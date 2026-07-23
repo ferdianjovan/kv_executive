@@ -1,0 +1,15 @@
+motion_planner:
+  ros__parameters:
+    horizontal_range: 15.0
+    vertical_range: 5.0
+    minimum_altitude: 2.0
+    maximum_altitude: 200.0
+    bound_margin: 2.0
+    yaw_weight: 1.0
+    # 500 mm base plus two 127 mm propeller radii gives a 377 mm radius.
+    # This is rounded up to provide a small physical safety margin.
+    drone_radius: 0.45
+    obstacle_clearance: 0.30
+    validity_resolution_fraction: 0.005
+    planning_timeout: 2.0
+    simplification_time: 0.2
