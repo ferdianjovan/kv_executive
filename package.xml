@@ -30,6 +30,7 @@
 
   <exec_depend>octomap_server</exec_depend>
   <exec_depend>mavros</exec_depend>
+  <exec_depend>mavros_extras</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>ament_index_python</exec_depend>

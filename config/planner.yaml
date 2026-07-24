@@ -13,3 +13,9 @@ motion_planner:
     validity_resolution_fraction: 0.005
     planning_timeout: 2.0
     simplification_time: 0.2
+    # Latch the first external-odometry pose as home so altitude limits use the
+    # same origin as the map. Set false to use MAVROS HomePosition instead.
+    home_from_first_odometry: true
+    home_position_topic: /mavros/home_position/home
+    mavros_parameter_service: /mavros/param/get_parameters
+    transform_timeout: 0.2

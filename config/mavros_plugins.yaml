@@ -1,0 +1,24 @@
+/**:
+  ros__parameters:
+    # Keep the flight-state, external-odometry, command, and setpoint plugins
+    # used by kv_executive. In particular, "odometry" provides
+    # /mavros/odometry/out -> MAVLink ODOMETRY -> PX4
+    # vehicle_visual_odometry. /mavros/odometry/in is FCU-to-ROS.
+    plugin_allowlist:
+      - sys_status
+      - sys_time
+      - command
+      - param
+      - home_position
+      - local_position
+      - global_position
+      - imu
+      - altitude
+      - odometry
+      - setpoint_accel
+      - setpoint_attitude
+      - setpoint_position
+      - setpoint_raw
+      - setpoint_trajectory
+      - setpoint_velocity
+      - waypoint

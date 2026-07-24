@@ -31,7 +31,7 @@ include_directories(${OMPL_INCLUDE_DIRS} ${OCTOMAP_INCLUDE_DIRS})
 add_executable(motion_planning src/planner_node.cpp)
 ament_target_dependencies(motion_planning
     rclcpp ompl geometry_msgs nav_msgs rcl_interfaces octomap octomap_msgs
-    tf2 tf2_geometry_msgs mavros_msgs
+    tf2 tf2_ros tf2_geometry_msgs mavros_msgs
 )
 target_link_libraries(motion_planning ${OMPL_LIBRARIES} ${OCTOMAP_LIBRARIES})
 install(TARGETS
@@ -48,6 +48,7 @@ install(DIRECTORY
 # Install Python executables
 install(PROGRAMS
   scripts/executive_node.py
+  scripts/configure_px4_external_odometry.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
