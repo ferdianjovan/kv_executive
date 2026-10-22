@@ -11,6 +11,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     drone_name = LaunchConfiguration('drone_name')
     planner_config = LaunchConfiguration('planner_config')
+    mission_config = LaunchConfiguration('mission_config')
     external_odometry_topic = LaunchConfiguration('external_odometry_topic')
     external_odom_parent_frame = LaunchConfiguration(
         'external_odom_parent_frame'
@@ -20,6 +21,9 @@ def generate_launch_description():
     )
     default_planner_config = PathJoinSubstitution(
         [FindPackageShare('kv_executive'), 'config', 'planner.yaml']
+    )
+    default_mission_config = PathJoinSubstitution(
+        [FindPackageShare('kv_executive'), 'config', 'mission.yaml']
     )
     px4_launch = PathJoinSubstitution(
         [FindPackageShare('kv_executive'), 'launch', 'px4.launch.py']
@@ -36,6 +40,21 @@ def generate_launch_description():
                 'planner_config',
                 default_value=default_planner_config,
                 description='Path to the motion planner ROS 2 parameter YAML file',
+            ),
+            DeclareLaunchArgument(
+                'mission_config',
+                default_value=default_mission_config,
+                description='Path to the mission executive ROS 2 parameter YAML file',
+            ),
+            DeclareLaunchArgument(
+                'auto_start_mission',
+                default_value='false',
+                description='Start one mission automatically when the executive starts',
+            ),
+            DeclareLaunchArgument(
+                'robot_base_frame',
+                default_value=[drone_name, '/base_link'],
+                description='Body frame used to align map paths with PX4 local odometry',
             ),
             DeclareLaunchArgument(
                 'external_odometry_topic',
@@ -112,6 +131,25 @@ def generate_launch_description():
                         'odometry_topic': external_odometry_topic,
                         'home_from_first_odometry': ParameterValue(
                             LaunchConfiguration('home_from_first_odometry'),
+                            value_type=bool,
+                        ),
+                        'use_sim_time': ParameterValue(
+                            LaunchConfiguration('use_sim_time'), value_type=bool
+                        ),
+                    },
+                ],
+            ),
+            Node(
+                package='kv_executive',
+                executable='executive_node.py',
+                name='mission_executive',
+                output='screen',
+                parameters=[
+                    mission_config,
+                    {
+                        'robot_base_frame': LaunchConfiguration('robot_base_frame'),
+                        'auto_start_mission': ParameterValue(
+                            LaunchConfiguration('auto_start_mission'),
                             value_type=bool,
                         ),
                         'use_sim_time': ParameterValue(

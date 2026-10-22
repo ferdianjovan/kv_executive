@@ -1,0 +1,10 @@
+# Set true to run the sweep and path from the current airborne position.
+# The default false runs TAKEOFF first and requires a disarmed vehicle.
+bool skip_takeoff
+---
+bool success
+string message
+---
+# Current YASMIN state or mission lifecycle event.
+string state
+string message

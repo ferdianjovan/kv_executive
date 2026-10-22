@@ -1,0 +1,27 @@
+mission_executive:
+  ros__parameters:
+    # autonomy.launch.py exposes auto_start_mission as a launch argument.
+    auto_start_mission: false
+    # Stream the active PX4-local setpoint independently of mission waits.
+    setpoint_rate: 20.0
+    path_speed: 0.75  # Metres per second along each planned path segment.
+    hold_duration: 0.5  # Continuous time within position and yaw tolerances.
+    offboard_warmup: 2.0
+    # Duration of each 60-degree yaw ramp; measured convergence follows it.
+    sweep_step_duration: 5.0
+    position_tolerance: 0.3
+    yaw_tolerance: 0.0872664626  # Radians: 5 degrees.
+    takeoff_altitude_tolerance: 0.3
+    service_timeout: 10.0
+    takeoff_timeout: 120.0
+    waypoint_timeout: 60.0
+    # PX4 HEARTBEAT (and MAVROS state) is only 1 Hz. Match MAVROS conn_timeout.
+    state_timeout: 10.0
+    # Local odometry is a separate, high-rate stream; keep its stricter deadline.
+    telemetry_timeout: 2.0
+    planning_timeout: 10.0
+    mode_timeout: 10.0
+    transform_timeout: 0.5
+    takeoff_altitude_parameter: MIS_TAKEOFF_ALT
+    local_odometry_topic: /mavros/local_position/odom
+    local_frame: px4_odom

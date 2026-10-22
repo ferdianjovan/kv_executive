@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
+from kv_executive.mission_executive import MissionExecutive
 import rclpy
-from kv_executive.mission_executive import MinimalPublisher
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 
 
 if __name__ == '__main__':
     rclpy.init()
-    node = MinimalPublisher()
+    node = MissionExecutive()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
+        executor.spin()
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.stop_mission()
+        executor.shutdown(timeout_sec=5.0)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()

@@ -8,7 +8,7 @@
 #include <string>
 #include <mutex>
 #include <shared_mutex>
-#include <vector>
+#include <utility>
 
 #include <octomap/OcTree.h>
 #include <octomap/AbstractOcTree.h>
@@ -38,6 +38,8 @@
 #include <nav_msgs/msg/path.hpp>
 #include <rcl_interfaces/msg/parameter_type.hpp>
 #include <rcl_interfaces/srv/get_parameters.hpp>
+
+#include "kv_executive/srv/plan_path.hpp"
 
 namespace ob = ompl::base;
 namespace og = ompl::geometric;
@@ -70,15 +72,18 @@ public:
       std::bind(&MotionPlanner::requestMaximumAltitude, this));
 
     octomap_subscription_ = this->create_subscription<octomap_msgs::msg::Octomap>(
-            "/octomap_binary", rclcpp::QoS(rclcpp::KeepLast(1)).reliable(),
+            octomap_topic_, rclcpp::QoS(1).reliable().transient_local(),
             std::bind(&MotionPlanner::octomapCallback, this, std::placeholders::_1)
     );
     path_publisher_ = this->create_publisher<nav_msgs::msg::Path>(
             "planned_path", rclcpp::QoS(1).reliable().transient_local());
+    planning_service_ = this->create_service<kv_executive::srv::PlanPath>(
+            "plan_path",
+            std::bind(
+              &MotionPlanner::planPathCallback, this,
+              std::placeholders::_1, std::placeholders::_2));
 
     createStateSpace();
-    planning_timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(5000), std::bind(&MotionPlanner::planPath, this));
   }
 
   void createPlanningSetup()
@@ -91,14 +96,15 @@ public:
     ss_->setPlanner(planner);
   }
 
-  bool planPath()
+  bool planPath(nav_msgs::msg::Path & path_message)
   {
+    last_planning_error_.clear();
     if (!updatePlanningPoses()) {
       return false;
     }
 
     auto goal_position = randomWalkGoal();
-    return createPath(goal_position);
+    return createPath(goal_position, path_message);
   }
 
   geometry_msgs::msg::Point randomWalkGoal()
@@ -129,11 +135,12 @@ public:
     return goal_position;
   }
 
-  bool createPath(const geometry_msgs::msg::Point & goal_position)
+  bool createPath(
+    const geometry_msgs::msg::Point & goal_position,
+    nav_msgs::msg::Path & path_message)
   {
     if (!current_pose_received_ || !home_pose_received_ || !occupancy_map_received_) {
-      RCLCPP_WARN(this->get_logger(), "Cannot create path: required data are unavailable");
-      return false;
+      return failPlanning("Required odometry, home, or OctoMap data became unavailable");
     }
 
     if (!updatePositionSpaceBounds(goal_position)) {
@@ -163,34 +170,29 @@ public:
 
     const auto space_information = ss_->getSpaceInformation();
     if (!space_information->isValid(start.get())) {
-      RCLCPP_ERROR(this->get_logger(), "OMPL start state is invalid");
-      return false;
+      return failPlanning(
+        "OMPL start state is invalid: check altitude bounds, home reference, and obstacle clearance");
     }
     if (!space_information->isValid(goal.get())) {
-      RCLCPP_ERROR(this->get_logger(), "OMPL goal state is invalid");
-      return false;
+      return failPlanning("OMPL goal state is invalid: check altitude bounds and obstacle clearance");
     }
     ss_->setStartAndGoalStates(start, goal);
 
     const auto solved = ss_->solve(planning_timeout_);
     if (!solved) {
-      RCLCPP_WARN(this->get_logger(), "No OMPL solution found");
-      return false;
+      return failPlanning("No OMPL solution found within the planning timeout");
     }
     ss_->simplifySolution(simplification_time_);
     auto & solution_path = ss_->getSolutionPath();
 
-    solution_poses_ = processSolutionPath(solution_path);
+    path_message = processSolutionPath(solution_path);
 
     return true;
   }
 
-  std::vector<geometry_msgs::msg::Pose> processSolutionPath(
+  nav_msgs::msg::Path processSolutionPath(
     const og::PathGeometric & solution_path)
   {
-    std::vector<geometry_msgs::msg::Pose> poses;
-    poses.reserve(solution_path.getStateCount());
-
     nav_msgs::msg::Path path_message;
     path_message.header.stamp = this->now();
     {
@@ -221,8 +223,6 @@ public:
       pose.orientation.y = 0.0;
       pose.orientation.z = std::sin(yaw_state->value * 0.5);
       pose.orientation.w = std::cos(yaw_state->value * 0.5);
-      poses.push_back(pose);
-
       geometry_msgs::msg::PoseStamped pose_stamped;
       pose_stamped.header = path_message.header;
       pose_stamped.pose = pose;
@@ -236,10 +236,30 @@ public:
                 path_message.poses.size(), path_message.header.frame_id.c_str());
     }
 
-    return poses;
+    return path_message;
   }
 
 private:
+  bool failPlanning(const std::string & reason)
+  {
+    last_planning_error_ = reason;
+    RCLCPP_WARN(this->get_logger(), "Cannot plan: %s", reason.c_str());
+    return false;
+  }
+
+  void planPathCallback(
+    const kv_executive::srv::PlanPath::Request::SharedPtr request,
+    kv_executive::srv::PlanPath::Response::SharedPtr response)
+  {
+    (void)request;
+    response->success = planPath(response->path);
+    if (response->success) {
+      response->message = "Path planned successfully";
+    } else {
+      response->message = last_planning_error_;
+    }
+  }
+
   void odometryCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
     latest_odometry_ = *msg;
@@ -276,11 +296,25 @@ private:
 
   bool updatePlanningPoses()
   {
-    if (!odometry_received_ || !home_pose_source_received_ || !occupancy_map_received_) {
-      RCLCPP_WARN_THROTTLE(
-                this->get_logger(), *this->get_clock(), 5000,
-                "Cannot plan: waiting for odometry, home, and OctoMap");
-      return false;
+    std::string missing;
+    const auto add_missing = [&missing](const std::string & input) {
+        if (!missing.empty()) {
+          missing += ", ";
+        }
+        missing += input;
+      };
+    if (!odometry_received_) {
+      add_missing("odometry (" + odometry_topic_ + ")");
+    }
+    if (!home_pose_source_received_) {
+      add_missing("home (" +
+        (home_from_first_odometry_ ? odometry_topic_ : home_position_topic_) + ")");
+    }
+    if (!occupancy_map_received_) {
+      add_missing("OctoMap (" + octomap_topic_ + ")");
+    }
+    if (!missing.empty()) {
+      return failPlanning("Missing inputs: " + missing);
     }
 
     std::string planning_frame;
@@ -289,20 +323,17 @@ private:
       planning_frame = occupancy_map_frame_;
     }
     if (planning_frame.empty()) {
-      RCLCPP_ERROR(this->get_logger(), "Cannot plan: OctoMap frame is empty");
-      return false;
+      return failPlanning("OctoMap frame is empty");
     }
 
     geometry_msgs::msg::PoseStamped odometry_pose;
     odometry_pose.header = latest_odometry_.header;
     odometry_pose.pose = latest_odometry_.pose.pose;
     if (odometry_pose.header.frame_id.empty()) {
-      RCLCPP_ERROR(this->get_logger(), "Cannot plan: odometry frame_id is empty");
-      return false;
+      return failPlanning("Odometry frame_id is empty on " + odometry_topic_);
     }
     if (home_pose_source_.header.frame_id.empty()) {
-      RCLCPP_ERROR(this->get_logger(), "Cannot plan: home frame_id is empty");
-      return false;
+      return failPlanning("Home frame_id is empty");
     }
 
     try {
@@ -329,11 +360,9 @@ private:
     } catch (const tf2::TransformException & exception) {
       current_pose_received_ = false;
       home_pose_received_ = false;
-      RCLCPP_WARN_THROTTLE(
-                this->get_logger(), *this->get_clock(), 5000,
-                "Cannot transform odometry/home into OctoMap frame '%s': %s",
-                planning_frame.c_str(), exception.what());
-      return false;
+      return failPlanning(
+        "Cannot transform odometry/home into OctoMap frame '" + planning_frame +
+        "': " + exception.what());
     }
 
     RCLCPP_INFO(
@@ -346,6 +375,10 @@ private:
 
   void octomapCallback(const octomap_msgs::msg::Octomap::SharedPtr msg)
   {
+    if (msg->header.frame_id.empty()) {
+      RCLCPP_ERROR(this->get_logger(), "Received OctoMap without a frame_id");
+      return;
+    }
     std::unique_ptr<octomap::AbstractOcTree> abstract_tree(octomap_msgs::msgToMap(*msg));
     if (!abstract_tree) {
       RCLCPP_ERROR(this->get_logger(), "Failed to deserialize OctoMap message");
@@ -356,6 +389,10 @@ private:
     if (!octree) {
       RCLCPP_ERROR(this->get_logger(), "Received unsupported OctoMap tree type: %s",
         msg->id.c_str());
+      return;
+    }
+    if (octree->size() == 0) {
+      RCLCPP_WARN(this->get_logger(), "Received an empty OctoMap; waiting for sensor data");
       return;
     }
 
@@ -388,6 +425,7 @@ private:
     simplification_time_ = this->declare_parameter<double>("simplification_time");
     odometry_topic_ = this->declare_parameter<std::string>(
             "odometry_topic");
+    octomap_topic_ = this->declare_parameter<std::string>("octomap_topic", "/octomap_binary");
     home_position_topic_ = this->declare_parameter<std::string>(
             "home_position_topic", "/mavros/home_position/home");
     mavros_parameter_service_ = this->declare_parameter<std::string>(
@@ -418,7 +456,7 @@ private:
     if (simplification_time_ <= 0.0) {
       throw std::invalid_argument("simplification_time must be greater than zero");
     }
-    if (odometry_topic_.empty() || home_position_topic_.empty() ||
+    if (odometry_topic_.empty() || home_position_topic_.empty() || octomap_topic_.empty() ||
       mavros_parameter_service_.empty())
     {
       throw std::invalid_argument("planner topic and service names cannot be empty");
@@ -462,7 +500,7 @@ private:
                 "Invalid planning bounds: x=[%.2f, %.2f], y=[%.2f, %.2f], z=[%.2f, %.2f]",
                 min_x, max_x, min_y, max_y, min_z, max_z
       );
-      return false;
+      return failPlanning("Invalid altitude or horizontal planning bounds; check home reference");
     }
 
     ob::RealVectorBounds bounds(3);
@@ -483,8 +521,7 @@ private:
       goal_position.y >= bounds.low[1] && goal_position.y <= bounds.high[1] &&
       goal_position.z >= bounds.low[2] && goal_position.z <= bounds.high[2];
     if (!goal_inside_bounds) {
-      RCLCPP_WARN(this->get_logger(), "Goal is outside the current planning bounds");
-      return false;
+      return failPlanning("Goal is outside the current planning bounds");
     }
     return true;
   }
@@ -607,6 +644,8 @@ private:
   double simplification_time_;
   double transform_timeout_;
   std::string odometry_topic_;
+  std::string octomap_topic_;
+  std::string last_planning_error_;
   std::string home_position_topic_;
   std::string mavros_parameter_service_;
   bool home_from_first_odometry_;
@@ -622,16 +661,15 @@ private:
   std::shared_ptr<ob::CompoundStateSpace> space_;
   std::shared_ptr<og::SimpleSetup> ss_;
   std::mt19937 random_generator_{std::random_device{}()};
-  std::vector<geometry_msgs::msg::Pose> solution_poses_;
 
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_publisher_;
+  rclcpp::Service<kv_executive::srv::PlanPath>::SharedPtr planning_service_;
   std::shared_ptr<const octomap::OcTree> occupancy_map_;
   mutable std::shared_mutex occupancy_map_mutex_;
   std::string occupancy_map_frame_;
 
   rclcpp::TimerBase::SharedPtr timer_;
-  rclcpp::TimerBase::SharedPtr planning_timer_;
   nav_msgs::msg::Odometry latest_odometry_;
   geometry_msgs::msg::PoseStamped home_pose_source_;
   geometry_msgs::msg::Pose current_pose;

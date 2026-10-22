@@ -4,7 +4,9 @@ motion_planner:
     vertical_range: 5.0
     minimum_altitude: 2.0
     maximum_altitude: 200.0
-    bound_margin: 2.0
+    # A 2 m lower bound permits PX4's default 2.5 m takeoff altitude.
+    # Obstacle clearance is configured separately below.
+    bound_margin: 0.0
     yaw_weight: 1.0
     # 500 mm base plus two 127 mm propeller radii gives a 377 mm radius.
     # This is rounded up to provide a small physical safety margin.
@@ -17,5 +19,6 @@ motion_planner:
     # same origin as the map. Set false to use MAVROS HomePosition instead.
     home_from_first_odometry: true
     home_position_topic: /mavros/home_position/home
+    octomap_topic: /octomap_binary
     mavros_parameter_service: /mavros/param/get_parameters
     transform_timeout: 0.2

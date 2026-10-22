@@ -23,9 +23,25 @@ find_package(ompl REQUIRED)
 find_package(mavros_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(action_msgs REQUIRED)
+find_package(service_msgs REQUIRED)
 find_package(rcl_interfaces REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 
-ament_python_install_package(${PROJECT_NAME})
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "srv/PlanPath.srv"
+  "action/ExecuteMission.action"
+  DEPENDENCIES nav_msgs
+)
+
+# rosidl_generator_py installs the generated interfaces with this same
+# name, so install the handwritten Python modules directly alongside it.
+install(
+  DIRECTORY ${PROJECT_NAME}/
+  DESTINATION "${PYTHON_INSTALL_DIR}/${PROJECT_NAME}"
+  PATTERN "*.pyc" EXCLUDE
+  PATTERN "__pycache__" EXCLUDE
+)
 
 include_directories(${OMPL_INCLUDE_DIRS} ${OCTOMAP_INCLUDE_DIRS})
 add_executable(motion_planning src/planner_node.cpp)
@@ -33,7 +49,14 @@ ament_target_dependencies(motion_planning
     rclcpp ompl geometry_msgs nav_msgs rcl_interfaces octomap octomap_msgs
     tf2 tf2_ros tf2_geometry_msgs mavros_msgs
 )
-target_link_libraries(motion_planning ${OMPL_LIBRARIES} ${OCTOMAP_LIBRARIES})
+rosidl_get_typesupport_target(cpp_typesupport_target
+  ${PROJECT_NAME} "rosidl_typesupport_cpp"
+)
+target_link_libraries(motion_planning
+  ${OMPL_LIBRARIES}
+  ${OCTOMAP_LIBRARIES}
+  "${cpp_typesupport_target}"
+)
 install(TARGETS
     motion_planning
     DESTINATION lib/${PROJECT_NAME}
@@ -53,7 +76,13 @@ install(PROGRAMS
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
+  ament_add_pytest_test(mission_geometry test/test_mission_geometry.py)
+  ament_add_pytest_test(mission_executive test/test_mission_executive.py)
+  ament_add_pytest_test(planner_inputs test/test_planner_inputs.py TIMEOUT 45)
+  # Realistic 1 Hz FCU state updates and independent telemetry-loss scenarios.
+  ament_add_pytest_test(mission_action test/test_mission_action.py TIMEOUT 150)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
