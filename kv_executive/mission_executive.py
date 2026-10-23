@@ -83,7 +83,7 @@ class TakeoffState(_MissionState):
 
 
 class SweepState(_MissionState):
-    """Verify six slow yaw increments at a fixed PX4-local position."""
+    """Scan six slow yaw increments, dwelling at each heading for smoke detection."""
 
     def __init__(self, executive):
         super().__init__(executive, 'SWEEP', executive._sweep)
@@ -125,9 +125,11 @@ class MissionExecutive(Node):
             'takeoff_altitude_parameter': 'MIS_TAKEOFF_ALT',
             'setpoint_rate': 20.0,
             'path_speed': 0.75,
+            'path_turn_step_duration': 5.0,
             'hold_duration': 0.5,
             'offboard_warmup': 2.0,
-            'sweep_step_duration': 5.0,
+            'sweep_step_duration': 12.0,
+            'sweep_hold_duration': 3.0,
             'position_tolerance': 0.3,
             'yaw_tolerance': math.radians(5.0),
             'takeoff_altitude_tolerance': 0.3,
@@ -526,7 +528,10 @@ class MissionExecutive(Node):
         check_source_mode()
         self._change_mode('OFFBOARD')
 
-    def _wait_at_pose(self, target):
+    def _wait_at_pose(self, target, hold_duration=None):
+        """Require continuous measured stability for the requested dwell time."""
+        if hold_duration is None:
+            hold_duration = self.config['hold_duration']
         stable_since = None
 
         def arrived():
@@ -549,11 +554,12 @@ class MissionExecutive(Node):
                 return False
             if stable_since is None:
                 stable_since = time.monotonic()
-            return time.monotonic() - stable_since >= self.config['hold_duration']
+            return time.monotonic() - stable_since >= hold_duration
 
         self._wait_until(arrived, self.config['waypoint_timeout'], 'target convergence')
 
-    def _ramp(self, start, target, duration):
+    def _ramp(self, start, target, duration, hold_duration=None):
+        """Stream an interpolated move, then wait for a stable measured pose."""
         started = time.monotonic()
         while True:
             self._check_running()
@@ -564,7 +570,7 @@ class MissionExecutive(Node):
             if fraction >= 1.0:
                 break
             self._stop.wait(min(1.0 / self.config['setpoint_rate'], duration - elapsed))
-        self._wait_at_pose(target)
+        self._wait_at_pose(target, hold_duration=hold_duration)
 
     def _fly_to(self, start, target):
         """Face the local XY travel direction before translating to a waypoint."""
@@ -582,7 +588,7 @@ class MissionExecutive(Node):
         if yaw_change > 1e-6:
             self._ramp(
                 start, facing_start,
-                yaw_change * self.config['sweep_step_duration'] / (math.tau / 6.0),
+                yaw_change * self.config['path_turn_step_duration'] / (math.tau / 6.0),
             )
         distance = math.dist(
             (start.position.x, start.position.y, start.position.z),
@@ -609,7 +615,11 @@ class MissionExecutive(Node):
         for step in range(1, 7):
             target = deepcopy(original)
             target.orientation = quaternion_from_yaw(original_yaw + step * math.tau / 6.0)
-            self._ramp(previous, target, self.config['sweep_step_duration'])
+            # Keep each heading stable long enough for consecutive detector frames.
+            self._ramp(
+                previous, target, self.config['sweep_step_duration'],
+                hold_duration=self.config['sweep_hold_duration'],
+            )
             self._report(f'SWEEP: step {step}/6 reached')
             previous = target
         self._wait_at_pose(original)

@@ -31,7 +31,9 @@ find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlanPath.srv"
   "action/ExecuteMission.action"
-  DEPENDENCIES nav_msgs
+  "msg/BatteryUsage.msg"
+  "msg/BatteryReturnEstimate.msg"
+  DEPENDENCIES nav_msgs geometry_msgs std_msgs
 )
 
 # rosidl_generator_py installs the generated interfaces with this same
@@ -57,8 +59,15 @@ target_link_libraries(motion_planning
   ${OCTOMAP_LIBRARIES}
   "${cpp_typesupport_target}"
 )
+add_executable(battery_monitor_node src/battery_monitor_node.cpp)
+target_compile_features(battery_monitor_node PRIVATE cxx_std_17)
+ament_target_dependencies(battery_monitor_node
+  rclcpp geometry_msgs nav_msgs sensor_msgs mavros_msgs std_msgs
+)
+target_link_libraries(battery_monitor_node "${cpp_typesupport_target}")
 install(TARGETS
     motion_planning
+    battery_monitor_node
     DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -71,6 +80,8 @@ install(DIRECTORY
 # Install Python executables
 install(PROGRAMS
   scripts/executive_node.py
+  scripts/battery_monitor_node.py
+  scripts/diagnose_ros_executor.py
   scripts/configure_px4_external_odometry.py
   DESTINATION lib/${PROJECT_NAME}
 )
@@ -80,9 +91,16 @@ if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_add_pytest_test(mission_geometry test/test_mission_geometry.py)
   ament_add_pytest_test(mission_executive test/test_mission_executive.py)
+  ament_add_pytest_test(battery_model test/test_battery_model.py TIMEOUT 45)
+  ament_add_pytest_test(battery_monitor test/test_battery_monitor.py TIMEOUT 45)
+  ament_add_pytest_test(battery_monitor_ros test/test_battery_monitor_ros.py TIMEOUT 45)
+  ament_add_pytest_test(
+    battery_monitor_native_ros test/test_battery_monitor_native_ros.py TIMEOUT 90)
+  ament_add_pytest_test(
+    battery_monitor_constant_ros test/test_battery_monitor_constant_ros.py TIMEOUT 120)
   ament_add_pytest_test(planner_inputs test/test_planner_inputs.py TIMEOUT 45)
-  # Realistic 1 Hz FCU state updates and independent telemetry-loss scenarios.
-  ament_add_pytest_test(mission_action test/test_mission_action.py TIMEOUT 150)
+  # FCU state updates, telemetry loss, and three successive simulated-clock goals.
+  ament_add_pytest_test(mission_action test/test_mission_action.py TIMEOUT 210)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)

@@ -94,7 +94,12 @@ class Harness:
             'takeoff_timeout': 1.0,
             'takeoff_altitude_parameter': 'MIS_TAKEOFF_ALT',
             'takeoff_altitude_tolerance': 0.3,
-            'sweep_step_duration': 5.0,
+            'sweep_step_duration': 12.0,
+            'sweep_hold_duration': 3.0,
+            'path_turn_step_duration': 5.0,
+            'hold_duration': 0.5,
+            'yaw_tolerance': math.radians(5.0),
+            'waypoint_timeout': 60.0,
             'path_speed': 1.0,
             'position_tolerance': 0.3,
             'local_frame': 'px4_odom',
@@ -157,11 +162,13 @@ class Harness:
         self._target = deepcopy(pose)
         self.events.append(('target', deepcopy(pose)))
 
-    def _ramp(self, start, target, duration):
+    def _ramp(self, start, target, duration, hold_duration=None):
         self.events.append(('ramp', deepcopy(start), deepcopy(target), duration))
+        if hold_duration is not None:
+            self.events.append(('dwell', deepcopy(target), hold_duration))
         self.odometry.pose.pose = deepcopy(target)
 
-    def _wait_at_pose(self, target):
+    def _wait_at_pose(self, target, hold_duration=None):
         self.events.append(('converged', deepcopy(target)))
 
     def _loiter(self):
@@ -187,6 +194,22 @@ class TelemetryHarness(Harness):
         self._odometry_received = clock.now
 
 
+class MotionHarness(Harness):
+    """Run the production ramp and convergence waits with ideal pose tracking."""
+
+    _wait_at_pose = MissionExecutive._wait_at_pose
+
+    def _set_target(self, pose):
+        super()._set_target(pose)
+        self.odometry.pose.pose = deepcopy(pose)
+
+    def _ramp(self, start, target, duration, hold_duration=None):
+        started = self._stop.clock.now
+        self.events.append(('ramp_started', started, deepcopy(target)))
+        MissionExecutive._ramp(self, start, target, duration, hold_duration=hold_duration)
+        self.events.append(('ramp_finished', self._stop.clock.now, deepcopy(target)))
+
+
 @pytest.fixture
 def harness(monkeypatch):
     clock = Clock()
@@ -195,6 +218,11 @@ def harness(monkeypatch):
     )
     monkeypatch.setattr(executive_module.rclpy, 'ok', lambda context: True)
     return Harness(clock)
+
+
+@pytest.fixture
+def motion_harness(harness):
+    return MotionHarness(harness._stop.clock)
 
 
 @pytest.fixture
@@ -553,7 +581,7 @@ def test_sweep_proves_six_positive_sixty_degree_steps_and_final_convergence(harn
     increments = []
     for _, start, target, duration in moves:
         assert xyz(start) == xyz(target) == xyz(original)
-        assert duration == 5.0
+        assert duration == 12.0
         increments.append(angular_distance(
             yaw_from_quaternion(target.orientation),
             yaw_from_quaternion(start.orientation),
@@ -565,9 +593,75 @@ def test_sweep_proves_six_positive_sixty_degree_steps_and_final_convergence(harn
         yaw_from_quaternion(moves[-1][2].orientation), math.radians(170),
     )) < 1e-12
     assert blackboard['sweep_start_orientation'] == original.orientation
+    assert [event[2] for event in harness.events if event[0] == 'dwell'] == [3.0] * 6
     assert harness.events[-2][0] == 'converged'
     assert harness.events[-2][1] == original
     assert harness.events[-1] == ('loiter',)
+
+
+def test_sweep_spends_twelve_seconds_rotating_and_three_seconds_stable_per_step(
+    motion_harness,
+):
+    node = motion_harness
+    node._sweep(Blackboard())
+
+    started = [event[1] for event in node.events if event[0] == 'ramp_started']
+    finished = [event[1] for event in node.events if event[0] == 'ramp_finished']
+    assert len(started) == len(finished) == 6
+    assert all(15.0 <= end - begin < 15.1 for begin, end in zip(started, finished))
+    assert 90.5 <= node._stop.clock.now < 91.0
+    assert node.state.mode == 'AUTO.LOITER'
+
+
+@pytest.mark.parametrize('drift', ['position', 'yaw'])
+def test_sweep_dwell_restarts_after_measured_pose_drift(motion_harness, drift):
+    node = motion_harness
+    node.state.mode = 'OFFBOARD'
+    target = deepcopy(node.odometry.pose.pose)
+    recovered_at = []
+
+    def disturb_then_recover():
+        now = node._stop.clock.now
+        node.odometry.pose.pose = deepcopy(target)
+        if 1.0 <= now < 1.5:
+            if drift == 'position':
+                node.odometry.pose.pose.position.x += node.config['position_tolerance'] * 2
+            else:
+                yaw = yaw_from_quaternion(target.orientation)
+                node.odometry.pose.pose.orientation = quaternion_from_yaw(
+                    yaw + node.config['yaw_tolerance'] * 2,
+                )
+        elif now >= 1.5 and not recovered_at:
+            recovered_at.append(now)
+
+    node._stop.on_wait = disturb_then_recover
+    node._wait_at_pose(target, hold_duration=node.config['sweep_hold_duration'])
+
+    assert recovered_at
+    assert 3.0 <= node._stop.clock.now - recovered_at[0] < 3.1
+    assert node._stop.clock.now >= 4.5
+
+
+def test_cancel_during_sweep_dwell_prevents_the_next_rotation(motion_harness):
+    node = motion_harness
+    goal = Goal(skip_takeoff=True)
+    node._goal_handle = goal
+    cancel_at = node.config['sweep_step_duration'] + 0.5
+
+    def cancel_during_dwell():
+        if node._stop.clock.now >= cancel_at:
+            goal.is_cancel_requested = True
+
+    node._stop.on_wait = cancel_during_dwell
+    with pytest.raises(MissionCanceled, match='canceled by client'):
+        node._sweep(Blackboard())
+
+    assert 0.0 <= node._stop.clock.now - cancel_at < 0.1
+    assert len([event for event in node.events if event[0] == 'ramp_started']) == 1
+    assert not any(event[0] == 'ramp_finished' for event in node.events)
+    assert not any(event[0] == 'loiter' for event in node.events)
+    heading = yaw_from_quaternion(node.odometry.pose.pose.orientation)
+    assert heading == pytest.approx(math.tau / 6)
 
 
 def planned_corner_path():
@@ -655,7 +749,7 @@ def test_fly_to_faces_xy_direction_before_translation(harness, dx, dy, planner_y
     assert xyz(turn_target) == xyz(start)
     assert yaw_from_quaternion(turn_target.orientation) == pytest.approx(expected_yaw)
     assert turn_duration == pytest.approx(
-        abs(expected_yaw) * harness.config['sweep_step_duration'] / (math.tau / 6),
+        abs(expected_yaw) * harness.config['path_turn_step_duration'] / (math.tau / 6),
     )
     _, translation_start, translation_target, duration = moves[1]
     assert translation_start == turn_target
@@ -695,7 +789,7 @@ def test_fly_to_turns_shortest_angle_across_yaw_wrap(harness):
     moves = [event for event in harness.events if event[0] == 'ramp']
     assert len(moves) == 2
     assert xyz(moves[0][1]) == xyz(moves[0][2]) == xyz(start)
-    assert moves[0][3] == pytest.approx(harness.config['sweep_step_duration'] / 3)
+    assert moves[0][3] == pytest.approx(harness.config['path_turn_step_duration'] / 3)
     assert yaw_from_quaternion(reached.orientation) == pytest.approx(direction)
 
 

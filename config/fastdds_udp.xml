@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Executive transport workaround: keep normal UDP discovery and interfaces,
+     disable Fast DDS shared memory. No publisher/subscriber QoS is overridden. -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>kv_executive_udp_only</transport_id>
+      <type>UDPv4</type>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="kv_executive_udp_participant" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>kv_executive_udp_only</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

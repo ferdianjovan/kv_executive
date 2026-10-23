@@ -5,10 +5,12 @@ mission_executive:
     # Stream the active PX4-local setpoint independently of mission waits.
     setpoint_rate: 20.0
     path_speed: 0.75  # Metres per second along each planned path segment.
+    path_turn_step_duration: 5.0  # Seconds per 60 degrees for path-facing turns.
     hold_duration: 0.5  # Continuous time within position and yaw tolerances.
     offboard_warmup: 2.0
-    # Duration of each 60-degree yaw ramp; measured convergence follows it.
-    sweep_step_duration: 5.0
+    # Slow 60-degree scan ramps (5 degrees/s), followed by a stable detector dwell.
+    sweep_step_duration: 12.0
+    sweep_hold_duration: 3.0  # Continuous settled time at each of the six headings.
     position_tolerance: 0.3
     yaw_tolerance: 0.0872664626  # Radians: 5 degrees.
     takeoff_altitude_tolerance: 0.3

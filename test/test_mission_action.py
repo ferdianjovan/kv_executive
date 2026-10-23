@@ -29,6 +29,7 @@ from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy, qos_profile_sensor_data, QoSProfile, ReliabilityPolicy,
 )
+from rosgraph_msgs.msg import Clock
 from std_msgs.msg import Header, String
 
 
@@ -270,15 +271,19 @@ def prepare_airborne(mission):
 
 
 @pytest.fixture
-def mission(monkeypatch, tmp_path):
+def mission(monkeypatch, tmp_path, request):
     # Keep this test's simulated MAVROS services isolated from other ROS graphs.
     monkeypatch.setenv('ROS_DOMAIN_ID', str(40 + os.getpid() % 50))
     monkeypatch.setenv('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST')
     monkeypatch.setenv('ROS_LOG_DIR', str(tmp_path / 'ros_logs'))
+    use_sim_time = getattr(request, 'param', False)
     parameters = {
+        'use_sim_time': use_sim_time,
         'setpoint_rate': 30.0,
         'offboard_warmup': 1.0,
         'sweep_step_duration': 0.15,
+        'sweep_hold_duration': 0.05,
+        'path_turn_step_duration': 0.15,
         'hold_duration': 0.05,
         'path_speed': 3.0,
         'position_tolerance': 0.03,
@@ -290,7 +295,10 @@ def mission(monkeypatch, tmp_path):
         'waypoint_timeout': 3.0,
     }
     namespace = f'/mission_test_{os.getpid()}'
-    arguments = ['--ros-args', '-r', f'__ns:={namespace}']
+    arguments = [
+        '--ros-args', '-r', f'__ns:={namespace}',
+        '-r', f'/clock:={namespace}/clock',
+    ]
     for topic_or_service in (
         'state', 'statustext/recv', 'local_position/odom', 'setpoint_position/local',
         'set_mode', 'cmd/arming', 'param/pull', 'param/get_parameters',
@@ -304,7 +312,27 @@ def mission(monkeypatch, tmp_path):
     fcu = None
     executor = None
     thread = None
+    clock_node = None
+    clock_thread = None
+    stop_clock = threading.Event()
     try:
+        if use_sim_time:
+            clock_node = Node('mission_action_test_clock')
+            clock_publisher = clock_node.create_publisher(Clock, '/clock', 10)
+            clock_started = time.monotonic()
+
+            def publish_clock():
+                # ROS timers need clock messages before they can drive telemetry.
+                # A wall-clock thread also keeps publishing while callbacks wait.
+                while not stop_clock.is_set():
+                    nanoseconds = int((10.0 + time.monotonic() - clock_started) * 1e9)
+                    message = Clock()
+                    message.clock.sec, message.clock.nanosec = divmod(nanoseconds, 10**9)
+                    clock_publisher.publish(message)
+                    stop_clock.wait(0.02)
+
+            clock_thread = threading.Thread(target=publish_clock, daemon=True)
+            clock_thread.start()
         executive = MissionExecutive()
         fcu = SimulatedFcu()
         executor = MultiThreadedExecutor(num_threads=4)
@@ -338,6 +366,11 @@ def mission(monkeypatch, tmp_path):
             executive.destroy_node()
         if fcu is not None:
             fcu.destroy_node()
+        stop_clock.set()
+        if clock_thread is not None:
+            clock_thread.join(timeout=3.0)
+        if clock_node is not None:
+            clock_node.destroy_node()
         rclpy.shutdown()
 
 
@@ -364,6 +397,49 @@ def cancel_goal(goal):
     assert result.status == GoalStatus.STATUS_CANCELED
     assert not result.result.success
     return result
+
+
+@pytest.mark.parametrize('mission', [True], indirect=True, ids=['sim_clock'])
+def test_repeated_airborne_goals_with_simulated_clock(mission):
+    """Repeat the CLI goal lifecycle while ROS timers use an isolated /clock."""
+    executive, fcu = mission.executive, mission.fcu
+    assert executive.get_parameter('use_sim_time').value is True
+    assert 0 < executive.get_clock().now().nanoseconds < 1000 * 10**9
+    fcu.heartbeat_interval = 0.2
+
+    for skip_takeoff in (False, True, True):
+        # Each CLI invocation creates a fresh action client and disconnects once
+        # its result is received. Exercise that endpoint lifecycle as well.
+        client = ActionClient(
+            fcu, ExecuteMission, 'execute_mission', callback_group=fcu.callbacks,
+        )
+        try:
+            wait_for(client.server_is_ready, 3.0, 'new mission client discovery')
+            future = client.send_goal_async(ExecuteMission.Goal(skip_takeoff=skip_takeoff))
+            wait_for(future.done, 3.0, 'repeated goal acknowledgement')
+            goal = future.result()
+            assert goal.accepted
+            result_future = goal.get_result_async()
+            wait_for(result_future.done, 40.0, 'repeated mission result')
+            result = result_future.result()
+            assert result.status == GoalStatus.STATUS_SUCCEEDED
+            assert result.result.success, result.result.message
+            assert executive._goal_handle is None
+            assert executive._state_machine is None
+            assert not executive._mission_lock.locked()
+            assert executive._target is None
+        finally:
+            client.destroy()
+
+    with fcu.lock:
+        assert fcu.state.mode == 'AUTO.LOITER'
+        assert fcu.state.armed
+        assert fcu.pose.position.x == pytest.approx(2.8, abs=0.03)
+        assert fcu.pose.position.z == pytest.approx(8.0, abs=0.03)
+        assert fcu.arming_requests == [(True, 'AUTO.TAKEOFF')]
+        assert fcu.planning_requests == 3
+        assert fcu.mode_requests.count('AUTO.TAKEOFF') == 1
+        assert not fcu.offboard_losses
 
 
 def test_action_completes_and_accepts_another_airborne_goal(mission):
@@ -484,6 +560,52 @@ def test_action_completes_and_accepts_another_airborne_goal(mission):
         assert yaw_from_quaternion(fcu.pose.orientation) == pytest.approx(0.0, abs=1e-6)
         assert fcu.arming_requests == [(True, 'AUTO.TAKEOFF')]
         assert not {'AUTO.RTL', 'AUTO.LAND'} & set(fcu.mode_requests)
+        assert not fcu.offboard_losses
+
+
+def test_cancel_during_sweep_dwell_keeps_streaming_without_next_rotation(mission):
+    executive, fcu = mission.executive, mission.fcu
+    executive.config['sweep_step_duration'] = 0.2
+    executive.config['sweep_hold_duration'] = 1.5
+    prepare_airborne(mission)
+    with fcu.lock:
+        original_yaw = yaw_from_quaternion(fcu.pose.orientation)
+    first_yaw = original_yaw + math.tau / 6
+    goal = send_goal(mission, skip_takeoff=True)
+    assert goal.accepted
+
+    def first_heading_published():
+        with fcu.lock:
+            return any(
+                mode == 'OFFBOARD' and abs(angular_distance(
+                    yaw_from_quaternion(message.pose.orientation), first_yaw,
+                )) < 1e-6
+                for _, mode, message in fcu.setpoints
+            )
+
+    wait_for(first_heading_published, 6.0, 'first sweep heading and detector dwell')
+    with fcu.lock:
+        before = len(fcu.setpoints)
+    wait_for(lambda: len(fcu.setpoints) >= before + 6,
+             0.8, 'setpoints to continue during detector dwell')
+    with fcu.lock:
+        dwell_messages = [message for _, mode, message in fcu.setpoints[before:]
+                          if mode == 'OFFBOARD']
+        assert len(dwell_messages) >= 6
+        assert all(message.pose == dwell_messages[0].pose for message in dwell_messages)
+        assert not any(text.startswith('SWEEP: step') for _, text in fcu.statuses)
+
+    started = time.monotonic()
+    cancel_goal(goal)
+    assert time.monotonic() - started < 3.0
+    with fcu.lock:
+        assert fcu.state.mode == 'AUTO.LOITER'
+        assert fcu.planning_requests == 0
+        assert not any(text.startswith('SWEEP: step') for _, text in fcu.statuses)
+        headings = [yaw_from_quaternion(message.pose.orientation)
+                    for _, mode, message in fcu.setpoints if mode == 'OFFBOARD']
+        assert all(-1e-6 <= angular_distance(yaw, original_yaw) <= math.tau / 6 + 1e-6
+                   for yaw in headings)
         assert not fcu.offboard_losses
 
 

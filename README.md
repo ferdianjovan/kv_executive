@@ -1,9 +1,10 @@
 # KV Executive
 
 The executive runs a YASMIN state machine with `TAKEOFF`, `SWEEP`, and
-`EXECUTE_PATH` states. The motion planner remains a separate node with the
-`plan_path` service. YASMIN is a required Python runtime dependency; the
-executive uses its state-machine implementation directly.
+`EXECUTE_PATH` states. The motion planner and battery monitor run as separate
+nodes. The planner exposes the `plan_path` service. YASMIN is a required
+Python runtime dependency; the executive uses its state-machine
+implementation directly.
 
 ## Start and execute a mission
 
@@ -15,16 +16,36 @@ colcon build --packages-select kv_executive --symlink-install
 source install/setup.bash
 ```
 
-Start the Gazebo/PX4 simulation first, then launch MAVROS, the planner, and the
-executive together:
+Start the Gazebo/PX4 simulation first, then start MAVROS in its own terminal:
 
 ```bash
-ros2 launch kv_executive autonomy.launch.py \
-  drone_name:=x500_depth \
-  start_mavros:=true
+ros2 launch kv_executive px4.launch.py drone_name:=x500_depth
 ```
 
-If MAVROS is already running, omit `start_mavros:=true`.
+Wait for connected MAVROS state and local odometry before starting autonomy
+in another terminal:
+
+```bash
+ros2 launch kv_executive autonomy.launch.py drone_name:=x500_depth
+```
+
+Autonomy defaults `executive_udp_only` to `true`: the executive uses Fast DDS
+over UDP with shared memory disabled. This is a scoped workaround for the
+observed native Python executor crashes; it leaves the planner and MAVROS
+transport environment alone. The launch prints `Mission executive: Fast DDS
+UDP-only transport (shared memory disabled)`. Explicit localhost-only settings
+select a loopback-only UDP profile. Other selected RMW implementations are
+left alone. To preserve an existing custom Fast DDS XML/discovery configuration,
+set `executive_udp_only:=false`. See the
+[crash investigation](docs/native_crashes.md) for the evidence and test limits.
+
+Autonomy starts the planner and executive; `start_mavros` and
+`start_battery_monitor` both default to `false`. Before the first mission's
+takeoff, start the battery monitor in a separate terminal:
+
+```bash
+ros2 launch kv_executive battery_monitor.launch.py use_sim_time:=true
+```
 
 The default launch starts the nodes and waits for an explicit mission request:
 
@@ -109,12 +130,12 @@ The installed `executive_node.py` runs a `MultiThreadedExecutor` so action
 callbacks, telemetry, service replies, and setpoint publication continue while
 the YASMIN sequence runs.
 
-To request one mission automatically when the executive starts:
+To request one mission automatically when the executive starts, start MAVROS
+and the standalone battery monitor first, then run:
 
 ```bash
 ros2 launch kv_executive autonomy.launch.py \
   drone_name:=x500_depth \
-  start_mavros:=true \
   auto_start_mission:=true
 ```
 
@@ -155,9 +176,14 @@ One mission runs the following sequence:
   local height.
 - `SWEEP` holds position and performs one full turn in six 60-degree steps,
   returning to the starting heading. `sweep_step_duration` is the yaw ramp
-  duration for each step, five seconds by default. After each ramp, the
-  executive waits for the measured position and heading to converge and
-  remain within tolerance for `hold_duration`.
+  duration for each step, 12 seconds by default (5 degrees/second). After each
+  ramp, the executive waits for the measured position and heading to converge and
+  remain within tolerance for `sweep_hold_duration` (3 seconds). This stable
+  dwell gives the smoke detector time to register consecutive frames before
+  the next rotation. Any position or heading drift outside tolerance restarts
+  the dwell. The six ramps and dwells take at least 90 seconds, plus OFFBOARD
+  warmup and final convergence. Both scan timings can be tuned in `mission.yaml`;
+  path convergence continues to use `hold_duration` (0.5 seconds).
 - `EXECUTE_PATH` requests one path from `plan_path`, splits it into three
   equal lengths along the path, and executes all three legs consecutively
   using MAVROS local-position setpoints. Split boundaries are interpolated;
@@ -167,7 +193,8 @@ One mission runs the following sequence:
   for heading convergence before moving forward along a segment; it keeps
   that heading during translation. Vertical moves and repeated points retain
   the previous heading. Planner pose orientations do not set the flight yaw.
-  Turns use the same yaw rate as the sweep (`sweep_step_duration` per 60 degrees).
+  Turns use `path_turn_step_duration` per 60 degrees (5 seconds by default),
+  independently of the slower scan timing.
 
 On completion, the executive confirms `AUTO.LOITER` and returns the action
 result. After taking flight control, cancellation or failure recovery refreshes
@@ -274,12 +301,143 @@ as a launch argument. TF must connect the path frame to that body frame at
 the MAVROS odometry timestamp. The mission stops if telemetry or the required
 transform cannot be obtained within the configured timeouts.
 
+## Battery usage and return estimate
+
+Run the monitor separately from autonomy so its startup and logs can be
+controlled independently:
+
+```bash
+ros2 launch kv_executive battery_monitor.launch.py use_sim_time:=true
+```
+
+The standalone launch defaults `use_sim_time` to `true`; use `false` on a real
+vehicle. Supply `battery_monitor_config:=/absolute/path/battery_monitor.yaml`
+to override its parameters. Start MAVROS first and wait for telemetry, then
+start autonomy and the monitor before sending the first mission goal. This
+lets the monitor observe the grounded home pose, battery baseline, and all
+mission-status transitions. Autonomy leaves the monitor disabled by default
+(`start_battery_monitor:=false`). To launch it alongside autonomy instead, set
+`start_battery_monitor:=true` and do not also run the standalone launch.
+Keep `auto_start_mission:=false` (the default) for the staged startup sequence;
+if enabling automatic missions, start the standalone monitor before autonomy.
+
+The monitor was already a separate OS process when started by autonomy.
+Separate launching provides startup control and makes failures easier to
+isolate; it is not a confirmed fix for the native segmentation faults.
+
+The production monitor is the C++ `battery_monitor_node` executable, using
+`rclcpp` and a single-threaded executor. Both launch files use it. The legacy
+`battery_monitor_node.py` command forwards all arguments to that executable
+before importing any Python ROS libraries. The Python model and monitor
+modules remain as a reference implementation for regression tests. This
+avoids the Python executor path observed in the monitor's repeated native
+crashes; the underlying runtime fault has not been established.
+
+The monitor reads `sensor_msgs/BatteryState` from `/mavros/battery`. MAVROS
+provides remaining charge in `percentage` as a fraction from 0 to 1; the monitor
+converts this to 0–100 percentage points. For example, a change from 0.80 to
+0.77 consumes 3 percentage points. Unknown, nonfinite, or out-of-range readings
+cannot establish a usable baseline or return estimate. Voltage is not used.
+
+### Simulated battery depletion
+
+The PX4 checkout's battery simulator defaults `SIM_BAT_MIN_PCT` to 50 and
+`SIM_BAT_DRAIN` to 60 seconds. It stops reducing the reported battery at 50%.
+The slow sweep can reach this floor before `EXECUTE_PATH`, leaving no measured
+charge drop for the monitor to learn from. A `0.00` consumption record means
+the reported percentage did not decrease; it does not establish zero energy
+use. Such records are stored but excluded from the return model.
+
+For a dedicated SITL battery-monitor test, set a longer discharge time and
+remove the simulated charge floor in the PX4 console before takeoff, for example:
+
+```text
+param set SIM_BAT_DRAIN 1800
+param set SIM_BAT_MIN_PCT 0
+```
+
+These are simulator settings, not changes to the monitor's arithmetic or a
+fix for native crashes. PX4's existing low-battery failsafes still apply.
+Use a fresh disarmed simulation run when establishing a new training baseline.
+
+### Recording path usage
+
+`TAKEOFF: done` on `mission_status` establishes the post-takeoff battery
+baseline. Measurement starts only at `EXECUTE_PATH: started`, the third state
+that flies the planned random-walk path, and ends when that state finishes or
+the mission terminates. The interval's battery baseline is refreshed at its
+start, so the intervening scan does not enter the path's measured consumption.
+Run the monitor before starting the mission: progress-only retained status
+messages cannot reconstruct a third-state start missed while the node was down.
+If fresh battery, odometry, or vehicle state is missing at that start, the node
+skips learning for that interval rather than inventing its starting battery.
+A mission with `skip_takeoff: true` establishes its baseline when the third
+state starts. Each third-state interval is stored in the node's
+in-memory dictionary (a C++ map keyed by sample ID) and published on
+`battery_usage` as `kv_executive/msg/BatteryUsage`, with start/end poses, accumulated 3D
+travel distance, start/end battery percentage, consumption, and outcome. These
+records survive repeated missions and disarms while the node runs; they are not
+saved across node restarts. Restart the node when changing the battery pack or
+vehicle to clear the learned model.
+
+Usable completed intervals must have fresh telemetry, at least
+`minimum_sample_distance` (1 m by default), and positive depletion. Their
+average cost is distance-weighted:
+
+```text
+mean_percent_per_meter = sum(consumed_percent) / sum(distance_m)
+return_required_percent = mean_percent_per_meter * straight_line_home_distance_m
+buffered_required_percent = return_required_percent * return_safety_factor + reserve_percent
+```
+
+The current third-state interval also contributes once it has sufficient
+distance and measurable depletion, including before the first completed
+interval. `sample_count` counts usable completed records plus the usable active
+interval. Intervals with telemetry gaps or rising charge are not learned.
+`battery_return_estimate` publishes
+`kv_executive/msg/BatteryReturnEstimate` at `monitor_rate` (2 Hz), including
+current/home poses, remaining percentage, straight-line 3D distance, estimated
+return cost, buffered cost, margin, availability, and alert status. Check
+`estimate_available` before using the estimate fields. The monitor suppresses
+estimates when battery, local odometry, or connected vehicle state is stale;
+default receipt-age limits are 5, 2, and 10 seconds respectively.
+
+The existing `battery_return_estimate` message includes the typed boolean
+`return_alert` field, so a future autonomy subscriber can receive alerts
+without adding a service. The separate launch preserves these publishers and
+the monitor's `mission_status` subscription.
+
+Home uses the latest valid local pose received while disarmed and freezes that
+pose at `TAKEOFF: started`, or when the vehicle arms for externally initiated
+takeoff. Start the monitor before takeoff when possible. If
+it starts airborne, it can use `/mavros/home_position/home` instead: MAVROS's
+`HomePosition.position` is numeric local ENU, in the same estimator coordinates
+as `/mavros/local_position/odom`. Its subscription accepts retained MAVROS home
+messages for airborne startup. Home and distance calculations use that PX4
+local frame, not the planner's external-odometry home.
+
+The default alert threshold adds a 30% multiplier to the estimated return cost
+and a reserve of 15 percentage points. When remaining battery reaches or falls
+below that threshold during the third state, an `INFO` terminal message reports
+the remaining charge, home distance, estimated cost, buffer, and margin. Alerts
+repeat at most every `alert_repeat_period` (10 seconds). This node issues no
+flight commands. A straight-line consumption estimate does not account for
+obstacles, wind, or a separate landing-energy model. Distance integrates raw
+odometry, so estimator jitter and resets that retain the same frame name can
+distort the learned rate. Use the configurable reserve and factor when
+validating the estimate on the vehicle.
+
+```bash
+ros2 topic echo /battery_usage
+ros2 topic echo /battery_return_estimate
+```
+
 ## Mission tests
 
 After building and sourcing the workspace, run the mission tests with:
 
 ```bash
-colcon test --packages-select kv_executive --ctest-args -R '^(mission_|planner_inputs$)'
+colcon test --packages-select kv_executive --ctest-args -R '^(mission_|battery_|planner_inputs$)'
 colcon test-result --verbose
 ```
 
@@ -292,7 +450,32 @@ forward-facing yaw after frame conversion and turns at corners. State updates
 run at 1 Hz independently of odometry; tests exercise heartbeat gaps, expired
 state, stale odometry, and an explicit disconnect. Planner tests use the real
 C++ service to check missing inputs and planning with a map published before
-the planner starts. These tests do not replace SITL or vehicle flight validation.
+the planner starts. Battery tests cover depletion calculations, path-only
+recording, baseline and home handling, telemetry validity, and buffered return
+alerts. These tests do not replace SITL or vehicle flight validation.
+
+The native monitor DDS test checks the installed C++ executable with zero and
+positive consumption, weighted learning, frozen home, invalid telemetry and
+the buffered alert. The combined action test completes three missions with
+constant 50% battery, then cancels a fourth goal during its sweep; it also
+exercises the legacy executable's forwarding to the native monitor.
+
+For Python nodes exiting with `-11` (SIGSEGV), see the
+[native crash investigation](docs/native_crashes.md). The Python entrypoints
+emit all-thread fault traces on a native crash, and the action tests include
+successive airborne goals using simulated time and separate action clients.
+
+The installed runtime probe can reproduce executor failures using only plain
+ROS workers and standard messages, with no simulation or mission goals:
+
+```bash
+ros2 run kv_executive diagnose_ros_executor.py --duration 180
+```
+
+It uses a unique namespace and isolated ROS domain, reports its output directory,
+and saves worker fault traces and a JSON summary. It inherits
+`RMW_IMPLEMENTATION` for controlled middleware comparisons. See the investigation
+document for the latest results and their limits.
 
 ## External odometry and PX4
 
