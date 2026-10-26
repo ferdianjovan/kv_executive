@@ -1,0 +1,14 @@
+detection_monitor:
+  ros__parameters:
+    # Relative defaults allow direct ros2 run use in the executive namespace.
+    # The launch files override detector inputs to /<drone_name>/... .
+    smoke_topic: smoke/detection
+    fire_topic: fire/detection
+    action_status_topic: execute_mission/_action/status
+    mission_state_request_topic: mission_state_request_for_goal
+    mission_phase_topic: mission_phase
+    # Freshness uses source image header stamps and the node's ROS clock.
+    observation_timeout: 2.0
+    future_tolerance: 0.25
+    # Confirmed smoke or fire aborts Exploration; the executive recovers LOITER.
+    # Verify and previously recorded viewing-sector exclusions remain dormant.

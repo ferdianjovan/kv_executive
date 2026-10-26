@@ -5,16 +5,21 @@ import math
 import threading
 from types import SimpleNamespace
 
+from builtin_interfaces.msg import Time as TimeMessage
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion, TransformStamped
 from kv_executive.action import ExecuteMission
 import kv_executive.mission_executive as executive_module
 from kv_executive.mission_executive import (
-    build_state_machine, MissionCanceled, MissionError, MissionExecutive,
+    build_state_machine, ExplorationStateMachine, MissionAbortRequested,
+    MissionCanceled, MissionError,
+    MissionExecutive, MissionStateRequested,
 )
 from kv_executive.mission_geometry import (
     angular_distance, quaternion_from_yaw, yaw_from_quaternion,
 )
+from kv_executive.msg import BatteryReturnEstimate, MissionStateRequest
 from kv_executive.srv import PlanPath
+from kv_executive.verification import VERIFY_DEFAULTS
 from mavros_msgs.msg import State as VehicleState
 from mavros_msgs.srv import CommandBool, ParamPull, SetMode
 from nav_msgs.msg import Odometry, Path
@@ -22,8 +27,9 @@ import pytest
 from rcl_interfaces.msg import ParameterType, ParameterValue
 from rcl_interfaces.srv import GetParameters
 from rclpy.action import GoalResponse
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from std_srvs.srv import Trigger
+from unique_identifier_msgs.msg import UUID
 from yasmin import Blackboard
 
 
@@ -82,12 +88,21 @@ class Harness:
     _fly_to = MissionExecutive._fly_to
     _execute_path = MissionExecutive._execute_path
     _check_running = MissionExecutive._check_running
+    _check_motion_observation = MissionExecutive._check_motion_observation
+    _verify_parent_entry = MissionExecutive._verify_parent_entry
+    _exploration_parent_entry = MissionExecutive._exploration_parent_entry
     _goal_callback = MissionExecutive._goal_callback
+    _goal_accepted_callback = MissionExecutive._goal_accepted_callback
+    request_mission_state = MissionExecutive.request_mission_state
+    _mission_state_request_callback = MissionExecutive._mission_state_request_callback
+    _goal_state_request_callback = MissionExecutive._goal_state_request_callback
+    _battery_alert_callback = MissionExecutive._battery_alert_callback
     _recover_to_loiter = MissionExecutive._recover_to_loiter
     _execute_mission_callback = MissionExecutive._execute_mission_callback
 
     def __init__(self, clock):
         self.config = {
+            **VERIFY_DEFAULTS,
             'service_timeout': 0.5,
             'mode_timeout': 0.3,
             'planning_timeout': 0.5,
@@ -103,17 +118,29 @@ class Harness:
             'path_speed': 1.0,
             'position_tolerance': 0.3,
             'local_frame': 'px4_odom',
+            'local_odometry_frame_aliases': ['map'],
             'robot_base_frame': 'kv_drone/base_link',
             'transform_timeout': 0.5,
             'setpoint_rate': 20.0,
             'offboard_warmup': 1.0,
+            'battery_alert_timeout': 5.0,
+            'telemetry_timeout': 2.0,
         }
         self.events = []
         self._stop = ClockStop(clock)
         self._data_lock = threading.Lock()
+        self._odometry_aliases_reported = set()
         self._mission_lock = threading.Lock()
         self._goal_lock = threading.Lock()
         self._goal_handle = None
+        self._mission_started_ns = 122_000_000_000
+        self._requested_mission_state = None
+        self._parent_state = None
+        self._airborne_ready = True
+        self._motion_guard = None
+        self._phase_sequence = 0
+        self._phase_publisher = SimpleNamespace(
+            publish=lambda phase: self.events.append(('phase', phase)))
         self._recovering = False
         self._finalizing = False
         self._command_inflight = False
@@ -135,6 +162,10 @@ class Harness:
         self._mode_client = object()
         self._arming_client = object()
         self._planning_client = object()
+
+    def get_clock(self):
+        return SimpleNamespace(now=lambda: SimpleNamespace(
+            nanoseconds=123_000_000_000, to_msg=lambda: TimeMessage(sec=123)))
 
     def _report(self, message, error=False):
         self.events.append(('report', message, error))
@@ -276,6 +307,43 @@ def test_stale_local_odometry_aborts_despite_fresh_state(telemetry_harness):
     )
 
 
+def test_stock_mavros_map_odometry_keeps_local_coordinates_and_input(telemetry_harness):
+    node = telemetry_harness
+    incoming = deepcopy(node._odometry)
+    incoming.header.frame_id = 'map'
+    incoming.pose.pose = make_pose(21, -34, 8, math.radians(73))
+    incoming.pose.covariance[0] = 0.25
+    incoming.twist.twist.linear.x = 1.5
+    original = deepcopy(incoming)
+
+    MissionExecutive._odometry_callback(node, incoming)
+    _, accepted = node._snapshot(expected_mode='AUTO.LOITER', require_armed=True)
+
+    assert accepted.header.frame_id == 'px4_odom'
+    assert accepted.pose == original.pose
+    assert accepted.twist == original.twist
+    assert accepted.child_frame_id == original.child_frame_id
+    assert accepted.header.stamp == original.header.stamp
+    assert incoming == original
+    assert node._odometry is not incoming
+
+
+@pytest.mark.parametrize('frame,aliases', [
+    ('other_odom', ['map']), ('/map', ['map']), ('map', []),
+])
+def test_unconfigured_odometry_frames_still_abort(telemetry_harness, frame, aliases):
+    node = telemetry_harness
+    node.config['local_odometry_frame_aliases'] = aliases
+    incoming = deepcopy(node._odometry)
+    incoming.header.frame_id = frame
+
+    MissionExecutive._odometry_callback(node, incoming)
+
+    with pytest.raises(MissionError, match='Local odometry frame is'):
+        node._snapshot()
+    assert incoming.header.frame_id == frame
+
+
 def test_disconnected_fcu_aborts_immediately_with_fresh_telemetry(telemetry_harness):
     node = telemetry_harness
     node._vehicle_state.connected = False
@@ -345,6 +413,7 @@ class Goal:
         self.is_cancel_requested = False
         self.is_active = True
         self.outcome = None
+        self.goal_id = UUID(uuid=[1] * 16)
 
     def succeed(self):
         self.outcome = 'succeeded'
@@ -368,17 +437,28 @@ def run_goal(harness, goal=None):
 
 
 class SequenceExecutive:
-    def __init__(self, fail_at=None):
+    def __init__(self, fail_at=None, cancel_after=2):
         self.fail_at = fail_at
+        self.cancel_after = cancel_after
+        self.cancel_requested = False
         self.executed = []
         self.reports = []
         self._last_error = ''
+        self._airborne_ready = False
+
+    def _exploration_parent_entry(self, blackboard):
+        self._check_running()
 
     def _report(self, message, error=False):
         self.reports.append((message, error))
+        if message == 'EXECUTE_PATH: done':
+            completed = sum(text == message for text, _ in self.reports)
+            if completed == self.cancel_after:
+                self.cancel_requested = True
 
     def _check_running(self):
-        pass
+        if self.cancel_requested:
+            raise MissionCanceled('Mission canceled at cycle boundary')
 
     def run(self, name, blackboard):
         self.executed.append(name)
@@ -396,21 +476,67 @@ class SequenceExecutive:
         self.run('EXECUTE_PATH', blackboard)
 
 
-def test_actual_yasmin_machine_runs_three_states_in_order():
+def test_actual_yasmin_machine_nests_exploration_and_repeats_without_takeoff():
     fake = SequenceExecutive()
     blackboard = Blackboard()
-    outcome = build_state_machine(fake)(blackboard)
-    assert outcome == 'succeeded'
-    assert fake.executed == ['TAKEOFF', 'SWEEP', 'EXECUTE_PATH']
+    machine = build_state_machine(fake)
+    assert machine.get_start_state() == 'Exploration'
+    assert set(machine.get_states()) == {'Exploration'}
+    assert machine.get_transitions()['Exploration']['verify_requested'] == 'verify_requested'
+    exploration = machine.get_states()['Exploration']['state']
+    assert isinstance(exploration, ExplorationStateMachine)
+    assert exploration.get_start_state() == 'ENTER_EXPLORATION'
+    assert exploration.get_transitions()['ENTER_EXPLORATION']['succeeded'] == 'TAKEOFF'
+    assert exploration.get_transitions()['EXECUTE_PATH']['succeeded'] == 'SWEEP'
+    assert machine(blackboard) == 'canceled'
+    assert fake.executed == [
+        'TAKEOFF', 'SWEEP', 'EXECUTE_PATH', 'SWEEP', 'EXECUTE_PATH',
+    ]
     assert all(blackboard[name] for name in fake.executed)
-    assert fake.reports[-1] == ('EXECUTE_PATH: done', False)
+    assert sum(text == 'EXECUTE_PATH: done' for text, _ in fake.reports) == 2
+    assert not any(error for _, error in fake.reports)
 
 
-def test_airborne_yasmin_machine_skips_takeoff():
+def test_airborne_yasmin_machine_repeats_without_takeoff():
     fake = SequenceExecutive()
-    outcome = build_state_machine(fake, skip_takeoff=True)(Blackboard())
-    assert outcome == 'succeeded'
-    assert fake.executed == ['SWEEP', 'EXECUTE_PATH']
+    machine = build_state_machine(fake, skip_takeoff=True)
+    exploration = machine.get_states()['Exploration']['state']
+    assert exploration.get_start_state() == 'ENTER_EXPLORATION'
+    assert exploration.get_transitions()['ENTER_EXPLORATION']['succeeded'] == 'SWEEP'
+    assert 'TAKEOFF' not in exploration.get_states()
+    assert machine(Blackboard()) == 'canceled'
+    assert fake.executed == ['SWEEP', 'EXECUTE_PATH'] * 2
+
+
+def test_cancel_in_a_later_cycle_stops_before_another_sweep():
+    fake = SequenceExecutive(cancel_after=10)
+
+    def canceled_path(blackboard):
+        fake.run('EXECUTE_PATH', blackboard)
+        if fake.executed.count('EXECUTE_PATH') == 3:
+            raise MissionCanceled('Mission canceled during later path')
+
+    fake._execute_path = canceled_path
+    assert build_state_machine(fake)(Blackboard()) == 'canceled'
+    assert fake.executed == ['TAKEOFF'] + ['SWEEP', 'EXECUTE_PATH'] * 3
+    assert sum(text == 'EXECUTE_PATH: done' for text, _ in fake.reports) == 2
+
+
+@pytest.mark.parametrize('state,outcome', [
+    ('Return', 'return_requested'), ('Verify', 'verify_requested'),
+])
+def test_requested_higher_state_propagates_out_of_exploration(state, outcome):
+    fake = SequenceExecutive()
+
+    def request_state(blackboard):
+        fake.run('SWEEP', blackboard)
+        raise MissionStateRequested(state)
+
+    fake._sweep = request_state
+    assert ExplorationStateMachine(fake)(Blackboard()) == outcome
+    assert fake.executed == ['TAKEOFF', 'SWEEP']
+    assert fake._last_error == ''
+    assert not any(error for _, error in fake.reports)
 
 
 def test_yasmin_cancel_stops_before_next_state():
@@ -436,7 +562,25 @@ def test_actual_yasmin_machine_aborts_without_executing_later_states(failed_inde
     assert fake.reports[-1][1] is True
 
 
+@pytest.mark.parametrize('stage', ['TAKEOFF', 'SWEEP', 'EXECUTE_PATH'])
+def test_monitor_abort_exits_machine_without_entering_verify(stage):
+    fake = SequenceExecutive(fail_at=None)
+    original_run = fake.run
+
+    def abort_stage(name, blackboard):
+        original_run(name, blackboard)
+        if name == stage:
+            raise MissionAbortRequested('Monitoring requested abort')
+
+    fake.run = abort_stage
+
+    assert build_state_machine(fake)(Blackboard()) == 'aborted'
+    assert fake.executed[-1] == stage
+    assert 'Monitoring requested abort' in fake._last_error
+
+
 def configure_takeoff_services(harness, *, arming_success=True, integer=False):
+    harness._airborne_ready = False
     harness.state.armed = False
     harness.state.mode = 'MANUAL'
     harness.odometry.pose.pose = make_pose(1, 2, 10)
@@ -529,6 +673,28 @@ def test_cancel_during_arming_observes_armed_ack_before_recovery(harness):
     harness._call = cancel_after_arm_dispatch
     with pytest.raises(MissionCanceled):
         harness._takeoff(Blackboard())
+    assert harness.state.armed
+    assert harness.state.mode == 'AUTO.TAKEOFF'
+    assert not harness._command_inflight
+    assert harness.odometry.pose.pose.position.z < 14.0
+
+
+@pytest.mark.parametrize('state', ['Return', 'Verify'])
+def test_transition_during_arming_waits_for_ack_before_interrupting(harness, state):
+    configure_takeoff_services(harness)
+    harness._goal_handle = Goal()
+    call = harness._call
+
+    def request_after_arm_dispatch(client, *args, **kwargs):
+        response = call(client, *args, **kwargs)
+        if client is harness._arming_client:
+            assert harness.request_mission_state(state)
+        return response
+
+    harness._call = request_after_arm_dispatch
+    with pytest.raises(MissionStateRequested) as request:
+        harness._takeoff(Blackboard())
+    assert request.value.state == state
     assert harness.state.armed
     assert harness.state.mode == 'AUTO.TAKEOFF'
     assert not harness._command_inflight
@@ -676,7 +842,16 @@ def planned_corner_path():
     return path
 
 
-def test_execute_path_splits_equal_arcs_and_converts_waypoints_without_cutting_corners(harness):
+@pytest.mark.parametrize('odometry_frame', ['px4_odom', 'map'])
+def test_execute_path_splits_equal_arcs_and_converts_waypoints_without_cutting_corners(
+    harness, odometry_frame,
+):
+    incoming = deepcopy(harness.odometry)
+    incoming.header.frame_id = odometry_frame
+    MissionExecutive._odometry_callback(harness, incoming)
+    harness.odometry = harness._odometry
+    assert harness.odometry.header.frame_id == 'px4_odom'
+    harness.events.clear()
     path = planned_corner_path()
     response = PlanPath.Response(success=True, message='planned', path=path)
 
@@ -878,6 +1053,30 @@ def test_mode_sent_response_still_waits_for_fcu_telemetry_acknowledgment(harness
     assert harness._stop.clock.now >= 0.1
     assert observed_before_ack[0] == 'AUTO.LOITER'
     assert harness.state.mode == 'OFFBOARD'
+
+
+def test_transition_during_mode_command_waits_for_telemetry_acknowledgment(harness):
+    harness._goal_handle = Goal()
+
+    def request_transition(*args, **kwargs):
+        assert harness._command_inflight
+        assert harness.request_mission_state('Return')
+        return SetMode.Response(mode_sent=True)
+
+    def acknowledge():
+        if harness._stop.clock.now >= 0.1:
+            harness.state.mode = 'OFFBOARD'
+
+    harness._call = request_transition
+    harness._stop.on_wait = acknowledge
+
+    harness._change_mode('OFFBOARD')
+    assert harness._stop.clock.now >= 0.1
+    assert harness.state.mode == 'OFFBOARD'
+    assert not harness._command_inflight
+    assert harness._requested_mission_state == 'Return'
+    with pytest.raises(MissionStateRequested):
+        harness._check_running()
 
 
 def test_mode_request_without_telemetry_acknowledgment_times_out(harness):
@@ -1133,6 +1332,420 @@ def test_cancel_interrupts_waits_but_allows_recovery(harness, recovering):
     assert not harness._stop.is_set()
 
 
+@pytest.mark.parametrize('state,outcome', [
+    ('Return', 'return_requested'), ('Verify', 'verify_requested'),
+])
+def test_state_request_interrupts_pending_wait(harness, state, outcome):
+    harness._goal_handle = Goal()
+    assert harness.request_mission_state(state)
+
+    with pytest.raises(MissionStateRequested) as request:
+        harness._wait_until(lambda: False, 10.0, 'a pending operation')
+    assert request.value.state == state
+    assert request.value.outcome == outcome
+    assert harness._stop.clock.now == 0.0
+    assert not harness._stop.is_set()
+
+
+def test_abort_request_interrupts_wait_without_entering_another_parent(harness):
+    harness._goal_handle = Goal()
+    assert harness.request_mission_state('Abort')
+
+    with pytest.raises(MissionAbortRequested):
+        harness._wait_until(lambda: False, 10.0, 'pending motion')
+
+    assert harness._stop.clock.now == 0.0
+    assert harness._parent_state is None
+
+
+def battery_alert(harness, available=True):
+    current = PoseStamped(
+        header=Header(stamp=TimeMessage(sec=123), frame_id='px4_odom'),
+        pose=deepcopy(harness.odometry.pose.pose),
+    )
+    home = deepcopy(current)
+    home.header.stamp.sec = 1  # Home is a reference and need not be a fresh observation.
+    return BatteryReturnEstimate(
+        header=deepcopy(current.header), current_pose=current, home_pose=home,
+        remaining_percent=8.0, buffered_required_percent=10.0,
+        return_margin_percent=-2.0, home_distance_m=0.0,
+        mean_percent_per_meter=0.1 if available else math.nan,
+        return_required_percent=0.0 if available else math.nan,
+        sample_count=1 if available else 0,
+        estimate_available=available, return_alert=True,
+    )
+
+
+@pytest.mark.parametrize('available', [True, False])
+def test_fresh_return_or_unknown_rate_reserve_alert_requests_abort(harness, available):
+    harness._goal_handle = Goal()
+
+    harness._battery_alert_callback(battery_alert(harness, available))
+
+    assert harness._requested_mission_state == 'Abort'
+    assert any(event[0] == 'report' and 'BATTERY:' in event[1] for event in harness.events)
+
+
+@pytest.mark.parametrize('invalid', [
+    'not_alert', 'before_goal', 'same_goal_tick', 'stale', 'future', 'stale_pose',
+    'future_pose', 'uninitialized_pose', 'message_frame', 'pose_frame', 'home_frame',
+    'invalid_pose', 'invalid_home', 'invalid_orientation', 'negative_remaining',
+    'overfull_remaining', 'invalid_remaining', 'negative_required', 'invalid_required',
+    'negative_distance', 'invalid_distance', 'inconsistent_margin', 'positive_margin',
+    'no_samples', 'invalid_rate', 'negative_rate', 'invalid_return', 'negative_return',
+])
+def test_incoherent_or_old_battery_alert_does_not_abort(harness, invalid):
+    harness._goal_handle = Goal()
+    message = battery_alert(harness)
+    if invalid == 'not_alert':
+        message.return_alert = False
+    elif invalid == 'before_goal':
+        message.header.stamp.sec = 121
+    elif invalid == 'same_goal_tick':
+        message.header.stamp.sec = 122
+    elif invalid == 'stale':
+        harness._mission_started_ns = 1
+        message.header.stamp.sec = 117
+    elif invalid == 'future':
+        message.header.stamp.sec = 124
+    elif invalid in {'stale_pose', 'future_pose', 'uninitialized_pose'}:
+        message.current_pose.header.stamp.sec = {
+            'stale_pose': 120, 'future_pose': 124, 'uninitialized_pose': 0,
+        }[invalid]
+    elif invalid in {'message_frame', 'pose_frame', 'home_frame'}:
+        {
+            'message_frame': message.header,
+            'pose_frame': message.current_pose.header,
+            'home_frame': message.home_pose.header,
+        }[invalid].frame_id = 'other_odom'
+    elif invalid in {'invalid_pose', 'invalid_home'}:
+        pose = message.current_pose if invalid == 'invalid_pose' else message.home_pose
+        pose.pose.position.x = math.nan
+    elif invalid == 'invalid_orientation':
+        message.current_pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=0.0)
+    elif invalid == 'negative_remaining':
+        message.remaining_percent = -1.0
+    elif invalid == 'overfull_remaining':
+        message.remaining_percent = 101.0
+    elif invalid == 'invalid_remaining':
+        message.remaining_percent = math.nan
+    elif invalid == 'negative_required':
+        message.buffered_required_percent = -1.0
+    elif invalid == 'invalid_required':
+        message.buffered_required_percent = math.inf
+    elif invalid == 'negative_distance':
+        message.home_distance_m = -1.0
+    elif invalid == 'invalid_distance':
+        message.home_distance_m = math.nan
+    elif invalid == 'inconsistent_margin':
+        message.return_margin_percent = -5.0
+    elif invalid == 'positive_margin':
+        message.remaining_percent = 20.0
+        message.return_margin_percent = 10.0
+    elif invalid == 'no_samples':
+        message.sample_count = 0
+    elif invalid == 'invalid_rate':
+        message.mean_percent_per_meter = math.nan
+    elif invalid == 'negative_rate':
+        message.mean_percent_per_meter = -0.1
+    elif invalid == 'invalid_return':
+        message.return_required_percent = math.inf
+    elif invalid == 'negative_return':
+        message.return_required_percent = -1.0
+
+    harness._battery_alert_callback(message)
+
+    assert harness._requested_mission_state is None
+
+
+def test_delayed_battery_callback_cannot_abort_a_successor_goal(harness):
+    harness._goal_handle = Goal()
+    request = harness.request_mission_state
+
+    def successor_started_before_request(state, goal_id=None):
+        harness._goal_handle = Goal()
+        harness._goal_handle.goal_id = UUID(uuid=[2] * 16)
+        return request(state, goal_id=goal_id)
+
+    harness.request_mission_state = successor_started_before_request
+    harness._battery_alert_callback(battery_alert(harness))
+
+    assert harness._requested_mission_state is None
+
+
+@pytest.mark.parametrize('deferred_attribute', ['_command_inflight', '_recovering'])
+def test_abort_waits_for_inflight_command_or_recovery(harness, deferred_attribute):
+    harness._goal_handle = Goal()
+    harness._requested_mission_state = 'Abort'
+    setattr(harness, deferred_attribute, True)
+    harness._check_running()
+
+    setattr(harness, deferred_attribute, False)
+    with pytest.raises(MissionAbortRequested):
+        harness._check_running()
+
+
+def test_abort_during_arming_waits_for_ack_but_does_not_continue_climb(harness):
+    configure_takeoff_services(harness)
+    harness._goal_handle = Goal()
+    call = harness._call
+
+    def abort_after_arm_dispatch(client, *args, **kwargs):
+        response = call(client, *args, **kwargs)
+        if client is harness._arming_client:
+            assert harness.request_mission_state('Abort')
+        return response
+
+    harness._call = abort_after_arm_dispatch
+    with pytest.raises(MissionAbortRequested):
+        harness._takeoff(Blackboard())
+
+    assert harness.state.armed
+    assert not harness._command_inflight
+    assert harness.odometry.pose.pose.position.z < 14.0
+    assert not harness._airborne_ready
+
+
+@pytest.mark.parametrize('deferred_attribute', ['_command_inflight', '_recovering'])
+def test_state_request_is_deferred_during_command_and_recovery(
+    harness, deferred_attribute,
+):
+    harness._goal_handle = Goal()
+    harness._requested_mission_state = 'Return'
+    setattr(harness, deferred_attribute, True)
+    harness._check_running()
+    assert harness._requested_mission_state == 'Return'
+
+    setattr(harness, deferred_attribute, False)
+    with pytest.raises(MissionStateRequested) as request:
+        harness._check_running()
+    assert request.value.state == 'Return'
+
+
+@pytest.mark.parametrize('deferred_attribute', ['_command_inflight', '_recovering'])
+def test_client_cancel_has_priority_over_pending_state_request(
+    harness, deferred_attribute,
+):
+    goal = Goal()
+    goal.is_cancel_requested = True
+    harness._goal_handle = goal
+    harness._requested_mission_state = 'Return'
+    setattr(harness, deferred_attribute, True)
+    harness._check_running()
+
+    setattr(harness, deferred_attribute, False)
+    with pytest.raises(MissionCanceled):
+        harness._check_running()
+
+
+@pytest.mark.parametrize('invalid', ['', 'Exploration', 'return', 'Verification', None])
+def test_state_request_rejects_unsupported_states(harness, invalid):
+    harness._goal_handle = Goal()
+    assert harness.request_mission_state(invalid) is False
+    assert harness._requested_mission_state is None
+
+
+@pytest.mark.parametrize('unavailable', ['idle', 'inactive', 'finalizing', 'recovering'])
+def test_state_request_rejects_when_goal_cannot_transition(harness, unavailable):
+    if unavailable != 'idle':
+        harness._goal_handle = Goal()
+    if unavailable == 'inactive':
+        harness._goal_handle.is_active = False
+    elif unavailable == 'finalizing':
+        harness._finalizing = True
+    elif unavailable == 'recovering':
+        harness._recovering = True
+
+    assert harness.request_mission_state('Return') is False
+    assert harness._requested_mission_state is None
+
+
+def test_return_request_takes_priority_over_verify(harness):
+    harness._goal_handle = Goal()
+    assert harness.request_mission_state('Verify')
+    assert harness._requested_mission_state == 'Verify'
+    assert harness.request_mission_state('Return')
+    assert harness._requested_mission_state == 'Return'
+    harness.request_mission_state('Verify')
+    assert harness._requested_mission_state == 'Return'
+
+
+@pytest.mark.parametrize('first', ['Return', 'Verify'])
+def test_abort_cannot_be_downgraded_to_another_state_request(harness, first):
+    harness._goal_handle = Goal()
+    assert harness.request_mission_state(first)
+    assert harness.request_mission_state('Abort')
+    assert harness._requested_mission_state == 'Abort'
+    harness.request_mission_state(first)
+    assert harness._requested_mission_state == 'Abort'
+
+
+def test_dormant_verify_cannot_be_entered_or_publish_a_phase(harness):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._owns_flight = True
+    harness.state.mode = 'OFFBOARD'
+    assert harness.request_mission_state('Verify')
+
+    with pytest.raises(MissionError, match='Verify is dormant'):
+        harness._verify_parent_entry('Verify')
+
+    assert harness._parent_state is None
+    assert not any(event[0] == 'phase' for event in harness.events)
+    assert harness._goal_handle.is_active
+
+
+def test_pending_return_interrupts_exploration_parent_entry(harness):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness.request_mission_state('Verify')
+    harness.request_mission_state('Return')
+
+    with pytest.raises(MissionStateRequested) as requested:
+        harness._verify_parent_entry('Exploration')
+
+    assert requested.value.state == 'Return'
+    assert harness._requested_mission_state == 'Return'
+    assert not any(event[0] == 'phase' for event in harness.events)
+
+
+def test_parent_phase_requires_initialized_ros_clock_before_takeoff(harness):
+    harness._goal_handle = Goal()
+    harness._airborne_ready = False
+    harness.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(
+        to_msg=lambda: TimeMessage()))
+
+    with pytest.raises(MissionError, match='initialized mission ROS clock'):
+        harness._verify_parent_entry('Exploration')
+
+    assert not any(event[0] in {'phase', 'service'} for event in harness.events)
+
+
+def test_exploration_phase_publishes_without_verify_runtime(harness):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._parent_state = 'Verify'
+    harness._phase_sequence = 2
+    blackboard = Blackboard()
+
+    harness._exploration_parent_entry(blackboard)
+    harness._takeoff(blackboard)
+
+    assert not hasattr(harness, '_verify')
+    phase = next(event[1] for event in harness.events if event[0] == 'phase')
+    assert phase.state == 'Exploration'
+    assert phase.sequence == 3
+    assert not any(event[0] == 'service' for event in harness.events)
+
+
+def test_state_request_topic_uses_same_transition_entry_point(harness):
+    harness._goal_handle = Goal()
+    harness._mission_state_request_callback(String(data='Verify'))
+    assert harness._requested_mission_state == 'Verify'
+
+
+@pytest.mark.parametrize('state', ['Abort', 'Return', 'Verify'])
+def test_goal_state_request_rejects_previous_goal_uuid(harness, state):
+    goal = Goal()
+    goal.goal_id = UUID(uuid=[2] * 16)
+    harness._goal_handle = goal
+    harness._goal_state_request_callback(MissionStateRequest(
+        goal_id=UUID(uuid=[1] * 16), state=state,
+    ))
+    assert harness._requested_mission_state is None
+
+    harness._goal_state_request_callback(MissionStateRequest(goal_id=goal.goal_id, state=state))
+    assert harness._requested_mission_state == state
+
+
+def test_new_goal_clears_previous_state_request(harness):
+    harness._requested_mission_state = 'Return'
+    executed = []
+    goal = SimpleNamespace(execute=lambda: executed.append(True))
+
+    harness._goal_accepted_callback(goal)
+
+    assert harness._requested_mission_state is None
+    assert harness._goal_handle is goal
+    assert executed == [True]
+
+
+def test_return_supersedes_verify_between_machine_exit_and_recovery(harness, monkeypatch):
+    def request_verify_then_return(blackboard):
+        assert harness.request_mission_state('Verify')
+        with pytest.raises(MissionStateRequested) as observed:
+            harness._check_running()
+        assert observed.value.outcome == 'verify_requested'
+        assert harness.request_mission_state('Return')
+        return observed.value.outcome
+
+    def recover():
+        assert harness._recovering
+        assert not harness.request_mission_state('Verify')
+        return ''
+
+    monkeypatch.setattr(
+        executive_module, 'build_state_machine',
+        lambda *args, **kwargs: request_verify_then_return,
+    )
+    harness._recover_to_loiter = recover
+    goal = Goal(skip_takeoff=True)
+
+    result = run_goal(harness, goal)
+
+    assert goal.outcome == 'aborted'
+    assert not result.success
+    assert 'Return is not implemented' in result.message
+    assert 'Verify is not implemented' not in result.message
+    assert harness._requested_mission_state is None
+    assert not harness._mission_lock.locked()
+
+
+@pytest.mark.parametrize('state', ['Abort', 'Return', 'Verify'])
+@pytest.mark.parametrize('loiter_acknowledged', [True, False])
+def test_stop_request_aborts_recovers_and_clears_request(
+    harness, state, loiter_acknowledged,
+):
+    goal = Goal(skip_takeoff=True)
+
+    def request_during_sweep(blackboard):
+        harness.state.mode = 'OFFBOARD'
+        harness._target = make_pose(100, 100, 100)
+        assert harness.request_mission_state(state)
+        harness._check_running()
+
+    def unexpected_path(blackboard):
+        raise AssertionError('Path must not run after a transition request')
+
+    harness._sweep = request_during_sweep
+    harness._execute_path = unexpected_path
+    if not loiter_acknowledged:
+        def reject_loiter():
+            raise MissionError('mode refused')
+
+        harness._loiter = reject_loiter
+
+    result = run_goal(harness, goal)
+
+    assert goal.outcome == 'aborted'
+    assert not result.success
+    expected = {
+        'Abort': 'aborted by a monitor request',
+        'Return': 'Return is not implemented',
+        'Verify': 'Verify is dormant',
+    }[state]
+    assert expected in result.message
+    assert harness._requested_mission_state is None
+    assert harness._goal_handle is None
+    assert harness._state_machine is None
+    assert not harness._mission_lock.locked()
+    if loiter_acknowledged:
+        assert harness.state.mode == 'AUTO.LOITER'
+        assert harness._target is None
+    else:
+        assert harness.state.mode == 'OFFBOARD'
+        assert harness._target == harness.odometry.pose.pose
+        assert harness._recovery_hold
+        assert 'retaining the local hold setpoint' in result.message
+
+
 def test_cancel_preserves_hover_and_releases_goal_slot(harness):
     goal = Goal()
 
@@ -1150,6 +1763,7 @@ def test_cancel_preserves_hover_and_releases_goal_slot(harness):
     assert harness.state.mode == 'AUTO.LOITER'
     assert harness._target is None
     assert harness._goal_handle is None
+    assert harness._requested_mission_state is None
     assert not harness._mission_lock.locked()
     assert not harness._stop.is_set()
     assert not any(event[0] == 'ramp' for event in harness.events)

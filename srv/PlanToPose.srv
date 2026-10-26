@@ -1,0 +1,6 @@
+# Requested endpoint in a TF-resolvable frame. A zero stamp uses latest TF.
+geometry_msgs/PoseStamped target
+---
+bool success
+string message
+nav_msgs/Path path

@@ -99,7 +99,7 @@ def test_walk_usage_and_buffered_return_alert_over_dds(monkeypatch, tmp_path):
 
         def odometry(x=0.0, y=0.0, z=0.0):
             point = Point(x=float(x), y=float(y), z=float(z))
-            message = Odometry(header=Header(frame_id='px4_odom'))
+            message = Odometry(header=Header(frame_id='map'))
             message.header.stamp = telemetry.get_clock().now().to_msg()
             message.pose.pose = Pose(position=point, orientation=Quaternion(w=1.0))
             wait_for(
@@ -138,12 +138,28 @@ def test_walk_usage_and_buffered_return_alert_over_dds(monkeypatch, tmp_path):
 
         status_publisher.publish(String(data='SWEEP: started'))
         battery(0.8)
-        # Allow several actual timer callbacks to prove SWEEP stays inactive.
+        # SWEEP publishes current estimates without opening a usage interval.
         spin_for(0.16)
         assert not monitor.model.active
         assert monitor.records == {}
         assert usages == []
-        assert estimates == []
+        wait_for(
+            lambda: any(message.remaining_percent == pytest.approx(80.0)
+                        and not message.estimate_available and message.sample_count == 0
+                        for message in estimates),
+            'unknown return estimate during the initial SWEEP',
+        )
+        battery(0.14)
+        wait_for(
+            lambda: any(message.return_alert and not message.estimate_available
+                        and message.remaining_percent == pytest.approx(14.0)
+                        and message.sample_count == 0 for message in estimates),
+            'reserve-only alert before any path has been flown',
+        )
+        assert monitor.records == {}
+        assert usages == []
+        assert not monitor.model.active
+        battery(0.8)
         status_publisher.publish(String(data='SWEEP: done'))
         status('EXECUTE_PATH: started', lambda: monitor.model.active)
 
@@ -163,6 +179,9 @@ def test_walk_usage_and_buffered_return_alert_over_dds(monkeypatch, tmp_path):
         assert isinstance(first_estimate, BatteryReturnEstimate)
         assert first_estimate.home_distance_m == pytest.approx(math.sqrt(125.0))
         assert first_estimate.mean_percent_per_meter == pytest.approx(1.0)
+        assert first_estimate.header.frame_id == 'px4_odom'
+        assert first_estimate.current_pose.header.frame_id == 'px4_odom'
+        assert first_estimate.home_pose.header.frame_id == 'px4_odom'
         assert not first_estimate.return_alert
 
         status('EXECUTE_PATH: done', lambda: len(monitor.records) == 1)
@@ -177,6 +196,9 @@ def test_walk_usage_and_buffered_return_alert_over_dds(monkeypatch, tmp_path):
         assert usage.end_battery_percent == pytest.approx(70.0)
         assert usage.consumed_percent == pytest.approx(10.0)
         assert usage.valid_for_estimate
+        assert usage.header.frame_id == 'px4_odom'
+        assert usage.start_pose.header.frame_id == 'px4_odom'
+        assert usage.end_pose.header.frame_id == 'px4_odom'
         assert usage.outcome == 'completed'
         assert usage.start_pose == sample['start_pose']
         assert usage.end_pose == sample['end_pose']

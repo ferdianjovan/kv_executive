@@ -2,11 +2,11 @@
 
 import math
 import os
+from pathlib import Path
 import signal
 import subprocess
 import threading
 import time
-from pathlib import Path
 
 from ament_index_python.packages import get_package_prefix
 
@@ -24,7 +24,7 @@ import rclpy
 from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, qos_profile_sensor_data, QoSProfile
 
 from rosgraph_msgs.msg import Clock
 
@@ -33,7 +33,56 @@ from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Header, String
 
 
-def test_native_monitor_repeated_walks_and_buffered_alert_over_dds(monkeypatch, tmp_path):
+@pytest.mark.parametrize('aliases, valid', [
+    ('[px4_odom]', True), ('[""]', False), ('["   "]', False),
+])
+def test_native_monitor_alias_parameter_validation(monkeypatch, tmp_path, aliases, valid):
+    """Canonical-only matching is valid; blank frame names are rejected."""
+    monkeypatch.setenv('ROS_DOMAIN_ID', str(210 + os.getpid() % 15))
+    monkeypatch.setenv('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST')
+    monkeypatch.setenv('ROS_LOG_DIR', str(tmp_path / 'ros_logs'))
+    executable = (
+        Path(get_package_prefix('kv_executive'))
+        / 'lib' / 'kv_executive' / 'battery_monitor_node'
+    )
+    log_path = tmp_path / 'alias_parameter.log'
+    monitor = None
+    try:
+        with log_path.open('w') as log_file:
+            monitor = subprocess.Popen(
+                [str(executable), '--ros-args', '-r',
+                 f'__ns:=/native_alias_parameters_{os.getpid()}', '-p',
+                 f'local_odometry_frame_aliases:={aliases}'],
+                stdout=log_file, stderr=subprocess.STDOUT,
+            )
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            log = log_path.read_text()
+            if 'Battery monitor ready' in log or monitor.poll() is not None:
+                break
+            time.sleep(0.02)
+        log = log_path.read_text()
+        if valid:
+            assert monitor.poll() is None, log
+            assert 'Battery monitor ready' in log, log
+        else:
+            assert monitor.wait(timeout=2.0) == 1, log
+            assert 'local_odometry_frame_aliases' in log
+            assert 'nonempty frame names' in log
+    finally:
+        if monitor is not None and monitor.poll() is None:
+            monitor.send_signal(signal.SIGINT)
+            try:
+                monitor.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                monitor.kill()
+                monitor.wait(timeout=3.0)
+
+
+@pytest.mark.parametrize('allow_map', [True, False])
+def test_native_monitor_repeated_walks_and_buffered_alert_over_dds(
+    monkeypatch, tmp_path, allow_map,
+):
     """Use public records/estimates; no flight-control endpoints are created."""
     monkeypatch.setenv('ROS_DOMAIN_ID', str(170 + os.getpid() % 30))
     monkeypatch.setenv('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST')
@@ -45,6 +94,8 @@ def test_native_monitor_repeated_walks_and_buffered_alert_over_dds(monkeypatch, 
     )
     assert executable.is_file(), f'Build kv_executive first: missing {executable}'
     arguments = [str(executable), '--ros-args', '-r', f'__ns:={namespace}']
+    if not allow_map:
+        arguments.extend(['-p', 'local_odometry_frame_aliases:=[px4_odom]'])
     remaps = {'/clock': f'{namespace}/clock'}
     for topic in ('battery', 'local_position/odom', 'state', 'home_position/home'):
         remaps[f'/mavros/{topic}'] = f'{namespace}/mavros/{topic}'
@@ -88,7 +139,8 @@ def test_native_monitor_repeated_walks_and_buffered_alert_over_dds(monkeypatch, 
     thread_errors = []
     values = {
         'fraction': 0.5, 'position': (0.0, 0.0, 0.0), 'armed': False,
-        'frame': 'px4_odom', 'home': (0.0, 0.0, 0.0), 'publish_odometry': True,
+        # Match stock MAVROS: map is only a label on its PX4-local stream.
+        'frame': 'map', 'home': (0.0, 0.0, 0.0), 'publish_odometry': True,
     }
 
     def stream_telemetry():
@@ -199,6 +251,15 @@ def test_native_monitor_repeated_walks_and_buffered_alert_over_dds(monkeypatch, 
             home_publisher, status_publisher, clock_publisher,
         ))
         spin_for(0.2)
+        if not allow_map:
+            # Disable compatibility using a canonical-only list. The default
+            # map-labelled local stream must yield no estimates or usage until
+            # the telemetry itself adopts the configured canonical frame.
+            update(armed=True, fraction=0.14)
+            spin_for(0.2)
+            assert not estimates
+            assert not usages
+            update(frame='px4_odom', armed=False, fraction=0.5)
         status_publisher.publish(String(data='TAKEOFF: started'))
         spin_for(0.15)
         update(armed=True, position=(0.0, 0.0, 5.0))
@@ -208,7 +269,29 @@ def test_native_monitor_repeated_walks_and_buffered_alert_over_dds(monkeypatch, 
         status_publisher.publish(String(data='SWEEP: started'))
         spin_for(0.16)
         assert not usages
-        assert not estimates
+        initial = estimate_where(
+            lambda item: item.remaining_percent == pytest.approx(50.0)
+            and not item.estimate_available and item.sample_count == 0,
+            'unknown return estimate during SWEEP before the first path',
+        )
+        assert not initial.return_alert
+        assert initial.header.frame_id == 'px4_odom'
+        assert initial.current_pose.header.frame_id == 'px4_odom'
+        assert initial.home_pose.header.frame_id == 'px4_odom'
+        update(fraction=0.14)
+        reserve = estimate_where(
+            lambda item: item.return_alert and not item.estimate_available
+            and item.remaining_percent == pytest.approx(14.0)
+            and item.sample_count == 0,
+            'reserve-only alert while sweeping without learned path consumption',
+        )
+        assert reserve.buffered_required_percent == pytest.approx(15.0)
+        assert reserve.return_margin_percent == pytest.approx(-1.0)
+        assert reserve.current_pose.header.frame_id == 'px4_odom'
+        assert math.isnan(reserve.mean_percent_per_meter)
+        assert math.isnan(reserve.return_required_percent)
+        assert not usages, 'Sweeping must not invent a path-usage record'
+        wait_for(lambda: 'BATTERY RESERVE ALERT:' in logs(), 'ROS INFO reserve alert')
 
         begin(0.5, 1)
         update(position=(3.0, 4.0, 5.0))
@@ -260,6 +343,9 @@ def test_native_monitor_repeated_walks_and_buffered_alert_over_dds(monkeypatch, 
         assert positive.consumed_percent == pytest.approx(10.0, abs=1e-5)
         assert positive.percentage_per_meter == pytest.approx(1.0, abs=1e-6)
         assert positive.valid_for_estimate
+        assert logs().count(
+            "MAVROS local odometry frame 'map' accepted as 'px4_odom'",
+        ) == int(allow_map)
 
         begin(0.25, 3)
         update(position=(103.0, 4.0, 10.0), fraction=0.24)

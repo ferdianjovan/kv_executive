@@ -107,7 +107,7 @@ def node(monkeypatch):
     return Harness(clock)
 
 
-def test_only_third_state_records_usage_and_publishes_return_estimates(node):
+def test_only_path_records_usage_but_all_flight_phases_publish_estimates(node):
     node.takeoff()
     node._tick()
     node.status('SWEEP: started')
@@ -116,7 +116,10 @@ def test_only_third_state_records_usage_and_publishes_return_estimates(node):
 
     assert node.records == {}
     assert node._usage_publisher.messages == []
-    assert node._estimate_publisher.messages == []
+    assert len(node._estimate_publisher.messages) == 2
+    assert node._estimate_publisher.messages[-1].remaining_percent == 80.0
+    assert not node._estimate_publisher.messages[-1].estimate_available
+    assert node._estimate_publisher.messages[-1].sample_count == 0
 
     node.status('SWEEP: done')
     node.status('EXECUTE_PATH: started')
@@ -151,7 +154,9 @@ def test_only_third_state_records_usage_and_publishes_return_estimates(node):
     node.odometry(20, 0, 5)
     node.battery(0.77)
     node._tick()
-    assert len(node._estimate_publisher.messages) == published
+    assert len(node._estimate_publisher.messages) == published + 1
+    assert node._estimate_publisher.messages[-1].remaining_percent == 77.0
+    assert node._estimate_publisher.messages[-1].sample_count == 1
     assert len(node.records) == 1
 
 
@@ -175,7 +180,53 @@ def test_canceled_or_aborted_walk_keeps_observed_partial_sample(node, terminal, 
     assert node._usage_publisher.messages[0].outcome == outcome
     published = len(node._estimate_publisher.messages)
     node._tick()
-    assert len(node._estimate_publisher.messages) == published
+    assert len(node._estimate_publisher.messages) == published + 1
+    assert node._estimate_publisher.messages[-1].sample_count == 1
+    assert len(node._usage_publisher.messages) == 1
+
+
+@pytest.mark.parametrize('phase', [
+    'TAKEOFF: started', 'SWEEP: started', 'MISSION: aborted',
+])
+def test_reserve_alert_without_a_path_or_learned_model(node, phase):
+    node.takeoff()
+    node.status(phase)
+    node.odometry(3, 4, 5)
+    node.battery(0.14)
+    node._tick()
+
+    estimate = node._estimate_publisher.messages[-1]
+    assert estimate.return_alert
+    assert not estimate.estimate_available
+    assert estimate.sample_count == 0
+    assert estimate.remaining_percent == pytest.approx(14.0)
+    assert estimate.buffered_required_percent == pytest.approx(15.0)
+    assert estimate.return_margin_percent == pytest.approx(-1.0)
+    assert estimate.home_distance_m == pytest.approx(50 ** 0.5)
+    assert not node.model.active
+    assert node.records == {}
+    assert node._usage_publisher.messages == []
+    assert any('BATTERY RESERVE ALERT:' in message for message in node.logs['info'])
+
+
+@pytest.mark.parametrize('stale', ['battery', 'odometry', 'state'])
+def test_sweep_reserve_alert_requires_fresh_telemetry(node, stale):
+    node.takeoff()
+    node.status('SWEEP: started')
+    node.battery(0.14)
+    node.clock.seconds += 11.0
+    if stale != 'state':
+        node.state()
+    if stale != 'odometry':
+        node.odometry(z=5)
+    if stale != 'battery':
+        node.battery(0.14)
+    node._tick()
+
+    assert node._estimate_publisher.messages == []
+    assert node.records == {}
+    assert node._usage_publisher.messages == []
+    assert not any('ALERT' in message for message in node.logs['info'])
 
 
 def test_home_is_last_disarmed_pose_and_does_not_follow_airborne_telemetry(node):
@@ -374,7 +425,8 @@ def test_unknown_home_allows_usage_record_but_suppresses_return_estimate(node):
 
 
 @pytest.mark.parametrize('frame, x', [
-    ('map', 10.0), ('', 10.0), ('px4_odom', float('nan')),
+    ('unrelated_world', 10.0), ('', 10.0), ('px4_odom', float('nan')),
+    ('map', float('nan')),
 ])
 def test_invalid_or_mismatched_odometry_invalidates_active_sample(node, frame, x):
     node.takeoff()
@@ -388,6 +440,66 @@ def test_invalid_or_mismatched_odometry_invalidates_active_sample(node, frame, x
 
     assert not node.records[1]['valid_for_estimate']
     assert node.records[1]['invalid_reason']
+
+
+def test_stock_mavros_frame_alias_keeps_canonical_usage_and_reserve_alert(node):
+    node.state(armed=False)
+    node.odometry(1, 2, 0, frame='map')
+    node.battery(0.90)
+    node.status('TAKEOFF: started')
+    node.state()
+    node.odometry(1, 2, 5, frame='map')
+    node.status('TAKEOFF: done')
+    node.status('SWEEP: started')
+    node.battery(0.14)
+    node._tick()
+    reserve = node._estimate_publisher.messages[-1]
+    assert reserve.return_alert
+    assert not reserve.estimate_available
+    assert reserve.header.frame_id == 'px4_odom'
+    assert reserve.home_pose.header.frame_id == 'px4_odom'
+    assert reserve.current_pose.header.frame_id == 'px4_odom'
+    assert reserve.home_pose.pose.position == Point(x=1.0, y=2.0)
+    assert reserve.current_pose.pose.position == Point(x=1.0, y=2.0, z=5.0)
+
+    node.start_walk(0.80)
+    node.odometry(4, 6, 5, frame='map')
+    node.battery(0.79)
+    node.status('EXECUTE_PATH: done')
+    usage = node._usage_publisher.messages[-1]
+    assert usage.valid_for_estimate
+    assert usage.distance_m == pytest.approx(5.0)
+    assert usage.header.frame_id == 'px4_odom'
+    assert usage.start_pose.header.frame_id == 'px4_odom'
+    assert usage.end_pose.header.frame_id == 'px4_odom'
+    assert usage.start_pose.pose.orientation == Quaternion(w=1.0)
+    assert usage.end_pose.pose.position == Point(x=4.0, y=6.0, z=5.0)
+    assert sum('accepted as' in message for message in node.logs['info']) == 1
+
+
+def test_empty_frame_aliases_require_exact_canonical_frame(node):
+    node.config['local_odometry_frame_aliases'] = []
+    node.state(armed=False)
+    node.odometry(1, 2, 3, frame='map')
+    assert node._pose is None
+    assert node._home_pose is None
+    node.odometry(1, 2, 3)
+    assert node._pose.header.frame_id == 'px4_odom'
+    assert node._pose.pose.position == Point(x=1.0, y=2.0, z=3.0)
+    assert not any('accepted as' in message for message in node.logs['info'])
+
+
+def test_frame_alias_normalization_preserves_received_message(node):
+    message = Odometry(header=Header(frame_id='map'))
+    message.pose.pose = Pose(
+        position=Point(x=11.0, y=-7.0, z=5.0),
+        orientation=Quaternion(z=0.6, w=0.8),
+    )
+    original = deepcopy(message)
+    node._odometry_callback(message)
+    assert message == original
+    assert node._pose.header.frame_id == 'px4_odom'
+    assert node._pose.pose == original.pose.pose
 
 
 def test_disconnected_state_suppresses_return_alert_and_invalidates_interval(node):

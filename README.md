@@ -1,10 +1,15 @@
 # KV Executive
 
-The executive runs a YASMIN state machine with `TAKEOFF`, `SWEEP`, and
-`EXECUTE_PATH` states. The motion planner and battery monitor run as separate
-nodes. The planner exposes the `plan_path` service. YASMIN is a required
-Python runtime dependency; the executive uses its state-machine
-implementation directly.
+The executive starts each mission in the nested YASMIN state machine
+`Exploration`. It takes off once, then repeats `SWEEP` and `EXECUTE_PATH`.
+Verify is dormant and disconnected from Exploration while startup and flight
+behavior are isolated. Confirmed smoke/fire and a valid battery return/reserve
+alert abort the action with bounded LOITER recovery. A new action goal is
+required to resume. The motion planner, detection monitor and battery monitor
+run as separate nodes. The planner exposes `plan_path` for Exploration and
+retains `plan_to_pose` for future targeted behavior. YASMIN is a required
+Python runtime dependency; the executive uses its state-machine implementation
+directly.
 
 ## Start and execute a mission
 
@@ -12,40 +17,62 @@ Build the package and source the generated action and service bindings before
 launching:
 
 ```bash
-colcon build --packages-select kv_executive --symlink-install
+colcon build --packages-up-to kv_executive --symlink-install
 source install/setup.bash
 ```
 
 Start the Gazebo/PX4 simulation first, then start MAVROS in its own terminal:
 
 ```bash
-ros2 launch kv_executive px4.launch.py drone_name:=x500_depth
+ros2 launch kv_executive px4.launch.py drone_name:=kv_drone
 ```
 
 Wait for connected MAVROS state and local odometry before starting autonomy
 in another terminal:
 
 ```bash
-ros2 launch kv_executive autonomy.launch.py drone_name:=x500_depth
+ros2 launch kv_executive autonomy.launch.py drone_name:=kv_drone
 ```
 
 Autonomy defaults `executive_udp_only` to `true`: the executive uses Fast DDS
 over UDP with shared memory disabled. This is a scoped workaround for the
-observed native Python executor crashes; it leaves the planner and MAVROS
-transport environment alone. The launch prints `Mission executive: Fast DDS
+observed native Python executor crashes; it leaves the planner and
+MAVROS transport environment alone. The launch prints `Mission executive: Fast DDS
 UDP-only transport (shared memory disabled)`. Explicit localhost-only settings
 select a loopback-only UDP profile. Other selected RMW implementations are
 left alone. To preserve an existing custom Fast DDS XML/discovery configuration,
 set `executive_udp_only:=false`. See the
 [crash investigation](docs/native_crashes.md) for the evidence and test limits.
 
-Autonomy starts the planner and executive; `start_mavros` and
-`start_battery_monitor` both default to `false`. Before the first mission's
-takeoff, start the battery monitor in a separate terminal:
+Autonomy starts the planner and executive; `start_mavros` defaults to `false`.
+When MAVROS is already running, autonomy uses that instance and does not apply
+the frame-label overrides in `kv_executive/px4.launch.py`. Both the explicit
+`px4_odom` label from this package's MAVROS launch and the stock MAVROS `map`
+label on its local-odometry stream are supported, as described below.
+
+Start the battery and detection monitors together in another terminal before
+the first mission's takeoff:
 
 ```bash
-ros2 launch kv_executive battery_monitor.launch.py use_sim_time:=true
+ros2 launch kv_executive monitoring.launch.py drone_name:=kv_drone use_sim_time:=true
 ```
+
+Monitoring starts both monitors by default. It defaults `drone_name` to
+`kv_drone` and `use_sim_time` to `true`; match these values to autonomy and
+use `use_sim_time:=false` on a real vehicle. Its
+`start_battery_monitor` and `start_detection_monitor` arguments can disable
+either monitor. Monitor switches and configuration files belong to the
+monitoring launch; autonomy does not accept them. Start the detectors
+separately with
+`ros2 launch kv_perception perception.launch.py drone_name:=kv_drone`.
+
+The standalone detection monitor also defaults `detection_monitor_udp_only` to
+`true`, applying the same scoped Fast DDS UDP workaround. `monitoring.launch.py`
+forwards this option to the detection monitor; the native battery monitor keeps
+its inherited transport settings. Set `detection_monitor_udp_only:=false` to
+preserve a custom transport configuration. Other RMW implementations are left
+unchanged, and localhost-only discovery remains limited to loopback. Detection
+monitor launches enable Python fault traces for any subsequent native crash.
 
 The default launch starts the nodes and waits for an explicit mission request:
 
@@ -56,13 +83,17 @@ ros2 action send_goal /execute_mission kv_executive/action/ExecuteMission '{}' -
 `execute_mission` is now an action, replacing the old Trigger service. Its name
 is relative, so its full name follows any node namespace. The action accepts
 the goal immediately and provides `state` and `message` feedback during the
-flight. Its final result contains `success` and `message`; the action status is
-`SUCCEEDED`, `CANCELED`, or `ABORTED`. Only one goal runs at a time. After that
-goal reaches a terminal status, the server accepts another goal without a
-node restart.
+flight. The same goal stays active across Exploration cycles; finishing a path
+does not return an action result or release the mission slot. Canceling returns
+`CANCELED`; monitor alerts, errors, and manual Verify/Return requests return
+`ABORTED`. The result
+contains `success` and `message`; there is no automatic successful completion
+for repeating Exploration. Only one goal runs at a time.
+After that goal reaches a terminal status, the server accepts another goal
+without a node restart.
 
-The default goal includes takeoff and requires a disarmed vehicle. To start
-another sweep and path while the vehicle is already airborne in `AUTO.LOITER`:
+The default goal includes one takeoff and requires a disarmed vehicle. To start
+repeating Exploration while the vehicle is already airborne in `AUTO.LOITER`:
 
 ```bash
 ros2 action send_goal /execute_mission kv_executive/action/ExecuteMission \
@@ -93,6 +124,30 @@ returns `ABORTED`. Setpoints continue until telemetry confirms control has
 left `OFFBOARD`/`AUTO.TAKEOFF`. If the loiter handoff fails, the final result
 reports the failure and the hold stream remains active.
 
+### Abort Exploration
+
+Internal code can stop Exploration with `node.request_mission_state('Abort')`.
+External nodes publish the same case-sensitive name as `std_msgs/msg/String`
+on the relative topic `mission_state_request`, for example:
+
+```bash
+ros2 topic pub --once /mission_state_request std_msgs/msg/String '{data: Abort}'
+```
+
+An Abort request stops the current motion, requests `AUTO.LOITER`, and ends
+the action as `ABORTED`. It does not fly home, land, or resume automatically.
+Verify has no connection from Exploration and no active perception, targeted
+planning, or GPS subscriptions in the executive. Compatibility requests named
+`Verify` or `Return` also abort to LOITER; neither starts a flight behavior.
+Requests are checked during motion and waits. An already dispatched mode or
+arming command is observed to its bounded outcome before recovery begins.
+
+Unsupported names, requests while idle, and requests during cancellation or
+recovery are ignored. The Python API returns whether a request was accepted.
+Goal-scoped requests include the active action UUID, and pending requests are
+cleared when that goal ends. The detection monitor sends `Abort`; the executive
+also consumes the battery monitor's `return_alert` directly as described below.
+
 The planner can also be called independently from a terminal:
 
 ```bash
@@ -100,7 +155,23 @@ ros2 service call /plan_path kv_executive/srv/PlanPath '{}'
 ```
 
 It returns `success`, `message`, and the new `nav_msgs/Path`; requesting a path
-alone does not fly it.
+alone does not fly it. The retained explicit endpoint service can be called
+independently, but is unused by the current Exploration action:
+
+```bash
+ros2 service call /plan_to_pose kv_executive/srv/PlanToPose \
+  '{target: {header: {frame_id: map}, pose: {position: {x: 5.0, y: 0.0, z: 5.0}, orientation: {w: 1.0}}}}'
+```
+
+The target is transformed into the actual OctoMap frame at its header stamp;
+a zero stamp requests latest TF. Explicit requests may expand the rolling
+planning volume to reach the endpoint, but retain the home-relative altitude
+limits and drone/obstacle clearance. Requests with invalid poses, missing TF,
+out-of-bounds altitude, or displacement above `maximum_target_distance`
+(50 m by default) fail. Approximate OMPL solutions are rejected. Exploration
+keeps its original rolling bounds. The planner keeps the existing treatment
+of unmapped OctoMap space as free; collision checks use the available occupied
+voxels and do not certify unseen space.
 
 Planning requires external odometry, a ground-home reference, and a nonempty
 OctoMap. The response lists each missing input and its configured topic rather
@@ -128,14 +199,15 @@ Other Python nodes use an `rclpy.action.ActionClient` with
 `kv_executive.action.ExecuteMission` and the relative name `execute_mission`.
 The installed `executive_node.py` runs a `MultiThreadedExecutor` so action
 callbacks, telemetry, service replies, and setpoint publication continue while
-the YASMIN sequence runs.
+the YASMIN state machine runs.
 
-To request one mission automatically when the executive starts, start MAVROS
-and the standalone battery monitor first, then run:
+To request repeating Exploration automatically when the executive starts,
+start MAVROS, the detectors and `monitoring.launch.py` first with matching
+`drone_name` and `use_sim_time`, then run:
 
 ```bash
 ros2 launch kv_executive autonomy.launch.py \
-  drone_name:=x500_depth \
+  drone_name:=kv_drone \
   auto_start_mission:=true
 ```
 
@@ -144,6 +216,9 @@ the executive. Supply a different ROS parameter file with
 `mission_config:=/absolute/path/mission.yaml`; the planner has its own
 `planner_config` argument. The launch argument `auto_start_mission` overrides
 the value in the mission parameter file.
+
+The default remains `false`: bringing the drone online does not itself arm it.
+`Exploration` is always the first parent state when a mission is requested.
 
 FCU state and local odometry have separate freshness deadlines. PX4 sends
 HEARTBEAT at 1 Hz, and MAVROS publishes `/mavros/state` from those heartbeats.
@@ -155,8 +230,9 @@ errors identify the topic, and stale-data errors include the receive age and
 configured deadline. These deadlines measure monotonic wall time since receipt.
 
 State progress is logged and published on `mission_status` (by default
-`/mission_status`). Messages include `TAKEOFF: started`, `TAKEOFF: done`,
-corresponding messages for the other states, sweep progress, completed path
+`/mission_status`). Messages include `Exploration: started`,
+`TAKEOFF: started`, `TAKEOFF: done`, corresponding messages for the other
+states, sweep progress, completed path
 legs, and the final result. FCU mode changes and MAVROS status messages are
 also forwarded there to help diagnose unexpected flight-mode changes. Inspect
 them with:
@@ -165,7 +241,18 @@ them with:
 ros2 topic echo /mission_status
 ```
 
-One mission runs the following sequence:
+The retained `kv_executive/msg/MissionPhase` topic `mission_phase` also records
+the active goal UUID, monotonically increasing phase sequence and parent-state
+name. The detection monitor uses this typed phase signal to request Abort
+only during Exploration and match detections to the current goal.
+
+One active goal runs the following nested Exploration sequence:
+
+```text
+Exploration
+  TAKEOFF (initial entry only, unless skip_takeoff is true)
+      -> SWEEP -> EXECUTE_PATH -> SWEEP -> EXECUTE_PATH -> ...
+```
 
 - `TAKEOFF` requires the vehicle to be disarmed initially unless the goal sets
   `skip_takeoff: true`, which requires an armed vehicle in `AUTO.LOITER` and
@@ -188,7 +275,8 @@ One mission runs the following sequence:
   equal lengths along the path, and executes all three legs consecutively
   using MAVROS local-position setpoints. Split boundaries are interpolated;
   unequal waypoint spacing does not change where the thirds fall. The sweep
-  runs once before path execution. Each movement uses a yaw-only heading from
+  runs before each path execution, and every `EXECUTE_PATH` requests a fresh
+  plan from the current position. Each movement uses a yaw-only heading from
   `atan2(dy, dx)` in PX4 local coordinates. The drone turns in place and waits
   for heading convergence before moving forward along a segment; it keeps
   that heading during translation. Vertical moves and repeated points retain
@@ -196,9 +284,11 @@ One mission runs the following sequence:
   Turns use `path_turn_step_duration` per 60 degrees (5 seconds by default),
   independently of the slower scan timing.
 
-On completion, the executive confirms `AUTO.LOITER` and returns the action
-result. After taking flight control, cancellation or failure recovery refreshes
-the hover target from current local odometry and requests `AUTO.LOITER` when
+Each sweep and path confirms `AUTO.LOITER` before the next state starts.
+Successful path completion loops back to `SWEEP`, without another takeoff or
+action request. A failed scan or path ends the goal instead of retrying.
+After taking flight control, recovery for cancellation, parent-state requests,
+or errors refreshes the hover target from current local odometry and requests `AUTO.LOITER` when
 the vehicle is armed and still in `OFFBOARD` or `AUTO.TAKEOFF`. With stale
 telemetry, it retains the last validated target. If the handoff fails while the
 vehicle remains armed in OFFBOARD, the hold setpoint continues streaming and the
@@ -206,7 +296,93 @@ returned message includes the recovery failure. A request rejected because
 the vehicle was already armed does not initiate recovery mode changes.
 Recovery also preserves an observed pilot or failsafe flight-mode takeover.
 
-### PX4 returning home after the mission
+### Dormant Verify reference: approach, reacquire, center and search
+
+The Verify controller and its tests remain in the source tree for future work.
+The active mission graph contains only Exploration: it does not construct the
+Verify controller, subscribe to its detector/GPS inputs, create a targeted
+planning client, execute this sequence, or publish fire-source reports. The
+following describes the preserved design, not current autonomy behavior.
+
+The controller defines four nested states. If reconnected, every translation,
+including altitude changes and retreats, would request a collision-checked
+`plan_to_pose` path using level position setpoints, guarded short path segments
+and bounded yaw turns. Its stored sequence is:
+
+```text
+Verify/APPROACH_SMOKE -> Verify/REACQUIRE
+                           | centered smoke, fewer than four regions -> APPROACH_SMOKE
+                           | persistent fire -> CENTER_FIRE -> Exploration
+                           | smoke in all four regions -> SEARCH_FIRE
+                           | no source recovered -> Exploration
+Verify/SEARCH_FIRE -> CENTER_FIRE when fire is confirmed
+                  -> retreat/climb -> APPROACH_SMOKE otherwise
+```
+
+1. `APPROACH_SMOKE` accepts a confirmed, fresh smoke detection in any camera
+   region. It saves the current pose, altitude and heading, then targets a
+   5–20 m step along the smoke's horizontal bearing. Greater apparent smoke
+   coverage chooses a shorter step; image coverage is a movement heuristic,
+   not a measured distance to the source. Smoke is checked before planning
+   and throughout execution. Loss of smoke or smoke covering all four regions
+   stops the current movement and enters REACQUIRE through LOITER.
+2. `REACQUIRE` uses the saved altitude and heading to recover a lost view,
+   makes bounded yaw corrections to center visible smoke horizontally, and
+   checks thermal detections throughout. A persistent fire enters CENTER_FIRE;
+   centered smoke in fewer than four regions starts another approach;
+   smoke in all four regions enters SEARCH_FIRE. If no usable source is
+   recovered within `verify_reacquire_timeout`, it resumes Exploration.
+3. `CENTER_FIRE` tracks the same thermal object over distinct source images
+   for at least 1.5 seconds and three frames by default. It makes bounded yaw
+   and 0.5 m altitude corrections, then permits at most four 0.75 m creep
+   steps. Creep requires a current smoke observation and stops if smoke fills
+   all four regions. A centered, stable fire produces a `Fire source found`
+   report, then the drone turns 180 degrees, plans a 10 m retreat and resumes
+   Exploration without another takeoff. If smoke already fills all four
+   regions, the drone retreats before reacquiring the source.
+4. `SEARCH_FIRE` stays level for three seconds and sweeps left 60 degrees,
+   right 120 degrees and left 60 degrees, returning to the starting heading.
+   These position-setpoint interfaces do not safely control pitch or roll,
+   so the allowed level sweep is used. A persistent fire interrupts the
+   search and enters CENTER_FIRE. Otherwise the drone turns away, plans a
+   10 m retreat with a 10 m climb, turns back toward the smoke and approaches
+   again. Altitude bounds and obstacle clearance apply to this retreat too.
+
+The dormant controller includes source image stamp and same-track persistence
+checks. Observations must be newer than the action and fresh against
+both ROS time and elapsed receive time. Fire matching uses track identity,
+image position and area consistency. After a targeted correction or creep,
+the next correction or report waits for a newer confirming source image.
+The controller limits approach cycles
+to eight by default; exhausted motion/centering limits, invalid telemetry,
+unavailable planning or GPS, and unsafe or unreachable targets abort to hold
+and LOITER instead of inventing a fallback trajectory. These defaults live
+in `config/mission.yaml` under `verify_*`, `global_position_*` and
+`fire_exclusion_radius`; the planner has separate bounds and clearance
+parameters in `config/planner.yaml`.
+
+The retained reporting helper is designed to publish completed observations
+reliably with transient-local retention on `fire_sources` as
+`kv_executive/msg/FireSourceReport`. Each report includes
+the site ID and label, drone pose in PX4 local coordinates, the corresponding
+pose in the planning frame, a fresh valid `sensor_msgs/msg/NavSatFix`, observed
+fire-source count, track ID, viewing bearing and exclusion radius. The latitude
+and longitude describe the drone's observation location. Camera detections
+alone do not measure the fire's three-dimensional position. A fresh valid GPS
+fix from `/mavros/global_position/global` is required before publishing a report;
+the default freshness deadline is two seconds. No global location is fabricated
+when GPS is unavailable.
+
+The planner retains support for sampling Exploration endpoints outside
+externally supplied observation circles (15 m radius by default). Current
+autonomy produces no new reports because Verify is disconnected. The detection
+monitor always requests Abort for qualifying fresh detections and does not
+suppress known viewing sectors. These circles are goal exclusions, not hard
+no-fly regions or measured fire boundaries. The planner retains up to 100
+reports and fails clearly if 128 random samples cannot find an eligible
+Exploration endpoint.
+
+### PX4 returning home during or after Exploration
 
 PX4 normally records a home position when arming; that alone does not request
 a return. PX4 monitors the setpoint stream while in OFFBOARD. If it stops before
@@ -216,9 +392,9 @@ landing can therefore be a failsafe response, rather than a command from this
 mission. Stopping local setpoints after PX4 has confirmed `AUTO.LOITER` does
 not itself trigger offboard loss.
 
-The normal completion sequence already confirms `AUTO.LOITER` before stopping
-setpoints, so offboard loss alone does not establish the cause of a return
-after successful completion. The x500 SITL configuration also defaults
+Normal state handoffs and successful recovery confirm `AUTO.LOITER` before
+stopping setpoints, so offboard loss alone does not establish the cause of a
+return after a handoff. The x500 SITL configuration also defaults
 `NAV_DLL_ACT` to Return (`2`), so a ground-station data-link timeout can cause
 a return while the vehicle is loitering. The actual mode transitions, PX4
 status messages, and flight log are needed to establish which failsafe fired.
@@ -296,32 +472,121 @@ the three planned legs without dynamic obstacle replanning.
 
 The executive's `local_odometry_topic` defaults to
 `/mavros/local_position/odom` and `local_frame` to `px4_odom`.
+Stock MAVROS labels this local-position stream `map` even though its numbers
+are still expressed relative to the PX4 EKF local origin. The executive and
+battery monitor therefore accept `local_odometry_frame_aliases: ['map']` by
+default. At their configured MAVROS local-odometry input only, a recognized
+alias is relabelled to `local_frame` without changing the position or
+orientation values. This is a naming compatibility rule for that input; the
+planner's actual `map` coordinates still require the body-pose alignment
+described above. No identity TF is added between the planner map and PX4 local
+coordinates.
+
+Unknown or empty incoming frame labels still fail validation. Set
+`local_odometry_frame_aliases: [px4_odom]` in both the executive and battery monitor
+parameter files to require the exact `local_frame` label. If a different
+odometry topic is configured, list an alias only when its numeric coordinates
+are known to use the PX4 local origin and ENU convention.
+
 `robot_base_frame` defaults to `<drone_name>/base_link` and can be overridden
 as a launch argument. TF must connect the path frame to that body frame at
 the MAVROS odometry timestamp. The mission stops if telemetry or the required
 transform cannot be obtained within the configured timeouts.
 
+To diagnose a local-odometry label mismatch before sending a goal:
+
+```bash
+ros2 topic echo /mavros/local_position/odom --once --field header
+ros2 param get /mission_executive local_frame
+ros2 param get /mission_executive local_odometry_frame_aliases
+ros2 param get /battery_monitor local_odometry_frame_aliases
+```
+
+The raw topic may report `px4_odom` with this package's MAVROS launch or `map`
+with the stock MAVROS launch. Earlier simulated-FCU tests published only the
+explicit `px4_odom` label, so they did not exercise the stock MAVROS label that
+caused the TAKEOFF rejection. Regression coverage now includes both labels
+and rejection of unrelated frames.
+
+## Smoke and fire monitoring
+
+`detection_monitor_node.py` listens to the detectors' typed
+`kv_perception/msg/SmokeDetection` and `kv_perception/msg/FireDetection`
+messages. Either detector can interrupt an active Exploration goal: smoke
+must have `detected=true`, `status=CONFIRMED` and `background_ready=true`;
+fire must have `detected=true` and `status=CONFIRMED`. The monitor uses the
+detectors' existing persistence checks and adds no second confirmation delay.
+Here, vicinity means a source visible in the camera; these messages do not
+provide a reliable distance in metres.
+
+The monitor follows the executing goal UUID on
+`execute_mission/_action/status` and the typed parent phase on `mission_phase`.
+It publishes `kv_executive/msg/MissionStateRequest` with `state: Abort` and
+that goal's `goal_id` on `mission_state_request_for_goal` once per Exploration
+entry. A new action goal and fresh observation rearm the monitor.
+It sends no requests outside Exploration, while idle, or while the action is
+canceling or terminal.
+The executive checks the requested UUID against its active goal and latches
+the transition atomically under the goal lock. A delayed request from a
+previous goal cannot interrupt a later goal. The existing
+`mission_state_request` String topic remains available for manual requests.
+Source image header stamps must be nonzero, newer than both the goal's
+acceptance stamp and current Exploration entry, and fresh against the
+monitor's ROS clock: no more than 2 seconds old or
+0.25 seconds in the future by default. Duplicate source frames do not cause
+additional requests. A later goal requires a fresh observation from that
+goal, so an observation from a previous mission cannot stop a new one. A
+monitor joining an executing goal waits for its matching phase and a qualifying
+detector observation. The request aborts Exploration and requests `AUTO.LOITER`.
+The action releases its goal after recovery; it stays stopped until another
+goal is sent explicitly. The executive performs the recovery flight commands;
+the monitor only publishes the goal-scoped stop request. It does not subscribe
+to odometry or fire-source reports, and applies no known-view suppression.
+
+`monitoring.launch.py` starts this monitor and the battery monitor by default.
+To run detection monitoring alone, disable the battery monitor there or use
+the existing individual launch instead:
+
+```bash
+ros2 launch kv_executive detection_monitor.launch.py drone_name:=kv_drone
+```
+
+The combined and individual monitor launches default `use_sim_time` to `true`;
+use the same clock setting and `drone_name` as the executive and detectors,
+and set `use_sim_time:=false` on a real vehicle. Both accept
+`detection_monitor_config` for a custom
+`config/detection_monitor.yaml`, `smoke_detection_topic`, and
+`fire_detection_topic`. Detector inputs default to
+`/<drone_name>/smoke/detection` and `/<drone_name>/fire/detection`; the monitor
+stays in the executive namespace, with relative action-status and request
+topics. For a separately namespaced executive, both monitor launches also
+accept `action_status_topic` and `mission_state_request_topic` overrides.
+Topic launch arguments override the corresponding YAML values. Run one
+monitor for each executive, alongside the matching detector inputs.
+Pass detector topic overrides to monitoring and configure the matching
+perception outputs. Autonomy no longer accepts detector, Verify-planning-frame,
+or GPS topic launch arguments because these are unused by Exploration.
+
 ## Battery usage and return estimate
 
-Run the monitor separately from autonomy so its startup and logs can be
-controlled independently:
+The combined `monitoring.launch.py` starts the battery monitor alongside the
+detection monitor. To run battery monitoring alone, disable detection
+monitoring there or use the existing individual launch instead:
 
 ```bash
 ros2 launch kv_executive battery_monitor.launch.py use_sim_time:=true
 ```
 
-The standalone launch defaults `use_sim_time` to `true`; use `false` on a real
-vehicle. Supply `battery_monitor_config:=/absolute/path/battery_monitor.yaml`
-to override its parameters. Start MAVROS first and wait for telemetry, then
-start autonomy and the monitor before sending the first mission goal. This
-lets the monitor observe the grounded home pose, battery baseline, and all
-mission-status transitions. Autonomy leaves the monitor disabled by default
-(`start_battery_monitor:=false`). To launch it alongside autonomy instead, set
-`start_battery_monitor:=true` and do not also run the standalone launch.
+Both monitor launches default `use_sim_time` to `true`; use the same clock
+setting as autonomy and `false` on a real vehicle. Both accept
+`battery_monitor_config:=/absolute/path/battery_monitor.yaml` to override the
+monitor's parameters. Start MAVROS first and wait for telemetry, then start
+autonomy and monitoring before sending the first mission goal. This lets the
+monitor observe the grounded home pose, battery baseline, and all
+mission-status transitions. Run only one instance of each monitor.
 Keep `auto_start_mission:=false` (the default) for the staged startup sequence;
-if enabling automatic missions, start the standalone monitor before autonomy.
+if enabling automatic missions, start monitoring before autonomy.
 
-The monitor was already a separate OS process when started by autonomy.
 Separate launching provides startup control and makes failures easier to
 isolate; it is not a confirmed fix for the native segmentation faults.
 
@@ -363,20 +628,21 @@ Use a fresh disarmed simulation run when establishing a new training baseline.
 ### Recording path usage
 
 `TAKEOFF: done` on `mission_status` establishes the post-takeoff battery
-baseline. Measurement starts only at `EXECUTE_PATH: started`, the third state
-that flies the planned random-walk path, and ends when that state finishes or
+baseline. Measurement starts only at `EXECUTE_PATH: started`, the Exploration
+child state that flies the planned random-walk path, and ends when that state finishes or
 the mission terminates. The interval's battery baseline is refreshed at its
 start, so the intervening scan does not enter the path's measured consumption.
 Run the monitor before starting the mission: progress-only retained status
-messages cannot reconstruct a third-state start missed while the node was down.
+messages cannot reconstruct a path start missed while the node was down.
 If fresh battery, odometry, or vehicle state is missing at that start, the node
 skips learning for that interval rather than inventing its starting battery.
-A mission with `skip_takeoff: true` establishes its baseline when the third
-state starts. Each third-state interval is stored in the node's
+A mission with `skip_takeoff: true` establishes its baseline when its first
+`EXECUTE_PATH` starts. Each path interval is stored in the node's
 in-memory dictionary (a C++ map keyed by sample ID) and published on
 `battery_usage` as `kv_executive/msg/BatteryUsage`, with start/end poses, accumulated 3D
 travel distance, start/end battery percentage, consumption, and outcome. These
-records survive repeated missions and disarms while the node runs; they are not
+records cover repeated Exploration cycles and survive new goals and disarms
+while the node runs; they are not
 saved across node restarts. Restart the node when changing the battery pack or
 vehicle to clear the learned model.
 
@@ -390,22 +656,29 @@ return_required_percent = mean_percent_per_meter * straight_line_home_distance_m
 buffered_required_percent = return_required_percent * return_safety_factor + reserve_percent
 ```
 
-The current third-state interval also contributes once it has sufficient
+The current path interval also contributes once it has sufficient
 distance and measurable depletion, including before the first completed
 interval. `sample_count` counts usable completed records plus the usable active
 interval. Intervals with telemetry gaps or rising charge are not learned.
-`battery_return_estimate` publishes
-`kv_executive/msg/BatteryReturnEstimate` at `monitor_rate` (2 Hz), including
+`battery_return_estimate` publishes throughout armed flight, including sweeps,
+as `kv_executive/msg/BatteryReturnEstimate` at `monitor_rate` (2 Hz), including
 current/home poses, remaining percentage, straight-line 3D distance, estimated
 return cost, buffered cost, margin, availability, and alert status. Check
 `estimate_available` before using the estimate fields. The monitor suppresses
 estimates when battery, local odometry, or connected vehicle state is stale;
 default receipt-age limits are 5, 2, and 10 seconds respectively.
 
-The existing `battery_return_estimate` message includes the typed boolean
-`return_alert` field, so a future autonomy subscriber can receive alerts
-without adding a service. The separate launch preserves these publishers and
-the monitor's `mission_status` subscription.
+The executive subscribes to `battery_return_estimate` through its configurable
+`battery_alert_topic` parameter. A fresh valid message with `return_alert=true`
+aborts the active Exploration action and requests `AUTO.LOITER`.
+`battery_alert_timeout` defaults to 5 seconds; stale, invalid, or pre-goal
+messages cannot abort a new mission. With a learned model, the alert uses the
+buffered return cost. Before the model is available (`estimate_available=false`),
+the monitor can still alert when remaining charge reaches its configured
+reserve. Both alerts stop Exploration; the executive adds no separate raw
+battery threshold. It does not initiate Return flight. Once recovery finishes,
+send a new action goal explicitly to resume; continued alerts can stop that
+goal too.
 
 Home uses the latest valid local pose received while disarmed and freezes that
 pose at `TAKEOFF: started`, or when the vehicle arms for externally initiated
@@ -418,7 +691,7 @@ local frame, not the planner's external-odometry home.
 
 The default alert threshold adds a 30% multiplier to the estimated return cost
 and a reserve of 15 percentage points. When remaining battery reaches or falls
-below that threshold during the third state, an `INFO` terminal message reports
+below that threshold during armed flight, an `INFO` terminal message reports
 the remaining charge, home distance, estimated cost, buffer, and margin. Alerts
 repeat at most every `alert_repeat_period` (10 seconds). This node issues no
 flight commands. A straight-line consumption estimate does not account for
@@ -437,33 +710,51 @@ ros2 topic echo /battery_return_estimate
 After building and sourcing the workspace, run the mission tests with:
 
 ```bash
-colcon test --packages-select kv_executive --ctest-args -R '^(mission_|battery_|planner_inputs$)'
+colcon test --packages-select kv_executive --ctest-args -R '^(mission_|verification$|verify_ros$|battery_|detection_monitor|planner_inputs$)'
 colcon test-result --verbose
 ```
 
 These cover geometry, state sequencing, failure handling, and the public ROS
 action using an isolated simulated FCU. The action test checks feedback,
-cancellation, terminal results, repeated goals, and independent setpoint
-publication during mode-service waits. A simulated OFFBOARD-loss watchdog
+cancellation, terminal results, repeating Exploration, repeated goals, and
+independent setpoint publication during mode-service waits. A simulated OFFBOARD-loss watchdog
 checks the LOITER handoff and deliberate publisher loss; path tests check
 forward-facing yaw after frame conversion and turns at corners. State updates
 run at 1 Hz independently of odometry; tests exercise heartbeat gaps, expired
 state, stale odometry, and an explicit disconnect. Planner tests use the real
-C++ service to check missing inputs and planning with a map published before
-the planner starts. Battery tests cover depletion calculations, path-only
+C++ services to check missing inputs, planning with a retained map, explicit
+target validation and transforms, exact endpoint/heading preservation, and
+reported-fire Exploration goal exclusion. Battery tests cover depletion calculations, path-only
 recording, baseline and home handling, telemetry validity, and buffered return
 alerts. These tests do not replace SITL or vehicle flight validation.
 
+Detection monitor tests cover either detector independently, confirmed-status
+gating, stale/future/zero source stamps, goal and phase boundaries, duplicate
+observations, idle suppression and rearming on each
+Exploration entry. ROS integration connects typed detector messages to the
+real monitor and an active mission. Active-mission tests check monitor-triggered
+abort, LOITER recovery, subsequent goals, and the absence of a connected Verify
+state. The retained Verify controller/navigation unit tests cover bounded
+branches, perception guards, waypoint preservation and reporting validation
+without enabling that controller in autonomy.
+
 The native monitor DDS test checks the installed C++ executable with zero and
 positive consumption, weighted learning, frozen home, invalid telemetry and
-the buffered alert. The combined action test completes three missions with
-constant 50% battery, then cancels a fourth goal during its sweep; it also
+the buffered alert. The combined action test exercises repeated Exploration
+cycles with constant 50% battery and cancellation during a sweep; it also
 exercises the legacy executable's forwarding to the native monitor.
 
 For Python nodes exiting with `-11` (SIGSEGV), see the
 [native crash investigation](docs/native_crashes.md). The Python entrypoints
 emit all-thread fault traces on a native crash, and the action tests include
 successive airborne goals using simulated time and separate action clients.
+
+When WSL updates require administrator approval, a workspace-local CycloneDDS
+runtime is available without `sudo` or a rebuild. See the
+[CycloneDDS setup instructions](docs/native_crashes.md#cyclonedds-alternative-when-wsl-updates-need-approval)
+and select it in every ROS terminal, including the simulator and action CLI.
+The earlier bounded CycloneDDS controls passed; the full Gazebo graph still
+needs validation with this selection.
 
 The installed runtime probe can reproduce executor failures using only plain
 ROS workers and standard messages, with no simulation or mission goals:
@@ -483,7 +774,7 @@ There are two different coordinate origins in this system:
 
 - PX4 EKF local position normally starts close to `(0, 0, 0)`.
 - Camera/VIO/LIO odometry may use a world-aligned origin such as
-  `x500_depth/odom`, which is offset from the PX4 origin.
+  `kv_drone/odom`, which is offset from the PX4 origin.
 
 PX4 estimates the bias between those origins when it fuses external vision.
 Consequently, external-vision fusion does **not** guarantee that
@@ -498,7 +789,7 @@ Start MAVROS with its `odometry` plugin connected to the Gazebo odometry:
 ```bash
 ros2 launch kv_executive px4.launch.py \
   fcu_url:="udp://:14540@127.0.0.1:14580" \
-  drone_name:=x500_depth
+  drone_name:=kv_drone
 ```
 
 `drone_name` derives the topic `/<drone_name>/odometry` and the frames
@@ -573,7 +864,7 @@ The planner can be started separately:
 
 ```bash
 ros2 launch kv_executive autonomy.launch.py \
-  drone_name:=x500_depth
+  drone_name:=kv_drone
 ```
 
 Or both can be started together:
@@ -581,7 +872,7 @@ Or both can be started together:
 ```bash
 ros2 launch kv_executive autonomy.launch.py \
   start_mavros:=true \
-  drone_name:=x500_depth
+  drone_name:=kv_drone
 ```
 
 The default planner home is the first external-odometry pose. This keeps
@@ -627,17 +918,19 @@ ros2 launch kv_executive px4.launch.py \
 Useful checks:
 
 ```bash
-ros2 topic hz /x500_depth/odometry
-ros2 topic echo /x500_depth/odometry --once
+ros2 topic hz /kv_drone/odometry
+ros2 topic echo /kv_drone/odometry --once
 ros2 topic echo /mavros/local_position/odom --once
-ros2 run tf2_ros tf2_echo map x500_depth/odom
-ros2 run tf2_ros tf2_echo x500_depth/odom_ned x500_depth/odom
-ros2 run tf2_ros tf2_echo x500_depth/base_link_frd x500_depth/base_link
+ros2 run tf2_ros tf2_echo map kv_drone/odom
+ros2 run tf2_ros tf2_echo kv_drone/odom_ned kv_drone/odom
+ros2 run tf2_ros tf2_echo kv_drone/base_link_frd kv_drone/base_link
 ```
 
 `/mavros/local_position/odom` is deliberately labelled `px4_odom` by this
 launch file because it has the PX4 EKF origin, not necessarily the external
-`map` origin.
+`map` origin. A separately started stock MAVROS instance may instead label
+the same PX4-local stream `map`; the executive and battery monitor normalize
+that configured input alias as described in the frame contract above.
 
 The mission executive performs this origin alignment before publishing to
 `/mavros/setpoint_position/local`, as described above. External-vision fusion

@@ -9,6 +9,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <utility>
+#include <vector>
 
 #include <octomap/OcTree.h>
 #include <octomap/AbstractOcTree.h>
@@ -40,6 +41,8 @@
 #include <rcl_interfaces/srv/get_parameters.hpp>
 
 #include "kv_executive/srv/plan_path.hpp"
+#include "kv_executive/srv/plan_to_pose.hpp"
+#include "kv_executive/msg/fire_source_report.hpp"
 
 namespace ob = ompl::base;
 namespace og = ompl::geometric;
@@ -82,6 +85,14 @@ public:
             std::bind(
               &MotionPlanner::planPathCallback, this,
               std::placeholders::_1, std::placeholders::_2));
+    target_planning_service_ = this->create_service<kv_executive::srv::PlanToPose>(
+            "plan_to_pose",
+            std::bind(
+              &MotionPlanner::planToPoseCallback, this,
+              std::placeholders::_1, std::placeholders::_2));
+    fire_sources_subscription_ = this->create_subscription<kv_executive::msg::FireSourceReport>(
+            "fire_sources", rclcpp::QoS(100).reliable().transient_local(),
+            std::bind(&MotionPlanner::fireSourceCallback, this, std::placeholders::_1));
 
     createStateSpace();
   }
@@ -103,12 +114,16 @@ public:
       return false;
     }
 
-    auto goal_position = randomWalkGoal();
+    geometry_msgs::msg::Point goal_position;
+    if (!randomWalkGoal(goal_position)) {
+      return false;
+    }
     return createPath(goal_position, path_message);
   }
 
-  geometry_msgs::msg::Point randomWalkGoal()
+  bool randomWalkGoal(geometry_msgs::msg::Point & goal_position)
   {
+    updateReportedSiteRegions();
     const double min_x = current_pose.position.x - horizontal_range_;
     const double max_x = current_pose.position.x + horizontal_range_;
     const double min_y = current_pose.position.y - horizontal_range_;
@@ -120,30 +135,34 @@ public:
             current_pose.position.z + vertical_range_,
             home_pose.z + maximum_altitude_ - bound_margin_);
 
-    geometry_msgs::msg::Point goal_position;
-    goal_position.x =
-      std::uniform_real_distribution<double>(min_x, max_x)(random_generator_);
-    goal_position.y =
-      std::uniform_real_distribution<double>(min_y, max_y)(random_generator_);
+    for (std::size_t attempt = 0; attempt < 128; ++attempt) {
+      goal_position.x =
+        std::uniform_real_distribution<double>(min_x, max_x)(random_generator_);
+      goal_position.y =
+        std::uniform_real_distribution<double>(min_y, max_y)(random_generator_);
 
-        // updatePositionSpaceBounds() will report the invalid altitude range.
-        // Avoid constructing a distribution with reversed limits in that case.
-    goal_position.z = min_z <= max_z ?
-      std::uniform_real_distribution<double>(min_z, max_z)(random_generator_) :
-      current_pose.position.z;
-
-    return goal_position;
+      // updatePositionSpaceBounds() reports an invalid altitude range.
+      goal_position.z = min_z <= max_z ?
+        std::uniform_real_distribution<double>(min_z, max_z)(random_generator_) :
+        current_pose.position.z;
+      if (outsideReportedSites(goal_position)) {
+        return true;
+      }
+    }
+    return failPlanning(
+      "No exploration goal outside reported fire-source regions after 128 attempts");
   }
 
   bool createPath(
     const geometry_msgs::msg::Point & goal_position,
-    nav_msgs::msg::Path & path_message)
+    nav_msgs::msg::Path & path_message,
+    const geometry_msgs::msg::Quaternion * goal_orientation = nullptr)
   {
     if (!current_pose_received_ || !home_pose_received_ || !occupancy_map_received_) {
       return failPlanning("Required odometry, home, or OctoMap data became unavailable");
     }
 
-    if (!updatePositionSpaceBounds(goal_position)) {
+    if (!updatePositionSpaceBounds(goal_position, goal_orientation != nullptr)) {
       return false;
     }
 
@@ -166,7 +185,8 @@ public:
     goal_position_state->values[1] = goal_position.y;
     goal_position_state->values[2] = goal_position.z;
     auto *goal_yaw_state = goal_compound_state->as<ob::SO2StateSpace::StateType>(1);
-    goal_yaw_state->value = tf2::getYaw(current_pose.orientation);
+    goal_yaw_state->value = tf2::getYaw(
+      goal_orientation ? *goal_orientation : current_pose.orientation);
 
     const auto space_information = ss_->getSpaceInformation();
     if (!space_information->isValid(start.get())) {
@@ -174,7 +194,8 @@ public:
         "OMPL start state is invalid: check altitude bounds, home reference, and obstacle clearance");
     }
     if (!space_information->isValid(goal.get())) {
-      return failPlanning("OMPL goal state is invalid: check altitude bounds and obstacle clearance");
+      return failPlanning(
+        "OMPL goal state is invalid: check altitude bounds and obstacle clearance");
     }
     ss_->setStartAndGoalStates(start, goal);
 
@@ -182,16 +203,21 @@ public:
     if (!solved) {
       return failPlanning("No OMPL solution found within the planning timeout");
     }
+    if (solved != ob::PlannerStatus::EXACT_SOLUTION) {
+      return failPlanning(
+        "OMPL returned an approximate solution; requested endpoint was not reached");
+    }
     ss_->simplifySolution(simplification_time_);
     auto & solution_path = ss_->getSolutionPath();
 
-    path_message = processSolutionPath(solution_path);
+    path_message = processSolutionPath(solution_path, goal_orientation);
 
     return true;
   }
 
   nav_msgs::msg::Path processSolutionPath(
-    const og::PathGeometric & solution_path)
+    const og::PathGeometric & solution_path,
+    const geometry_msgs::msg::Quaternion * goal_orientation = nullptr)
   {
     nav_msgs::msg::Path path_message;
     path_message.header.stamp = this->now();
@@ -228,6 +254,9 @@ public:
       pose_stamped.pose = pose;
       path_message.poses.push_back(std::move(pose_stamped));
     }
+    if (goal_orientation && !path_message.poses.empty()) {
+      path_message.poses.back().pose.orientation = *goal_orientation;
+    }
 
     if (!path_message.header.frame_id.empty()) {
       path_publisher_->publish(path_message);
@@ -258,6 +287,151 @@ private:
     } else {
       response->message = last_planning_error_;
     }
+  }
+
+  static bool validPose(const geometry_msgs::msg::Pose & pose)
+  {
+    const auto & p = pose.position;
+    const auto & q = pose.orientation;
+    const double norm_squared = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
+           std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z) &&
+           std::isfinite(q.w) && std::isfinite(norm_squared) && norm_squared > 1e-12;
+  }
+
+  static void normalizeOrientation(geometry_msgs::msg::Quaternion & quaternion)
+  {
+    const double norm = std::sqrt(
+      quaternion.x * quaternion.x + quaternion.y * quaternion.y +
+      quaternion.z * quaternion.z + quaternion.w * quaternion.w);
+    quaternion.x /= norm;
+    quaternion.y /= norm;
+    quaternion.z /= norm;
+    quaternion.w /= norm;
+  }
+
+  bool planToPose(
+    const geometry_msgs::msg::PoseStamped & target,
+    nav_msgs::msg::Path & path_message)
+  {
+    last_planning_error_.clear();
+    if (target.header.frame_id.empty() || !validPose(target.pose)) {
+      return failPlanning(
+        "Target requires a frame_id, finite position, and nonzero finite quaternion");
+    }
+    if (!updatePlanningPoses()) {
+      return false;
+    }
+    std::string planning_frame;
+    {
+      std::shared_lock<std::shared_mutex> lock(occupancy_map_mutex_);
+      planning_frame = occupancy_map_frame_;
+    }
+    geometry_msgs::msg::PoseStamped transformed_target;
+    try {
+      // PoseStamped's stamp deliberately selects the transform at request time;
+      // a zero stamp retains the standard TF convention of using latest data.
+      auto normalized_target = target;
+      normalizeOrientation(normalized_target.pose.orientation);
+      tf_buffer_->transform(
+                normalized_target, transformed_target, planning_frame,
+                tf2::durationFromSec(transform_timeout_));
+    } catch (const tf2::TransformException & exception) {
+      return failPlanning(
+        "Cannot transform target into OctoMap frame '" + planning_frame +
+        "': " + exception.what());
+    }
+    if (!validPose(transformed_target.pose)) {
+      return failPlanning("Transformed target pose is invalid");
+    }
+    const auto & target_position = transformed_target.pose.position;
+    const double distance = std::hypot(
+      std::hypot(target_position.x - current_pose.position.x,
+      target_position.y - current_pose.position.y),
+      target_position.z - current_pose.position.z);
+    if (!std::isfinite(distance) || distance > maximum_target_distance_) {
+      return failPlanning("Target exceeds maximum_target_distance");
+    }
+    normalizeOrientation(transformed_target.pose.orientation);
+    return createPath(
+      target_position, path_message, &transformed_target.pose.orientation);
+  }
+
+  void planToPoseCallback(
+    const kv_executive::srv::PlanToPose::Request::SharedPtr request,
+    kv_executive::srv::PlanToPose::Response::SharedPtr response)
+  {
+    response->success = planToPose(request->target, response->path);
+    response->message = response->success ? "Path to requested pose planned successfully" :
+      last_planning_error_;
+  }
+
+  void fireSourceCallback(const kv_executive::msg::FireSourceReport::SharedPtr report)
+  {
+    if (report->planning_pose.header.frame_id.empty() ||
+      !validPose(report->planning_pose.pose) || !std::isfinite(report->exclusion_radius) ||
+      report->exclusion_radius < 0.0)
+    {
+      RCLCPP_WARN(this->get_logger(), "Ignoring invalid fire-source region report");
+      return;
+    }
+    // Reports describe the safe observation viewpoint, not a measured 3-D fire
+    // location. They exclude future exploration goals, never transit/escape paths.
+    const auto existing = std::find_if(
+      reported_sites_.begin(), reported_sites_.end(),
+      [&report](const auto & site) {return site.site_id == report->site_id;});
+    if (existing != reported_sites_.end()) {
+      reported_sites_.erase(existing);
+    }
+    reported_sites_.push_back(*report);
+    if (reported_sites_.size() > maximum_reported_sites_) {
+      reported_sites_.erase(reported_sites_.begin());
+    }
+    RCLCPP_INFO(this->get_logger(), "Recorded fire-source exploration exclusion region");
+  }
+
+  void updateReportedSiteRegions()
+  {
+    reported_site_regions_.clear();
+    std::string planning_frame;
+    {
+      std::shared_lock<std::shared_mutex> lock(occupancy_map_mutex_);
+      planning_frame = occupancy_map_frame_;
+    }
+    for (const auto & site : reported_sites_) {
+      geometry_msgs::msg::PoseStamped site_pose;
+      try {
+        tf_buffer_->transform(
+                  site.planning_pose, site_pose, planning_frame,
+                  tf2::durationFromSec(0.0));
+      } catch (const tf2::TransformException & exception) {
+        RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 5000,
+          "Ignoring fire-source region without a transform into '%s': %s",
+          planning_frame.c_str(), exception.what());
+        continue;
+      }
+      const double radius = site.exclusion_radius > 0.0 ? site.exclusion_radius :
+        reported_site_exclusion_radius_;
+      if (!validPose(site_pose.pose)) {
+        RCLCPP_WARN(this->get_logger(), "Ignoring invalid transformed fire-source region");
+        continue;
+      }
+      reported_site_regions_.emplace_back(site_pose.pose.position, radius);
+    }
+  }
+
+  bool outsideReportedSites(const geometry_msgs::msg::Point & candidate) const
+  {
+    for (const auto & region : reported_site_regions_) {
+      if (std::hypot(
+          candidate.x - region.first.x,
+          candidate.y - region.first.y) < region.second)
+      {
+        return false;
+      }
+    }
+    return true;
   }
 
   void odometryCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
@@ -335,11 +509,17 @@ private:
     if (home_pose_source_.header.frame_id.empty()) {
       return failPlanning("Home frame_id is empty");
     }
+    if (!validPose(odometry_pose.pose) || !validPose(home_pose_source_.pose)) {
+      return failPlanning(
+        "Odometry/home pose requires finite position and nonzero finite quaternion");
+    }
 
     try {
       geometry_msgs::msg::PoseStamped current_pose_in_planning_frame;
       geometry_msgs::msg::PoseStamped home_pose_in_planning_frame;
       auto home_pose_for_transform = home_pose_source_;
+      normalizeOrientation(odometry_pose.pose.orientation);
+      normalizeOrientation(home_pose_for_transform.pose.orientation);
       if (home_from_first_odometry_) {
         // A map-to-odometry correction may change over time. Apply its current
         // value to the latched home coordinate instead of requesting a TF that
@@ -355,6 +535,10 @@ private:
 
       current_pose = current_pose_in_planning_frame.pose;
       home_pose = home_pose_in_planning_frame.pose.position;
+      if (!validPose(current_pose) || !validPose(home_pose_in_planning_frame.pose)) {
+        return failPlanning("Transformed odometry/home pose is invalid");
+      }
+      normalizeOrientation(current_pose.orientation);
       current_pose_received_ = true;
       home_pose_received_ = true;
     } catch (const tf2::TransformException & exception) {
@@ -433,6 +617,20 @@ private:
     home_from_first_odometry_ = this->declare_parameter<bool>(
             "home_from_first_odometry", true);
     transform_timeout_ = this->declare_parameter<double>("transform_timeout", 0.2);
+    maximum_target_distance_ = this->declare_parameter<double>("maximum_target_distance", 50.0);
+    reported_site_exclusion_radius_ =
+      this->declare_parameter<double>("reported_site_exclusion_radius", 15.0);
+    const auto maximum_reported_sites =
+      this->declare_parameter<int>("maximum_reported_sites", 100);
+    if (!std::isfinite(maximum_target_distance_) || maximum_target_distance_ <= 0.0 ||
+      !std::isfinite(reported_site_exclusion_radius_) || reported_site_exclusion_radius_ <= 0.0 ||
+      maximum_reported_sites < 1)
+    {
+      throw std::invalid_argument(
+        "maximum_target_distance, reported_site_exclusion_radius, and maximum_reported_sites "
+        "must be positive and finite");
+    }
+    maximum_reported_sites_ = static_cast<std::size_t>(maximum_reported_sites);
 
     if (horizontal_range_ <= 0.0 || vertical_range_ <= 0.0) {
       throw std::invalid_argument("horizontal_range and vertical_range must be greater than zero");
@@ -478,7 +676,8 @@ private:
     space_->lock();
   }
 
-  bool updatePositionSpaceBounds(const geometry_msgs::msg::Point & goal_position)
+  bool updatePositionSpaceBounds(
+    const geometry_msgs::msg::Point & goal_position, bool explicit_target = false)
   {
     const double drone_x = current_pose.position.x;
     const double drone_y = current_pose.position.y;
@@ -486,14 +685,21 @@ private:
 
     const double home_z = home_pose.z;
 
-    const double min_x = drone_x - horizontal_range_;
-    const double max_x = drone_x + horizontal_range_;
-    const double min_y = drone_y - horizontal_range_;
-    const double max_y = drone_y + horizontal_range_;
+    // Exploration retains the original rolling volume. Explicit Verify/retreat
+    // requests extend that volume to include the endpoint and detour space,
+    // while the home-relative altitude limits remain hard constraints.
+    const double min_x = explicit_target ? std::min(drone_x, goal_position.x) -
+      horizontal_range_ : drone_x - horizontal_range_;
+    const double max_x = explicit_target ? std::max(drone_x, goal_position.x) +
+      horizontal_range_ : drone_x + horizontal_range_;
+    const double min_y = explicit_target ? std::min(drone_y, goal_position.y) -
+      horizontal_range_ : drone_y - horizontal_range_;
+    const double max_y = explicit_target ? std::max(drone_y, goal_position.y) +
+      horizontal_range_ : drone_y + horizontal_range_;
     const double min_z = std::max(home_z + minimum_altitude_ + bound_margin_,
-      drone_z - vertical_range_);
+        (explicit_target ? std::min(drone_z, goal_position.z) : drone_z) - vertical_range_);
     const double max_z = std::min(home_z + maximum_altitude_ - bound_margin_,
-      drone_z + vertical_range_);
+        (explicit_target ? std::max(drone_z, goal_position.z) : drone_z) + vertical_range_);
 
     if (min_x >= max_x || min_y >= max_y || min_z >= max_z) {
       RCLCPP_ERROR(this->get_logger(),
@@ -618,7 +824,7 @@ private:
           return;
         }
         const double max_altitude = value.double_value;
-        if (max_altitude <= 0.0) {
+        if (!std::isfinite(max_altitude) || max_altitude <= 0.0) {
           RCLCPP_WARN(this->get_logger(),
           "MAXIMUM ALTITUDE is disabled, using default MAXIMUM ALTITUDE");
         } else {
@@ -643,6 +849,9 @@ private:
   double planning_timeout_;
   double simplification_time_;
   double transform_timeout_;
+  double maximum_target_distance_;
+  double reported_site_exclusion_radius_;
+  std::size_t maximum_reported_sites_;
   std::string odometry_topic_;
   std::string octomap_topic_;
   std::string last_planning_error_;
@@ -654,7 +863,8 @@ private:
   bool current_pose_received_{false};
   bool home_pose_received_{false};
   bool occupancy_map_received_{false};
-  bool fire_position_received_{false};
+  std::vector<kv_executive::msg::FireSourceReport> reported_sites_;
+  std::vector<std::pair<geometry_msgs::msg::Point, double>> reported_site_regions_;
 
   std::shared_ptr<ob::RealVectorStateSpace> position_space_;
   std::shared_ptr<ob::SO2StateSpace> yaw_space_;
@@ -665,6 +875,8 @@ private:
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_publisher_;
   rclcpp::Service<kv_executive::srv::PlanPath>::SharedPtr planning_service_;
+  rclcpp::Service<kv_executive::srv::PlanToPose>::SharedPtr target_planning_service_;
+  rclcpp::Subscription<kv_executive::msg::FireSourceReport>::SharedPtr fire_sources_subscription_;
   std::shared_ptr<const octomap::OcTree> occupancy_map_;
   mutable std::shared_mutex occupancy_map_mutex_;
   std::string occupancy_map_frame_;

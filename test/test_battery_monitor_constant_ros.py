@@ -1,10 +1,10 @@
 """Keep ROS processes alive when flown distance consumes no measured SOC."""
 
 import math
+from pathlib import Path
 import signal
 import subprocess
 import sys
-from pathlib import Path
 
 from action_msgs.msg import GoalStatus
 
@@ -16,7 +16,7 @@ from kv_executive.msg import BatteryReturnEstimate, BatteryUsage
 import pytest
 
 from rclpy.action import ActionClient
-from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, qos_profile_sensor_data, QoSProfile
 
 from sensor_msgs.msg import BatteryState
 
@@ -29,7 +29,7 @@ from test_mission_action import cancel_goal, mission, wait_for  # noqa: F401
 def test_constant_battery_survives_repeated_missions_over_dds(
     mission, tmp_path,  # noqa: F811
 ):
-    """Complete three zero-depletion missions and a fourth goal's sweep."""
+    """Record three zero-depletion paths across persistent goals, then cancel."""
     executive, fcu = mission.executive, mission.fcu
     action_clients = []
     original_destroy_node = fcu.destroy_node
@@ -124,6 +124,10 @@ def test_constant_battery_survives_repeated_missions_over_dds(
 
         for sample_id, skip_takeoff in enumerate((False, True, True), start=1):
             estimate_count = len(estimates)
+            with fcu.lock:
+                sweeps_before_goal = sum(
+                    text == 'SWEEP: started' for _, text in fcu.statuses
+                )
             # Use independent clients as repeated CLI invocations do. Retain
             # them until fixture teardown so executor work can finish safely.
             client = ActionClient(
@@ -139,15 +143,29 @@ def test_constant_battery_survives_repeated_missions_over_dds(
             goal = future.result()
             assert goal.accepted
             result_future = goal.get_result_async()
+
+            def path_recorded_and_next_sweep_started():
+                assert not result_future.done(), result_future.result()
+                with fcu.lock:
+                    next_sweep_started = sum(
+                        text == 'SWEEP: started' for _, text in fcu.statuses
+                    ) >= sweeps_before_goal + 2
+                return len(usages) >= sample_id and next_sweep_started
+
             wait_for_monitor(
-                result_future.done, 60.0,
-                'mission result with unchanged battery',
+                path_recorded_and_next_sweep_started, 60.0,
+                'completed path and repeated sweep with unchanged battery',
             )
-            response = result_future.result()
-            assert response.status == GoalStatus.STATUS_SUCCEEDED, (
+            assert executive._mission_lock.locked()
+            response = cancel_goal(goal)
+            assert response.status == GoalStatus.STATUS_CANCELED, (
                 response.result.message
             )
-            assert response.result.success, response.result.message
+            assert not response.result.success
+            wait_for(
+                lambda: not executive._mission_lock.locked(),
+                3.0, 'canceled goal releases the mission slot',
+            )
 
             wait_for_monitor(
                 lambda: len(usages) == sample_id,

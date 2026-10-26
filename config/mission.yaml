@@ -27,3 +27,45 @@ mission_executive:
     takeoff_altitude_parameter: MIS_TAKEOFF_ALT
     local_odometry_topic: /mavros/local_position/odom
     local_frame: px4_odom
+    # Stock MAVROS labels these PX4-local coordinates "map". Normalize only
+    # this subscribed input label; planner map paths still need origin alignment.
+    # Use [px4_odom] to require the canonical local_frame exactly.
+    local_odometry_frame_aliases: [map]
+    # A fresh valid return/reserve alert aborts Exploration and requests LOITER.
+    battery_alert_topic: battery_return_estimate
+    battery_alert_timeout: 5.0
+    # Dormant Verify defaults: preserved for future work, not used by Exploration.
+    # autonomy.launch.py no longer overrides or connects these perception inputs.
+    smoke_detection_topic: /kv_drone/smoke/detection
+    fire_detection_topic: /kv_drone/fire/detection
+    verify_planning_frame: map
+    global_position_topic: /mavros/global_position/global
+    global_position_timeout: 2.0
+    verify_path_step: 0.25  # Metres between guarded path targets.
+    fire_exclusion_radius: 15.0  # Exploration endpoint exclusion, in metres.
+    verify_observation_timeout: 2.0
+    verify_future_tolerance: 0.25
+    # The executive additionally confirms one unchanged thermal track.
+    verify_fire_persistence: 1.5
+    verify_fire_min_frames: 3
+    verify_track_center_tolerance: 0.08  # Fraction of image dimensions.
+    verify_track_area_ratio: 2.0
+    verify_reacquire_timeout: 15.0
+    verify_center_timeout: 30.0
+    verify_yaw_tolerance: 0.08726646259971647  # Radians: 5 degrees.
+    verify_yaw_step: 0.5235987755982988  # Radians: at most 30 degrees per correction.
+    verify_vertical_step: 0.5
+    verify_minimum_altitude: 2.0  # Local z floor; planner home limits also apply.
+    # Apparent smoke coverage selects a step; this is not a measured source range.
+    verify_step_min: 5.0
+    verify_step_max: 20.0
+    verify_full_coverage: 0.25
+    verify_target_fire_fraction: 0.005
+    verify_creep_step: 0.75
+    verify_creep_max_steps: 4
+    verify_motion_speed: 0.5
+    verify_escape_distance: 10.0
+    verify_escape_climb: 10.0
+    # Keep the aircraft level; these position setpoints cannot safely request tilt.
+    verify_search_hold: 3.0
+    verify_max_approaches: 8

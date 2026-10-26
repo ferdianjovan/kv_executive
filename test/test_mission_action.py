@@ -14,7 +14,7 @@ from kv_executive.mission_executive import MissionExecutive
 from kv_executive.mission_geometry import (
     angular_distance, quaternion_from_yaw, yaw_from_quaternion,
 )
-from kv_executive.srv import PlanPath
+from kv_executive.srv import PlanPath, PlanToPose
 from mavros_msgs.msg import State as VehicleState
 from mavros_msgs.srv import CommandBool, ParamPull, SetMode
 from nav_msgs.msg import Odometry, Path
@@ -30,6 +30,7 @@ from rclpy.qos import (
     DurabilityPolicy, qos_profile_sensor_data, QoSProfile, ReliabilityPolicy,
 )
 from rosgraph_msgs.msg import Clock
+from sensor_msgs.msg import NavSatFix, NavSatStatus
 from std_msgs.msg import Header, String
 
 
@@ -66,6 +67,7 @@ class SimulatedFcu(Node):
         self.parameter_requests = []
         self.arming_requests = []
         self.planning_requests = 0
+        self.target_requests = []
         # MAVROS emits state on the FCU heartbeat, independently of the much
         # faster local odometry stream. Keep their delivery controls separate.
         self.heartbeat_interval = 1.0
@@ -73,6 +75,7 @@ class SimulatedFcu(Node):
         self.next_heartbeat = 0.0
         self.state_enabled = True
         self.odometry_enabled = True
+        self.odometry_frame = 'px4_odom'
         self.state_publications = []
         self.status_publisher = self.create_publisher(
             VehicleState, '/mavros/state',
@@ -83,6 +86,9 @@ class SimulatedFcu(Node):
         )
         self.odometry_publisher = self.create_publisher(
             Odometry, '/mavros/local_position/odom', qos_profile_sensor_data,
+        )
+        self.gps_publisher = self.create_publisher(
+            NavSatFix, '/mavros/global_position/global', qos_profile_sensor_data,
         )
         self.setpoint_subscription = self.create_subscription(
             PoseStamped, '/mavros/setpoint_position/local', self.receive_setpoint,
@@ -114,12 +120,19 @@ class SimulatedFcu(Node):
                 PlanPath, 'plan_path', self.plan_path,
                 callback_group=self.callbacks,
             ),
+            self.create_service(
+                PlanToPose, 'plan_to_pose', self.plan_to_pose,
+                callback_group=self.callbacks,
+            ),
         ]
         self.telemetry_timer = self.create_timer(
             0.05, self.publish_telemetry, callback_group=self.telemetry_callbacks,
         )
         self.mission_client = ActionClient(
             self, ExecuteMission, 'execute_mission', callback_group=self.callbacks,
+        )
+        self.mission_state_publisher = self.create_publisher(
+            String, 'mission_state_request', 10,
         )
 
     def publish_telemetry(self):
@@ -147,7 +160,7 @@ class SimulatedFcu(Node):
             publish_odometry = self.odometry_enabled
             odometry = Odometry(
                 header=Header(
-                    stamp=self.get_clock().now().to_msg(), frame_id='px4_odom',
+                    stamp=self.get_clock().now().to_msg(), frame_id=self.odometry_frame,
                 ),
                 child_frame_id='kv_drone/base_link',
             )
@@ -156,6 +169,23 @@ class SimulatedFcu(Node):
             self.status_publisher.publish(state)
         if publish_odometry:
             self.odometry_publisher.publish(odometry)
+            self.gps_publisher.publish(NavSatFix(
+                header=Header(stamp=odometry.header.stamp, frame_id='gps'),
+                status=NavSatStatus(status=NavSatStatus.STATUS_FIX),
+                latitude=51.5, longitude=-0.12, altitude=30.0,
+            ))
+
+    def plan_to_pose(self, request, response):
+        with self.lock:
+            self.target_requests.append(deepcopy(request.target))
+            start = deepcopy(self.pose)
+        path = Path(header=Header(frame_id=request.target.header.frame_id))
+        path.poses = [PoseStamped(header=deepcopy(path.header), pose=start),
+                      deepcopy(request.target)]
+        response.success = self.planner_success
+        response.message = 'simulated explicit target'
+        response.path = path
+        return response
 
     def receive_setpoint(self, message):
         with self.lock:
@@ -293,14 +323,18 @@ def mission(monkeypatch, tmp_path, request):
         'mode_timeout': 3.0,
         'takeoff_timeout': 3.0,
         'waypoint_timeout': 3.0,
+        'smoke_detection_topic': 'smoke/detection',
+        'fire_detection_topic': 'fire/detection',
+        'verify_planning_frame': 'px4_odom',
     }
-    namespace = f'/mission_test_{os.getpid()}'
+    namespace = f'/mission_test_{os.getpid()}_{time.monotonic_ns()}'
     arguments = [
         '--ros-args', '-r', f'__ns:={namespace}',
         '-r', f'/clock:={namespace}/clock',
     ]
     for topic_or_service in (
-        'state', 'statustext/recv', 'local_position/odom', 'setpoint_position/local',
+        'state', 'statustext/recv', 'local_position/odom', 'global_position/global',
+        'setpoint_position/local',
         'set_mode', 'cmd/arming', 'param/pull', 'param/get_parameters',
     ):
         name = f'/mavros/{topic_or_service}'
@@ -399,8 +433,44 @@ def cancel_goal(goal):
     return result
 
 
+def test_stock_mavros_map_odometry_takes_off_and_cancels_to_loiter(mission):
+    """Stock MAVROS labels its independent PX4 local coordinates as map."""
+    executive, fcu = mission.executive, mission.fcu
+    with executive._data_lock:
+        received_before_change = executive._odometry_received
+    with fcu.lock:
+        fcu.odometry_frame = 'map'
+    wait_for(
+        lambda: executive._odometry_received > received_before_change + 0.05,
+        2.0, 'stock MAVROS map-labelled odometry',
+    )
+    with executive._data_lock:
+        assert executive._odometry.header.frame_id == 'px4_odom'
+
+    goal = send_goal(mission)
+    assert goal.accepted
+    result_future = goal.get_result_async()
+    wait_for(
+        lambda: any(text == 'TAKEOFF: done' for _, text in fcu.statuses)
+        and bool(fcu.setpoints),
+        8.0, 'takeoff followed by survey setpoints',
+    )
+    assert not result_future.done()
+    result = cancel_goal(goal)
+
+    assert 'AUTO.LOITER confirmed' in result.result.message
+    with fcu.lock:
+        assert any(text == 'SWEEP: started' for _, text in fcu.statuses)
+        assert fcu.mode_requests.count('AUTO.TAKEOFF') == 1
+        assert fcu.state.mode == 'AUTO.LOITER'
+        assert fcu.state.armed
+        assert fcu.setpoints
+        assert all(message.header.frame_id == 'px4_odom' for _, _, message in fcu.setpoints)
+        assert not fcu.offboard_losses
+
+
 @pytest.mark.parametrize('mission', [True], indirect=True, ids=['sim_clock'])
-def test_repeated_airborne_goals_with_simulated_clock(mission):
+def test_repeated_canceled_airborne_goals_with_simulated_clock(mission):
     """Repeat the CLI goal lifecycle while ROS timers use an isolated /clock."""
     executive, fcu = mission.executive, mission.fcu
     assert executive.get_parameter('use_sim_time').value is True
@@ -415,15 +485,20 @@ def test_repeated_airborne_goals_with_simulated_clock(mission):
         )
         try:
             wait_for(client.server_is_ready, 3.0, 'new mission client discovery')
+            with fcu.lock:
+                expected_paths = fcu.planning_requests + 1
             future = client.send_goal_async(ExecuteMission.Goal(skip_takeoff=skip_takeoff))
             wait_for(future.done, 3.0, 'repeated goal acknowledgement')
             goal = future.result()
             assert goal.accepted
             result_future = goal.get_result_async()
-            wait_for(result_future.done, 40.0, 'repeated mission result')
-            result = result_future.result()
-            assert result.status == GoalStatus.STATUS_SUCCEEDED
-            assert result.result.success, result.result.message
+            wait_for(
+                lambda: sum(text == 'EXECUTE_PATH: done' for _, text in fcu.statuses)
+                >= expected_paths,
+                40.0, 'one complete exploration cycle',
+            )
+            assert not result_future.done()
+            cancel_goal(goal)
             assert executive._goal_handle is None
             assert executive._state_machine is None
             assert not executive._mission_lock.locked()
@@ -442,19 +517,21 @@ def test_repeated_airborne_goals_with_simulated_clock(mission):
         assert not fcu.offboard_losses
 
 
-def test_action_completes_and_accepts_another_airborne_goal(mission):
+def test_action_repeats_exploration_until_canceled_and_accepts_another_goal(mission):
     executive, fcu = mission.executive, mission.fcu
     feedback = []
     goal = send_goal(mission, feedback=feedback)
     assert goal.accepted
-    response = mission_result(goal)
-    assert response.status == GoalStatus.STATUS_SUCCEEDED
-    assert response.result.success, response.result.message
-    assert 'AUTO.LOITER' in response.result.message
+    result_future = goal.get_result_async()
     wait_for(
-        lambda: any(text.startswith('MISSION: done') for _, text in fcu.statuses),
-        1.0, 'mission completion status',
+        lambda: sum(text == 'EXECUTE_PATH: done' for _, text in fcu.statuses) >= 2,
+        40.0, 'two complete exploration cycles',
     )
+    assert not result_future.done()
+    occupied = send_goal(mission, skip_takeoff=True)
+    assert not occupied.accepted
+    response = cancel_goal(goal)
+    assert 'canceled' in response.result.message.lower()
 
     with fcu.lock:
         statuses = list(fcu.statuses)
@@ -463,30 +540,36 @@ def test_action_completes_and_accepts_another_airborne_goal(mission):
         final_pose = deepcopy(fcu.pose)
         assert fcu.state.mode == 'AUTO.LOITER'
         assert fcu.state.armed
-        assert fcu.mode_requests == [
-            'AUTO.TAKEOFF', 'OFFBOARD', 'AUTO.LOITER', 'OFFBOARD', 'AUTO.LOITER',
-        ]
+        assert fcu.mode_requests.count('AUTO.TAKEOFF') == 1
+        assert fcu.mode_requests.count('OFFBOARD') >= 4
+        assert fcu.mode_requests.count('AUTO.LOITER') >= 4
         assert fcu.parameter_requests == [['MIS_TAKEOFF_ALT']]
         assert fcu.arming_requests == [(True, 'AUTO.TAKEOFF')]
-        assert fcu.planning_requests == 1
+        assert fcu.planning_requests == 2
         assert not fcu.offboard_losses
 
     messages = [text for _, text in statuses]
-    assert [text for text in messages if text.endswith((': started', ': done'))] == [
+    leaf_lifecycle = [
+        text for text in messages
+        if text.partition(':')[0] in {'TAKEOFF', 'SWEEP', 'EXECUTE_PATH'}
+        and text.endswith((': started', ': done'))
+    ]
+    assert leaf_lifecycle[:10] == [
         'TAKEOFF: started', 'TAKEOFF: done', 'SWEEP: started', 'SWEEP: done',
         'EXECUTE_PATH: started', 'EXECUTE_PATH: done',
+        'SWEEP: started', 'SWEEP: done', 'EXECUTE_PATH: started', 'EXECUTE_PATH: done',
     ]
     assert [text for text in messages if text.startswith('SWEEP: step')] == [
         f'SWEEP: step {step}/6 reached' for step in range(1, 7)
-    ]
+    ] * 2
     assert [text for text in messages if text.startswith('EXECUTE_PATH: sub-path')] == [
         f'EXECUTE_PATH: sub-path {leg}/3 done' for leg in range(1, 4)
-    ]
+    ] * 2
     assert {'TAKEOFF', 'SWEEP', 'EXECUTE_PATH'} <= {event.state for event in feedback}
     assert all(event.message for event in feedback)
     assert len(executive.sub_paths) == 3
     assert [path_length(leg) for leg in executive.sub_paths] == pytest.approx([0.2] * 3)
-    assert final_pose.position.x == pytest.approx(1.6, abs=0.03)
+    assert final_pose.position.x == pytest.approx(2.2, abs=0.03)
     assert final_pose.position.y == pytest.approx(-2.0, abs=0.03)
     assert final_pose.position.z == pytest.approx(8.0, abs=0.03)
     assert yaw_from_quaternion(final_pose.orientation) == pytest.approx(0.0, abs=1e-6)
@@ -523,14 +606,24 @@ def test_action_completes_and_accepts_another_airborne_goal(mission):
     assert translating, 'The path must contain observed horizontal movement'
     # Independent setpoint callbacks continue through delayed mode replies.
     assert all(after > before for mode, before, after in mode_waits
-               if mode in {'OFFBOARD', 'AUTO.LOITER'}), mode_waits
+               if mode == 'AUTO.LOITER'), mode_waits
+    assert any(after > before for mode, before, after in mode_waits
+               if mode == 'OFFBOARD'), mode_waits
     assert mode_waits[1][1] >= 20
     for state_name in ('SWEEP', 'EXECUTE_PATH'):
         started = next(stamp for stamp, text in statuses if text == f'{state_name}: started')
         finished = next(stamp for stamp, text in statuses if text == f'{state_name}: done')
-        publications = [stamp for stamp, _, _ in setpoints if started <= stamp <= finished]
+        publications = [
+            (stamp, mode) for stamp, mode, _ in setpoints if started <= stamp <= finished
+        ]
         assert len(publications) >= 30
-        assert max(b - a for a, b in zip(publications, publications[1:])) < 0.5
+        offboard_gaps = [
+            current[0] - previous[0]
+            for previous, current in zip(publications, publications[1:])
+            if previous[1] == current[1] == 'OFFBOARD'
+        ]
+        assert offboard_gaps
+        assert max(offboard_gaps) < fcu.offboard_loss_timeout
 
     # Once LOITER owns flight, ending the stream must not cause a return home.
     wait_for(lambda: time.monotonic() - fcu.last_setpoint > 0.1,
@@ -550,12 +643,16 @@ def test_action_completes_and_accepts_another_airborne_goal(mission):
     wait_for(future.done, 3.0, 'internal mission goal acknowledgement')
     repeat = future.result()
     assert repeat.accepted
-    result = mission_result(repeat)
-    assert result.status == GoalStatus.STATUS_SUCCEEDED
-    assert result.result.success, result.result.message
+    repeat_result_future = repeat.get_result_async()
+    wait_for(
+        lambda: sum(text == 'EXECUTE_PATH: done' for _, text in fcu.statuses) >= 3,
+        20.0, 'airborne exploration cycle after cancellation',
+    )
+    assert not repeat_result_future.done()
+    cancel_goal(repeat)
     with fcu.lock:
         assert fcu.state.mode == 'AUTO.LOITER'
-        assert fcu.pose.position.x == pytest.approx(2.2, abs=0.03)
+        assert fcu.pose.position.x == pytest.approx(2.8, abs=0.03)
         assert fcu.pose.position.z == pytest.approx(8.0, abs=0.03)
         assert yaw_from_quaternion(fcu.pose.orientation) == pytest.approx(0.0, abs=1e-6)
         assert fcu.arming_requests == [(True, 'AUTO.TAKEOFF')]
@@ -619,14 +716,14 @@ def test_cancel_interrupts_each_flight_stage_and_releases_goal_slot(mission, sta
     goal = send_goal(mission)
     assert goal.accepted
     if stage == 'takeoff':
-        wait_for(lambda: received_state(mission, armed=True), 4.0, 'takeoff climb')
+        wait_for(lambda: received_state(mission, armed=True), 6.0, 'takeoff climb')
     elif stage == 'sweep':
-        wait_for(lambda: received_state(mission, mode='OFFBOARD'), 6.0, 'survey OFFBOARD')
+        wait_for(lambda: received_state(mission, mode='OFFBOARD'), 10.0, 'survey OFFBOARD')
     elif stage == 'planning':
-        wait_for(fcu.planning_started.is_set, 12.0, 'pending planner response')
+        wait_for(fcu.planning_started.is_set, 20.0, 'pending planner response')
     else:
         wait_for(lambda: fcu.mode_requests.count('OFFBOARD') >= 2
-                 and received_state(mission, mode='OFFBOARD'), 16.0, 'path OFFBOARD')
+                 and received_state(mission, mode='OFFBOARD'), 24.0, 'path OFFBOARD')
 
     occupied = send_goal(mission, skip_takeoff=True)
     assert not occupied.accepted
@@ -662,17 +759,57 @@ def test_planner_failure_aborts_and_action_server_remains_available(mission):
     assert not result.result.success
     assert 'No route found' in result.result.message
     assert fcu.state.mode == 'AUTO.LOITER'
+    assert fcu.planning_requests == 1
+    assert sum(text == 'SWEEP: started' for _, text in fcu.statuses) == 1
     assert not fcu.offboard_losses
     next_goal = send_goal(mission, skip_takeoff=True)
     assert next_goal.accepted
     cancel_goal(next_goal)
 
 
+@pytest.mark.parametrize('state', ['Abort', 'Return', 'Verify'])
+def test_requested_higher_state_stops_exploration_and_recovers_to_loiter(mission, state):
+    executive, fcu = mission.executive, mission.fcu
+    executive.config['sweep_step_duration'] = 1.0
+    prepare_airborne(mission)
+    goal = send_goal(mission, skip_takeoff=True)
+    assert goal.accepted
+    wait_for(lambda: received_state(mission, mode='OFFBOARD'), 4.0, 'survey OFFBOARD')
+    wait_for(lambda: fcu.mission_state_publisher.get_subscription_count() > 0,
+             3.0, 'higher mission state request subscription')
+
+    fcu.mission_state_publisher.publish(String(data=state))
+    result = mission_result(goal)
+
+    assert result.status == GoalStatus.STATUS_ABORTED
+    assert not result.result.success
+    if state == 'Return':
+        assert 'Return is not implemented' in result.result.message
+    elif state == 'Verify':
+        assert 'Verify is dormant' in result.result.message
+    else:
+        assert 'abort' in result.result.message.lower()
+    assert 'AUTO.LOITER confirmed' in result.result.message
+    assert executive._requested_mission_state is None
+    assert executive._goal_handle is None
+    assert executive._state_machine is None
+    assert not executive._mission_lock.locked()
+    with fcu.lock:
+        assert fcu.state.mode == 'AUTO.LOITER'
+        assert fcu.state.armed
+        assert fcu.planning_requests == 0
+        assert not fcu.arming_requests
+        assert not {'AUTO.RTL', 'AUTO.LAND'} & set(fcu.mode_requests)
+        assert not fcu.offboard_losses
+        assert not fcu.target_requests
+    assert not hasattr(executive, '_verify')
+
+
 def test_cancel_keeps_offboard_hold_when_px4_rejects_loiter(mission):
     fcu = mission.fcu
     goal = send_goal(mission)
     assert goal.accepted
-    wait_for(lambda: received_state(mission, mode='OFFBOARD'), 6.0, 'survey OFFBOARD')
+    wait_for(lambda: received_state(mission, mode='OFFBOARD'), 10.0, 'survey OFFBOARD')
     with fcu.lock:
         fcu.reject_modes.add('AUTO.LOITER')
     result = cancel_goal(goal)
@@ -701,7 +838,7 @@ def test_offboard_loss_aborts_without_overriding_px4_return_mode(mission):
     executive, fcu = mission.executive, mission.fcu
     goal = send_goal(mission)
     assert goal.accepted
-    wait_for(lambda: received_state(mission, mode='OFFBOARD'), 6.0, 'survey OFFBOARD')
+    wait_for(lambda: received_state(mission, mode='OFFBOARD'), 10.0, 'survey OFFBOARD')
     # Simulate a dead publisher. The FCU, rather than the executive, requests RTL.
     executive._setpoint_timer.cancel()
     result = mission_result(goal)

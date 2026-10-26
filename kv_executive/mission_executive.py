@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cancelable ROS action for a YASMIN takeoff, sweep and planned flight mission.
+Cancelable ROS action for repeating Exploration, with monitor abort to LOITER.
 
 Run this node with a MultiThreadedExecutor: mission states wait for telemetry
 and service replies while independent callbacks keep OFFBOARD setpoints alive.
@@ -24,11 +24,12 @@ from kv_executive.mission_geometry import (
     transform_pose,
     yaw_from_quaternion,
 )
+from kv_executive.msg import BatteryReturnEstimate, MissionPhase, MissionStateRequest
 from kv_executive.srv import PlanPath
 from mavros_msgs.msg import State as VehicleState, StatusText
 from mavros_msgs.srv import CommandBool, ParamPull, SetMode
 from nav_msgs.msg import Odometry
-from rcl_interfaces.msg import ParameterType
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from rcl_interfaces.srv import GetParameters
 import rclpy
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
@@ -50,9 +51,27 @@ class MissionCanceled(MissionError):
     """A client requested cancellation; stop motion and hand over to LOITER."""
 
 
+class MissionAbortRequested(MissionError):
+    """A monitor requested an aborted action and bounded LOITER recovery."""
+
+
+class MissionStateRequested(MissionError):
+    """Stop Exploration on a legacy request for a dormant higher state."""
+
+    def __init__(self, state):
+        self.state = state
+        self.outcome = {'Return': 'return_requested', 'Verify': 'verify_requested'}[state]
+        super().__init__(f'Mission transition to {state} requested')
+
+
+_MISSION_OUTCOMES = [
+    'succeeded', 'aborted', 'canceled', 'return_requested', 'verify_requested',
+]
+
+
 class _MissionState(State):
     def __init__(self, executive, name, action):
-        super().__init__(['succeeded', 'aborted', 'canceled'])
+        super().__init__(_MISSION_OUTCOMES)
         self.executive = executive
         self.name = name
         self.action = action
@@ -67,6 +86,9 @@ class _MissionState(State):
             self.executive._check_running()
         except MissionCanceled:
             return 'canceled'
+        except MissionStateRequested as request:
+            self.executive._report(f'Exploration: leaving for {request.state}')
+            return request.outcome
         except (MissionError, ValueError) as error:
             self.executive._last_error = f'{self.name}: {error}'
             self.executive._report(self.executive._last_error, error=True)
@@ -96,24 +118,47 @@ class ExecutePathState(_MissionState):
         super().__init__(executive, 'EXECUTE_PATH', executive._execute_path)
 
 
+class ExplorationStateMachine(StateMachine):
+    """Take off once, then repeat scans and freshly planned random walks."""
+
+    def __init__(self, executive, skip_takeoff=False):
+        super().__init__(outcomes=_MISSION_OUTCOMES)
+        self.executive = executive
+        states = (
+            ('TAKEOFF', TakeoffState(executive), 'SWEEP'),
+            ('SWEEP', SweepState(executive), 'EXECUTE_PATH'),
+            ('EXECUTE_PATH', ExecutePathState(executive), 'SWEEP'),
+        )
+        for name, state, next_state in states[1:] if skip_takeoff else states:
+            transitions = {outcome: outcome for outcome in _MISSION_OUTCOMES}
+            transitions['succeeded'] = next_state
+            self.add_state(name, state, transitions=transitions)
+        # Native YASMIN nested dispatch does not invoke a Python override of
+        # StateMachine.execute; parent entry must be an actual child State.
+        self.add_state(
+            'ENTER_EXPLORATION',
+            _MissionState(executive, 'Exploration', executive._exploration_parent_entry),
+            transitions={
+                **{outcome: outcome for outcome in _MISSION_OUTCOMES},
+                'succeeded': 'SWEEP' if skip_takeoff else 'TAKEOFF',
+            },
+        )
+        self.set_start_state('ENTER_EXPLORATION')
+
+
 def build_state_machine(executive, skip_takeoff=False):
-    """Build one mission; airborne goals start directly at SWEEP."""
-    machine = StateMachine(outcomes=['succeeded', 'aborted', 'canceled'])
-    states = (
-        ('TAKEOFF', TakeoffState(executive), 'SWEEP'),
-        ('SWEEP', SweepState(executive), 'EXECUTE_PATH'),
-        ('EXECUTE_PATH', ExecutePathState(executive), 'succeeded'),
+    """Repeat Exploration only; dormant higher states are not instantiated."""
+    machine = StateMachine(outcomes=_MISSION_OUTCOMES)
+    machine.add_state(
+        'Exploration', ExplorationStateMachine(executive, skip_takeoff),
+        transitions={outcome: outcome for outcome in _MISSION_OUTCOMES},
     )
-    for name, state, next_state in states[1:] if skip_takeoff else states:
-        machine.add_state(name, state, transitions={
-            'succeeded': next_state, 'aborted': 'aborted', 'canceled': 'canceled',
-        })
-    machine.set_start_state('SWEEP' if skip_takeoff else 'TAKEOFF')
+    machine.set_start_state('Exploration')
     return machine
 
 
 class MissionExecutive(Node):
-    """Expose sequential flight through a ROS action with feedback and cancel."""
+    """Repeat Exploration until cancellation, a monitor abort, or a flight error."""
 
     def __init__(self):
         super().__init__('mission_executive')
@@ -141,11 +186,23 @@ class MissionExecutive(Node):
             'planning_timeout': 10.0,
             'mode_timeout': 10.0,
             'transform_timeout': 0.5,
+            'battery_alert_topic': 'battery_return_estimate',
+            'battery_alert_timeout': 5.0,
         }
         self.config = {
             name: self.declare_parameter(name, default).value
             for name, default in defaults.items()
         }
+        # Stock MAVROS calls its independent PX4 local ENU coordinates "map".
+        # Normalize that known input label, keeping the planner map distinct.
+        aliases = self.declare_parameter(
+            'local_odometry_frame_aliases', ['map'],
+            descriptor=ParameterDescriptor(dynamic_typing=True),
+        ).value
+        if (not isinstance(aliases, (list, tuple))
+                or any(not isinstance(frame, str) or not frame.strip() for frame in aliases)):
+            raise ValueError('local_odometry_frame_aliases must contain nonempty frame names')
+        self.config['local_odometry_frame_aliases'] = list(aliases)
         for name, default in defaults.items():
             value = self.config[name]
             if isinstance(default, float) and (
@@ -165,11 +222,18 @@ class MissionExecutive(Node):
         self._stop = threading.Event()
         self._goal_lock = threading.Lock()
         self._goal_handle = None
+        self._mission_started_ns = 0
+        self._requested_mission_state = None
+        self._parent_state = None
+        self._phase_sequence = 0
+        self._airborne_ready = False
+        self._motion_guard = None
         self._recovering = False
         self._finalizing = False
         self._command_inflight = False
         self._vehicle_state = None
         self._odometry = None
+        self._odometry_aliases_reported = set()
         self._state_received = 0.0
         self._odometry_received = 0.0
         self._target = None
@@ -197,11 +261,28 @@ class MissionExecutive(Node):
             Odometry, self.config['local_odometry_topic'], self._odometry_callback,
             qos_profile_sensor_data, callback_group=self._callbacks,
         )
+        self._battery_alert_subscription = self.create_subscription(
+            BatteryReturnEstimate, self.config['battery_alert_topic'],
+            self._battery_alert_callback,
+            10, callback_group=self._callbacks,
+        )
+        self._mission_state_subscription = self.create_subscription(
+            String, 'mission_state_request', self._mission_state_request_callback,
+            10, callback_group=self._callbacks,
+        )
+        self._goal_state_subscription = self.create_subscription(
+            MissionStateRequest, 'mission_state_request_for_goal',
+            self._goal_state_request_callback, 10, callback_group=self._callbacks,
+        )
         self._setpoint_publisher = self.create_publisher(
             PoseStamped, '/mavros/setpoint_position/local', 10,
         )
         self._status_publisher = self.create_publisher(
             String, 'mission_status',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
+        self._phase_publisher = self.create_publisher(
+            MissionPhase, 'mission_phase',
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
         self._setpoint_timer = self.create_timer(
@@ -268,9 +349,128 @@ class MissionExecutive(Node):
         self._report(f'PX4: {message.text}', error=message.severity <= 3)
 
     def _odometry_callback(self, message):
+        input_frame = message.header.frame_id
+        is_alias = (
+            input_frame != self.config['local_frame']
+            and input_frame in self.config['local_odometry_frame_aliases']
+        )
+        if is_alias:
+            message = deepcopy(message)
+            message.header.frame_id = self.config['local_frame']
         with self._data_lock:
             self._odometry = message
             self._odometry_received = time.monotonic()
+            report_alias = is_alias and input_frame not in self._odometry_aliases_reported
+            if report_alias:
+                self._odometry_aliases_reported.add(input_frame)
+        if report_alias:
+            self._report(
+                f'ODOMETRY: MAVROS local label {input_frame!r} uses '
+                f'{self.config["local_frame"]!r}; PX4 coordinates are unchanged',
+            )
+
+    def _battery_alert_callback(self, message):
+        """Abort only this goal for a fresh, coherent return or reserve alert."""
+        if not message.return_alert:
+            return
+        with self._goal_lock:
+            goal = self._goal_handle
+            if goal is None or not goal.is_active or self._finalizing:
+                return
+            goal_id = deepcopy(goal.goal_id)
+            accepted_ns = self._mission_started_ns
+        now_ns = self.get_clock().now().nanoseconds
+        stamp = message.header.stamp
+        source_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
+        if (accepted_ns <= 0 or source_ns <= accepted_ns or now_ns <= 0
+                or not -0.25 <= (now_ns - source_ns) / 1e9
+                <= self.config['battery_alert_timeout']):
+            return
+        frame = self.config['local_frame']
+        if (message.header.frame_id != frame
+                or message.current_pose.header.frame_id != frame
+                or message.home_pose.header.frame_id != frame):
+            return
+        pose_stamp = message.current_pose.header.stamp
+        pose_ns = pose_stamp.sec * 1_000_000_000 + pose_stamp.nanosec
+        if (pose_ns <= 0 or not -0.25 <= (now_ns - pose_ns) / 1e9
+                <= self.config['telemetry_timeout']):
+            return
+        try:
+            for pose in (message.current_pose.pose, message.home_pose.pose):
+                interpolate_pose(pose, pose, 0.0)
+        except ValueError:
+            return
+        remaining = message.remaining_percent
+        required = message.buffered_required_percent
+        margin = message.return_margin_percent
+        if (not all(math.isfinite(value) for value in (
+                remaining, required, margin, message.home_distance_m))
+                or not 0.0 <= remaining <= 100.0 or required < 0.0
+                or message.home_distance_m < 0.0 or remaining > required
+                or not math.isclose(margin, remaining - required, abs_tol=1e-3)):
+            return
+        if message.estimate_available and (
+            message.sample_count == 0
+            or not all(math.isfinite(value) and value >= 0.0 for value in (
+                message.mean_percent_per_meter, message.return_required_percent))
+        ):
+            return
+        # The monitor emits reserve-only alerts before learning a return rate.
+        # In that case the rate fields are NaN but the reserve budget is valid.
+        if self.request_mission_state('Abort', goal_id=goal_id):
+            reason = 'return budget' if message.estimate_available else 'battery reserve'
+            self._report(
+                f'BATTERY: {reason} alert; {remaining:.2f}% remaining, '
+                f'{required:.2f}% required; stopping Exploration',
+            )
+
+    def _verify_parent_entry(self, state):
+        """Publish Exploration admission; keep the former Verify entry dormant."""
+        if state != 'Exploration':
+            raise MissionError(f'{state} is dormant')
+        with self._goal_lock:
+            # Set before releasing admission so duplicate requests cannot leak
+            # into the next state while the vehicle is being stopped.
+            self._parent_state = state
+        self._check_running()
+        if self._airborne_ready:
+            self._recovering = True
+            try:
+                recovery = self._recover_to_loiter()
+            finally:
+                self._recovering = False
+            self._snapshot('AUTO.LOITER', require_armed=True)
+            if 'failed' in recovery:
+                raise MissionError(recovery)
+
+        def clock_ready():
+            stamp = self.get_clock().now().to_msg()
+            return stamp.sec > 0 or (stamp.sec == 0 and stamp.nanosec > 0)
+
+        self._wait_until(
+            clock_ready, self.config['service_timeout'], 'initialized mission ROS clock',
+        )
+        self._check_running()
+        with self._goal_lock:
+            goal = self._goal_handle
+            if goal is None or not goal.is_active:
+                raise MissionError('Higher-state entry requires an active mission')
+            self._phase_sequence += 1
+            if self._mission_started_ns <= 0:
+                self._mission_started_ns = self.get_clock().now().nanoseconds
+            phase = MissionPhase(
+                goal_id=deepcopy(goal.goal_id), state=state,
+                sequence=self._phase_sequence,
+            )
+        phase.header.stamp = self.get_clock().now().to_msg()
+        phase.header.frame_id = self.config['local_frame']
+        self._phase_publisher.publish(phase)
+        self._report(f'{state}: entered')
+
+    def _exploration_parent_entry(self, blackboard):
+        """Publish the goal-scoped phase used by the detection monitor."""
+        self._verify_parent_entry('Exploration')
 
     def _report(self, message, error=False):
         self._status_publisher.publish(String(data=message))
@@ -291,16 +491,23 @@ class MissionExecutive(Node):
             raise MissionError('Mission canceled or ROS is shutting down')
         with self._goal_lock:
             goal = self._goal_handle
-            if (
-                not self._recovering and not self._command_inflight
-                and goal is not None and goal.is_cancel_requested
-            ):
-                raise MissionCanceled('Mission canceled by client')
+            if not self._recovering and not self._command_inflight:
+                if goal is not None and goal.is_cancel_requested:
+                    raise MissionCanceled('Mission canceled by client')
+                if self._requested_mission_state == 'Abort':
+                    raise MissionAbortRequested('Exploration aborted by a monitor request')
+                if self._requested_mission_state is not None:
+                    raise MissionStateRequested(self._requested_mission_state)
+
+    def _check_motion_observation(self):
+        if not self._recovering and not self._command_inflight and self._motion_guard is not None:
+            self._motion_guard()
 
     def _wait_until(self, predicate, timeout, description):
         deadline = time.monotonic() + timeout
         while True:
             self._check_running()
+            self._check_motion_observation()
             if predicate():
                 return
             remaining = deadline - time.monotonic()
@@ -426,6 +633,9 @@ class MissionExecutive(Node):
         return altitude
 
     def _takeoff(self, blackboard):
+        if self._airborne_ready:
+            self._snapshot('AUTO.LOITER', require_armed=True)
+            return  # Resuming Exploration within an already airborne action.
         self._wait_until(
             self._telemetry_ready, self.config['service_timeout'],
             'connected FCU and local odometry',
@@ -470,6 +680,8 @@ class MissionExecutive(Node):
         self._wait_until(
             altitude_reached, self.config['takeoff_timeout'], 'takeoff altitude',
         )
+        self._airborne_ready = True
+        self._check_running()
 
     def _set_target(self, pose):
         # Normalize/validate a copy; never expose a mutable pose to the timer.
@@ -563,6 +775,7 @@ class MissionExecutive(Node):
         started = time.monotonic()
         while True:
             self._check_running()
+            self._check_motion_observation()
             self._snapshot('OFFBOARD', require_armed=True)
             elapsed = time.monotonic() - started
             fraction = min(1.0, elapsed / max(duration, 0.001))
@@ -700,7 +913,10 @@ class MissionExecutive(Node):
     def _goal_accepted_callback(self, goal_handle):
         with self._goal_lock:
             self._goal_handle = goal_handle
+            self._requested_mission_state = None
             self._finalizing = False
+            self._parent_state = None
+            self._mission_started_ns = self.get_clock().now().nanoseconds
         goal_handle.execute()
 
     def _cancel_callback(self, goal_handle):
@@ -726,6 +942,37 @@ class MissionExecutive(Node):
                 return None
             info = GoalInfo(goal_id=deepcopy(goal.goal_id))
         return self._cancel_client.call_async(CancelGoal.Request(goal_info=info))
+
+    def request_mission_state(self, state, goal_id=None):
+        """Latch a stop request; no request can activate a dormant higher state.
+
+        Abort, Return, and legacy Verify requests all end the action in LOITER.
+        Requests apply only to the active goal and never start a mission.
+        A supplied action UUID must match while holding the same admission lock.
+        """
+        if state not in {'Abort', 'Return', 'Verify'}:
+            return False
+        with self._goal_lock:
+            goal = self._goal_handle
+            if (
+                goal is None or not goal.is_active or self._finalizing
+                or self._recovering or goal.is_cancel_requested or self._stop.is_set()
+            ):
+                return False
+            if goal_id is not None and tuple(goal_id.uuid) != tuple(goal.goal_id.uuid):
+                return False
+            priority = {None: 0, 'Verify': 1, 'Return': 2, 'Abort': 3}
+            if priority[state] >= priority[self._requested_mission_state]:
+                self._requested_mission_state = state
+        return True
+
+    def _mission_state_request_callback(self, message):
+        if not self.request_mission_state(message.data):
+            self._report(f'MISSION: ignored state request {message.data!r}')
+
+    def _goal_state_request_callback(self, message):
+        if not self.request_mission_state(message.state, goal_id=message.goal_id):
+            self._report(f'MISSION: ignored goal state request {message.state!r}')
 
     def _auto_start(self):
         if not self._mission_client.server_is_ready():
@@ -768,6 +1015,8 @@ class MissionExecutive(Node):
         outcome = 'aborted'
         message = ''
         self._owns_flight = False
+        self._airborne_ready = False
+        self._motion_guard = None
         try:
             self._check_running()
             self.latest_path = None
@@ -776,23 +1025,37 @@ class MissionExecutive(Node):
             if goal_handle.request.skip_takeoff:
                 self._snapshot('AUTO.LOITER', require_armed=True)
                 self._owns_flight = True
+                self._airborne_ready = True
+            self._report('Exploration: started; repeating SWEEP and EXECUTE_PATH')
             self._state_machine = build_state_machine(
                 self, skip_takeoff=goal_handle.request.skip_takeoff,
             )
             outcome = self._state_machine(Blackboard())
-            self._check_running()
             if outcome == 'canceled':
                 raise MissionCanceled('Mission canceled by client')
+            if outcome in {'return_requested', 'verify_requested'}:
+                state = 'Return' if outcome == 'return_requested' else 'Verify'
+                raise MissionStateRequested(state)
+            self._check_running()
             if outcome != 'succeeded':
                 raise MissionError(self._last_error or 'Mission aborted')
-            self._report('MISSION: done; vehicle in AUTO.LOITER')
-            states = 'SWEEP and EXECUTE_PATH' if goal_handle.request.skip_takeoff else (
-                'TAKEOFF, SWEEP and EXECUTE_PATH'
-            )
-            message = f'{states} completed; AUTO.LOITER confirmed'
+            message = 'Mission completed; AUTO.LOITER confirmed'
+            self._report(f'MISSION: {message}')
         except MissionCanceled as error:
             outcome = 'canceled'
             message = str(error)
+        except MissionStateRequested as request:
+            # Return may supersede Verify while the nested machine unwinds.
+            # Close transition admission before starting the bounded handoff.
+            with self._goal_lock:
+                state = self._requested_mission_state or request.state
+                self._recovering = True
+            outcome = 'aborted'
+            message = {
+                'Abort': 'Exploration aborted by a monitor request',
+                'Return': 'Return requested; Return is not implemented',
+                'Verify': 'Verify requested; Verify is dormant; Exploration stopped',
+            }[state]
         except Exception as error:  # noqa: BLE001
             outcome = 'aborted'
             message = str(error)
@@ -828,7 +1091,11 @@ class MissionExecutive(Node):
                     self._recovery_hold = self._target is not None
                 with self._goal_lock:
                     self._goal_handle = None
+                    self._requested_mission_state = None
                     self._recovering = False
+                    self._parent_state = None
+                    self._mission_started_ns = 0
+                self._motion_guard = None
                 self._state_machine = None
                 self._mission_lock.release()
         return ExecuteMission.Result(success=outcome == 'succeeded', message=message)

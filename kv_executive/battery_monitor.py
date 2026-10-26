@@ -9,6 +9,7 @@ from kv_executive.battery_model import BatteryUsageModel
 from kv_executive.msg import BatteryReturnEstimate, BatteryUsage
 from mavros_msgs.msg import HomePosition, State
 from nav_msgs.msg import Odometry
+from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -24,6 +25,7 @@ DEFAULTS = {
     'mission_status_topic': 'mission_status',
     'home_position_topic': '/mavros/home_position/home',
     'local_frame': 'px4_odom',
+    'local_odometry_frame_aliases': ['map'],
     'battery_timeout': 5.0,
     'odometry_timeout': 2.0,
     'state_timeout': 10.0,
@@ -46,9 +48,17 @@ class BatteryMonitor(Node):
     def __init__(self, **kwargs):
         super().__init__('battery_monitor', **kwargs)
         self.config = {
-            name: self.declare_parameter(name, default).value
+            name: self.declare_parameter(
+                name, default,
+                ParameterDescriptor(dynamic_typing=isinstance(default, list)),
+            ).value
             for name, default in DEFAULTS.items()
         }
+        aliases = self.config['local_odometry_frame_aliases']
+        if not isinstance(aliases, (list, tuple)) or any(
+            not isinstance(alias, str) or not alias.strip() for alias in aliases
+        ):
+            raise ValueError('local_odometry_frame_aliases must contain nonempty frame names')
         for name, default in DEFAULTS.items():
             value = self.config[name]
             if isinstance(default, str) and not value.strip():
@@ -118,6 +128,7 @@ class BatteryMonitor(Node):
         self._last_alert = -math.inf
         self._alert_active = False
         self._unavailable = ''
+        self._odometry_alias_reported = False
 
     def _info_once(self, reason):
         if reason != self._unavailable:
@@ -162,6 +173,18 @@ class BatteryMonitor(Node):
         self._check_gap(self._odometry_received, self.config['odometry_timeout'], 'Odometry')
         self._odometry_received = time.monotonic()
         pose = PoseStamped(header=deepcopy(message.header), pose=deepcopy(message.pose.pose))
+        if pose.header.frame_id in self.config['local_odometry_frame_aliases']:
+            # This compatibility label applies only to the MAVROS local stream.
+            # Its numeric pose keeps the PX4 estimator origin, even when MAVROS
+            # labels it "map"; it does not become a planner/map-frame pose.
+            source_frame = pose.header.frame_id
+            pose.header.frame_id = self.config['local_frame']
+            if not self._odometry_alias_reported and source_frame != pose.header.frame_id:
+                self.get_logger().info(
+                    f'MAVROS local odometry frame {source_frame!r} accepted as '
+                    f'{pose.header.frame_id!r}; PX4 local coordinates retained'
+                )
+                self._odometry_alias_reported = True
         if not self._valid_pose(pose):
             self._pose = None
             self._invalidate('Invalid odometry or unexpected local frame')
@@ -346,8 +369,7 @@ class BatteryMonitor(Node):
         )
 
     def _tick(self):
-        if not self._phase_active:
-            return
+        # Learn only during path execution; publish alerts throughout flight.
         self._observe()
         reason = self._telemetry_problem()
         if reason:

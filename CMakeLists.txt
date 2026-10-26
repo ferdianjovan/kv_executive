@@ -24,16 +24,21 @@ find_package(mavros_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(action_msgs REQUIRED)
+find_package(unique_identifier_msgs REQUIRED)
 find_package(service_msgs REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlanPath.srv"
+  "srv/PlanToPose.srv"
   "action/ExecuteMission.action"
   "msg/BatteryUsage.msg"
   "msg/BatteryReturnEstimate.msg"
-  DEPENDENCIES nav_msgs geometry_msgs std_msgs
+  "msg/MissionStateRequest.msg"
+  "msg/MissionPhase.msg"
+  "msg/FireSourceReport.msg"
+  DEPENDENCIES nav_msgs geometry_msgs sensor_msgs std_msgs unique_identifier_msgs
 )
 
 # rosidl_generator_py installs the generated interfaces with this same
@@ -48,7 +53,7 @@ install(
 include_directories(${OMPL_INCLUDE_DIRS} ${OCTOMAP_INCLUDE_DIRS})
 add_executable(motion_planning src/planner_node.cpp)
 ament_target_dependencies(motion_planning
-    rclcpp ompl geometry_msgs nav_msgs rcl_interfaces octomap octomap_msgs
+    rclcpp ompl geometry_msgs nav_msgs sensor_msgs rcl_interfaces octomap octomap_msgs
     tf2 tf2_ros tf2_geometry_msgs mavros_msgs
 )
 rosidl_get_typesupport_target(cpp_typesupport_target
@@ -80,6 +85,7 @@ install(DIRECTORY
 # Install Python executables
 install(PROGRAMS
   scripts/executive_node.py
+  scripts/detection_monitor_node.py
   scripts/battery_monitor_node.py
   scripts/diagnose_ros_executor.py
   scripts/configure_px4_external_odometry.py
@@ -90,7 +96,13 @@ if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   ament_add_pytest_test(mission_geometry test/test_mission_geometry.py)
+  ament_add_pytest_test(launch_transport test/test_launch_transport.py)
   ament_add_pytest_test(mission_executive test/test_mission_executive.py)
+  ament_add_pytest_test(verification test/test_verification.py TIMEOUT 45)
+  ament_add_pytest_test(mission_navigation test/test_mission_navigation.py TIMEOUT 45)
+  ament_add_pytest_test(verify_ros test/test_verify_ros.py TIMEOUT 90)
+  ament_add_pytest_test(detection_monitor test/test_detection_monitor.py)
+  ament_add_pytest_test(detection_monitor_ros test/test_detection_monitor_ros.py TIMEOUT 120)
   ament_add_pytest_test(battery_model test/test_battery_model.py TIMEOUT 45)
   ament_add_pytest_test(battery_monitor test/test_battery_monitor.py TIMEOUT 45)
   ament_add_pytest_test(battery_monitor_ros test/test_battery_monitor_ros.py TIMEOUT 45)
@@ -98,9 +110,9 @@ if(BUILD_TESTING)
     battery_monitor_native_ros test/test_battery_monitor_native_ros.py TIMEOUT 90)
   ament_add_pytest_test(
     battery_monitor_constant_ros test/test_battery_monitor_constant_ros.py TIMEOUT 120)
-  ament_add_pytest_test(planner_inputs test/test_planner_inputs.py TIMEOUT 45)
-  # FCU state updates, telemetry loss, and three successive simulated-clock goals.
-  ament_add_pytest_test(mission_action test/test_mission_action.py TIMEOUT 210)
+  ament_add_pytest_test(planner_inputs test/test_planner_inputs.py TIMEOUT 90)
+  # Repeated Exploration cycles, parent-state requests, and simulated FCU recovery.
+  ament_add_pytest_test(mission_action test/test_mission_action.py TIMEOUT 300)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)

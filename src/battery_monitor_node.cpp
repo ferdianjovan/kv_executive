@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <kv_executive/msg/battery_return_estimate.hpp>
@@ -40,6 +41,14 @@ public:
     status_topic_ = string_parameter("mission_status_topic", "mission_status");
     home_topic_ = string_parameter("home_position_topic", "/mavros/home_position/home");
     local_frame_ = string_parameter("local_frame", "px4_odom");
+    local_odometry_frame_aliases_ = declare_parameter<std::vector<std::string>>(
+      "local_odometry_frame_aliases", std::vector<std::string>{"map"});
+    for (const auto & alias : local_odometry_frame_aliases_) {
+      if (!nonempty(alias)) {
+        throw std::invalid_argument(
+                "local_odometry_frame_aliases must contain nonempty frame names");
+      }
+    }
     battery_timeout_ = positive_parameter("battery_timeout", 5.0);
     odometry_timeout_ = positive_parameter("odometry_timeout", 2.0);
     state_timeout_ = positive_parameter("state_timeout", 10.0);
@@ -87,7 +96,7 @@ public:
       this, get_clock(), rclcpp::Duration::from_seconds(1.0 / monitor_rate),
       [this]() {tick();});
     RCLCPP_INFO(
-      get_logger(), "Battery monitor ready (C++ runtime); waiting for EXECUTE_PATH");
+      get_logger(), "Battery monitor ready (C++ runtime); watching armed-flight battery alerts");
   }
 
 private:
@@ -285,6 +294,22 @@ private:
     Pose pose;
     pose.header = message.header;
     pose.pose = message.pose.pose;
+    if (std::find(
+        local_odometry_frame_aliases_.begin(), local_odometry_frame_aliases_.end(),
+        pose.header.frame_id) != local_odometry_frame_aliases_.end())
+    {
+      // Normalize only this subscribed MAVROS local-odometry label. Its numeric
+      // pose still uses the independent PX4 estimator origin, not the map origin.
+      const auto source_frame = pose.header.frame_id;
+      pose.header.frame_id = local_frame_;
+      if (!odometry_alias_reported_ && source_frame != local_frame_) {
+        RCLCPP_INFO(
+          get_logger(),
+          "MAVROS local odometry frame '%s' accepted as '%s'; PX4 local coordinates retained",
+          source_frame.c_str(), local_frame_.c_str());
+        odometry_alias_reported_ = true;
+      }
+    }
     if (!valid_local_pose(pose)) {
       pose_.reset();
       invalidate("Invalid odometry or unexpected local frame");
@@ -549,9 +574,8 @@ private:
 
   void tick()
   {
-    if (!phase_active_) {
-      return;
-    }
+    // Sampling remains EXECUTE_PATH-only, but reserve/return alerts must also
+    // be available during the Exploration yaw sweep and takeoff.
     observe();
     const std::string reason = telemetry_problem();
     if (!reason.empty()) {
@@ -599,6 +623,8 @@ private:
   std::string status_topic_;
   std::string home_topic_;
   std::string local_frame_;
+  std::vector<std::string> local_odometry_frame_aliases_;
+  bool odometry_alias_reported_ = false;
   double battery_timeout_;
   double odometry_timeout_;
   double state_timeout_;

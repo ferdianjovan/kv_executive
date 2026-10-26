@@ -90,6 +90,8 @@ def _launch_setup(context):
             'ros__parameters': {
                 # PX4 local position retains the EKF local origin. Do not call
                 # that frame 'map' when the external map has another origin.
+                # Consumers also accept stock MAVROS's 'map' label only as a
+                # configured alias on their MAVROS local-odometry input.
                 'frame_id': local_frame,
                 'tf.send': False,
             }
@@ -254,7 +256,7 @@ def generate_launch_description():
             DeclareLaunchArgument('namespace', default_value='mavros'),
             DeclareLaunchArgument(
                 'drone_name',
-                default_value='x500_depth',
+                default_value='kv_drone',
                 description='Drone topic namespace and TF frame prefix',
             ),
             DeclareLaunchArgument(

@@ -6,6 +6,10 @@ battery_monitor:
     mission_status_topic: mission_status
     home_position_topic: /mavros/home_position/home
     local_frame: px4_odom
+    # Stock MAVROS labels its PX4-local stream "map"; normalize this label only.
+    # Set [px4_odom] to require an exact local_frame match instead.
+    # Jazzy rclcpp cannot parse untyped empty arrays from YAML/CLI overrides.
+    local_odometry_frame_aliases: [map]
     # Freshness deadlines use monotonic wall time since message receipt.
     battery_timeout: 5.0
     odometry_timeout: 2.0

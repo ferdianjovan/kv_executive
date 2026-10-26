@@ -3,7 +3,7 @@
 <package format="3">
   <name>kv_executive</name>
   <version>0.0.0</version>
-  <description>KV Executive Planning</description>
+  <description>Exploration and verification mission planning with detection monitoring.</description>
   <maintainer email="ferdian.jovan@abdn.ac.uk">Ferdian Jovan</maintainer>
   <license>BSD-3-Clause</license>
 
@@ -28,6 +28,7 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>action_msgs</depend>
+  <depend>unique_identifier_msgs</depend>
   <depend>service_msgs</depend>
   <depend>rcl_interfaces</depend>
 
@@ -39,6 +40,7 @@
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>yasmin</exec_depend>
+  <exec_depend>kv_perception</exec_depend>
   <exec_depend>tf2_ros_py</exec_depend>
   <exec_depend>tf2_msgs</exec_depend>
   <exec_depend>rosgraph_msgs</exec_depend>

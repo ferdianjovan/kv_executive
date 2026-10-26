@@ -22,3 +22,10 @@ motion_planner:
     octomap_topic: /octomap_binary
     mavros_parameter_service: /mavros/param/get_parameters
     transform_timeout: 0.2
+    # Explicit Verify/retreat goals may extend beyond the exploration window,
+    # while still respecting home altitude limits and collision clearance.
+    maximum_target_distance: 50.0
+    # Known fire reports exclude exploration endpoints around the observation
+    # viewpoint. Explicit targets and paths through these regions remain valid.
+    reported_site_exclusion_radius: 15.0
+    maximum_reported_sites: 100

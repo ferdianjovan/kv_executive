@@ -1,10 +1,14 @@
-# Set true to run the sweep and path from the current airborne position.
-# The default false runs TAKEOFF first and requires a disarmed vehicle.
+# Start Exploration: repeat SWEEP and freshly planned EXECUTE_PATH indefinitely.
+# Verify is dormant and disconnected from Exploration.
+# Set true to skip the initial TAKEOFF; requires airborne, armed AUTO.LOITER.
+# The default false runs TAKEOFF once and requires a disarmed vehicle.
+# Cancellation ends the goal; monitor alerts and flight errors abort it.
+# Recovery requests LOITER. Send a new goal explicitly to resume Exploration.
 bool skip_takeoff
 ---
 bool success
 string message
 ---
-# Current YASMIN state or mission lifecycle event.
+# Current Exploration child state or mission lifecycle event.
 string state
 string message
