@@ -29,7 +29,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'start_detection_monitor', default_value='true',
-            description='Abort Exploration to LOITER for confirmed smoke or fire',
+            description='Enter Verify from Exploration for confirmed smoke or fire',
         ),
         DeclareLaunchArgument(
             'battery_monitor_config',
@@ -68,7 +68,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'mission_state_request_topic', default_value='mission_state_request_for_goal',
-            description='Goal-scoped Abort request topic in the executive namespace',
+            description='Goal-scoped Verify request topic in the executive namespace',
         ),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(PathJoinSubstitution([

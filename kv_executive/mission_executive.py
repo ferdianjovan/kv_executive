@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cancelable ROS action for repeating Exploration, with monitor abort to LOITER.
+Cancelable ROS action for Exploration and observation-driven Verify.
 
 Run this node with a MultiThreadedExecutor: mission states wait for telemetry
 and service replies while independent callbacks keep OFFBOARD setpoints alive.
@@ -15,6 +15,8 @@ from action_msgs.msg import GoalInfo
 from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import Pose, PoseStamped
 from kv_executive.action import ExecuteMission
+from kv_executive.completed_sites import COMPLETED_SITE_DEFAULTS, CompletedSitesMixin
+from kv_executive.inspection_navigation import InspectionNavigationMixin
 from kv_executive.mission_geometry import (
     angular_distance,
     interpolate_pose,
@@ -24,8 +26,13 @@ from kv_executive.mission_geometry import (
     transform_pose,
     yaw_from_quaternion,
 )
-from kv_executive.msg import BatteryReturnEstimate, MissionPhase, MissionStateRequest
-from kv_executive.srv import PlanPath
+from kv_executive.mission_navigation import VerifyNavigationMixin
+from kv_executive.msg import (
+    BatteryReturnEstimate, FireSourceReport, InspectionReport, MissionPhase, MissionStateRequest,
+)
+from kv_executive.srv import PlanInspectionPath, PlanPath, PlanToPose, QueryInspectionGeometry
+from kv_executive.verification import VERIFY_DEFAULTS, VerifyController, VerifyStateMachine
+from kv_perception.msg import FireDetection, SmokeDetection
 from mavros_msgs.msg import State as VehicleState, StatusText
 from mavros_msgs.srv import CommandBool, ParamPull, SetMode
 from nav_msgs.msg import Odometry
@@ -38,6 +45,7 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, qos_profile_sensor_data, QoSProfile
 from rclpy.time import Time
+from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
 from yasmin import Blackboard, State, StateMachine
@@ -45,6 +53,10 @@ from yasmin import Blackboard, State, StateMachine
 
 class MissionError(RuntimeError):
     """An operation failed or timed out; stop advancing the mission."""
+
+
+class MissionTimeout(MissionError):
+    """A bounded wait expired; callers can distinguish it from control faults."""
 
 
 class MissionCanceled(MissionError):
@@ -56,7 +68,7 @@ class MissionAbortRequested(MissionError):
 
 
 class MissionStateRequested(MissionError):
-    """Stop Exploration on a legacy request for a dormant higher state."""
+    """Unwind the active child for a requested higher-state transition."""
 
     def __init__(self, state):
         self.state = state
@@ -147,22 +159,35 @@ class ExplorationStateMachine(StateMachine):
 
 
 def build_state_machine(executive, skip_takeoff=False):
-    """Repeat Exploration only; dormant higher states are not instantiated."""
+    """Repeat Exploration, entering Verify on confirmed smoke or fire."""
     machine = StateMachine(outcomes=_MISSION_OUTCOMES)
     machine.add_state(
         'Exploration', ExplorationStateMachine(executive, skip_takeoff),
-        transitions={outcome: outcome for outcome in _MISSION_OUTCOMES},
+        transitions={
+            **{outcome: outcome for outcome in _MISSION_OUTCOMES},
+            'verify_requested': 'Verify',
+        },
+    )
+    machine.add_state(
+        'Verify', VerifyStateMachine(executive),
+        transitions={
+            'explore': 'Exploration', 'aborted': 'aborted',
+            'canceled': 'canceled', 'return_requested': 'return_requested',
+        },
     )
     machine.set_start_state('Exploration')
     return machine
 
 
-class MissionExecutive(Node):
-    """Repeat Exploration until cancellation, a monitor abort, or a flight error."""
+class MissionExecutive(
+        CompletedSitesMixin, InspectionNavigationMixin, VerifyNavigationMixin, Node):
+    """Explore and verify detections within one cancelable mission goal."""
 
     def __init__(self):
         super().__init__('mission_executive')
         defaults = {
+            **VERIFY_DEFAULTS,
+            **COMPLETED_SITE_DEFAULTS,
             'auto_start_mission': False,
             'robot_base_frame': 'kv_drone/base_link',
             'local_odometry_topic': '/mavros/local_position/odom',
@@ -188,6 +213,13 @@ class MissionExecutive(Node):
             'transform_timeout': 0.5,
             'battery_alert_topic': 'battery_return_estimate',
             'battery_alert_timeout': 5.0,
+            'smoke_detection_topic': '/kv_drone/smoke/detection',
+            'fire_detection_topic': '/kv_drone/fire/detection',
+            'verify_planning_frame': 'map',
+            'global_position_topic': '/mavros/global_position/global',
+            'global_position_timeout': 2.0,
+            'verify_path_step': 0.25,
+            'fire_exclusion_radius': 15.0,
         }
         self.config = {
             name: self.declare_parameter(name, default).value
@@ -206,15 +238,34 @@ class MissionExecutive(Node):
         for name, default in defaults.items():
             value = self.config[name]
             if isinstance(default, float) and (
-                not math.isfinite(value) or value <= 0.0
+                not math.isfinite(value) or value < 0.0
+                or (value == 0.0 and name != 'verify_future_tolerance')
             ):
-                raise ValueError(f'{name} must be finite and positive')
+                raise ValueError(
+                    f'{name} must be finite and positive (future tolerance may be zero)')
+            if isinstance(default, int) and not isinstance(default, bool) and (
+                value < 0 or (value == 0 and name != 'verify_fire_approach_max_steps')
+            ):
+                raise ValueError(f'{name} must be a positive count')
             if isinstance(default, str) and not value.strip():
                 raise ValueError(f'{name} must not be empty')
         if self.config['setpoint_rate'] <= 2.0:
             raise ValueError('setpoint_rate must exceed the PX4 2 Hz minimum')
         if self.config['offboard_warmup'] < 1.0:
             raise ValueError('offboard_warmup must be at least one second')
+        if self.config['verify_step_min'] > self.config['verify_step_max']:
+            raise ValueError('verify_step_min must not exceed verify_step_max')
+        for name in ('verify_full_coverage', 'verify_track_center_tolerance'):
+            if self.config[name] > 1.0:
+                raise ValueError(f'{name} must not exceed one')
+        if self.config['verify_track_area_ratio'] < 1.0:
+            raise ValueError('verify_track_area_ratio must be at least one')
+        if self.config['verify_inspection_max_attempts'] > 3:
+            raise ValueError('verify_inspection_max_attempts must not exceed three')
+        if not (self.config['verify_inspection_altitude']
+                <= self.config['verify_navigation_preferred_agl']
+                <= self.config['verify_navigation_max_agl']):
+            raise ValueError('Navigation clearance must satisfy minimum <= preferred <= maximum')
 
         self._callbacks = ReentrantCallbackGroup()
         self._data_lock = threading.Lock()
@@ -224,9 +275,11 @@ class MissionExecutive(Node):
         self._goal_handle = None
         self._mission_started_ns = 0
         self._requested_mission_state = None
+        self._requested_verify_automatic = False
         self._parent_state = None
         self._phase_sequence = 0
         self._airborne_ready = False
+        self._verify_retry_after = 0.0
         self._motion_guard = None
         self._recovering = False
         self._finalizing = False
@@ -246,6 +299,12 @@ class MissionExecutive(Node):
         self._state_machine = None
         self.latest_path = None
         self.sub_paths = []
+        self._global_position = None
+        self._global_position_received = 0.0
+        self._fire_sites = []
+        self._site_sequence = 0
+        self._initialize_completed_sites()
+        self._verify = VerifyController(self, error_type=MissionError)
 
         # Match MAVROS's reliable, latched state publisher; odometry stays sensor QoS.
         self._state_subscription = self.create_subscription(
@@ -266,6 +325,18 @@ class MissionExecutive(Node):
             self._battery_alert_callback,
             10, callback_group=self._callbacks,
         )
+        self._smoke_subscription = self.create_subscription(
+            SmokeDetection, self.config['smoke_detection_topic'], self._verify.smoke_callback,
+            1, callback_group=self._callbacks,
+        )
+        self._fire_subscription = self.create_subscription(
+            FireDetection, self.config['fire_detection_topic'], self._verify.fire_callback,
+            1, callback_group=self._callbacks,
+        )
+        self._global_position_subscription = self.create_subscription(
+            NavSatFix, self.config['global_position_topic'], self._global_position_callback,
+            qos_profile_sensor_data, callback_group=self._callbacks,
+        )
         self._mission_state_subscription = self.create_subscription(
             String, 'mission_state_request', self._mission_state_request_callback,
             10, callback_group=self._callbacks,
@@ -284,6 +355,14 @@ class MissionExecutive(Node):
         self._phase_publisher = self.create_publisher(
             MissionPhase, 'mission_phase',
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
+        self._fire_report_publisher = self.create_publisher(
+            FireSourceReport, 'fire_sources',
+            QoSProfile(depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
+        self._inspection_report_publisher = self.create_publisher(
+            InspectionReport, 'inspection_reports',
+            QoSProfile(depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
         self._setpoint_timer = self.create_timer(
             1.0 / self.config['setpoint_rate'], self._publish_setpoint,
@@ -304,6 +383,15 @@ class MissionExecutive(Node):
         )
         self._planning_client = self.create_client(
             PlanPath, 'plan_path', callback_group=self._callbacks,
+        )
+        self._target_planning_client = self.create_client(
+            PlanToPose, 'plan_to_pose', callback_group=self._callbacks,
+        )
+        self._inspection_geometry_client = self.create_client(
+            QueryInspectionGeometry, 'query_inspection_geometry', callback_group=self._callbacks,
+        )
+        self._inspection_planning_client = self.create_client(
+            PlanInspectionPath, 'plan_inspection_path', callback_group=self._callbacks,
         )
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
@@ -348,6 +436,11 @@ class MissionExecutive(Node):
     def _statustext_callback(self, message):
         self._report(f'PX4: {message.text}', error=message.severity <= 3)
 
+    def _global_position_callback(self, message):
+        with self._data_lock:
+            self._global_position = deepcopy(message)
+            self._global_position_received = time.monotonic()
+
     def _odometry_callback(self, message):
         input_frame = message.header.frame_id
         is_alias = (
@@ -360,6 +453,7 @@ class MissionExecutive(Node):
         with self._data_lock:
             self._odometry = message
             self._odometry_received = time.monotonic()
+            CompletedSitesMixin._completed_odometry_locked(self, message)
             report_alias = is_alias and input_frame not in self._odometry_aliases_reported
             if report_alias:
                 self._odometry_aliases_reported.add(input_frame)
@@ -422,17 +516,18 @@ class MissionExecutive(Node):
             reason = 'return budget' if message.estimate_available else 'battery reserve'
             self._report(
                 f'BATTERY: {reason} alert; {remaining:.2f}% remaining, '
-                f'{required:.2f}% required; stopping Exploration',
+                f'{required:.2f}% required; stopping mission',
             )
 
     def _verify_parent_entry(self, state):
-        """Publish Exploration admission; keep the former Verify entry dormant."""
-        if state != 'Exploration':
-            raise MissionError(f'{state} is dormant')
+        """Stop prior motion before publishing admission to a higher state."""
         with self._goal_lock:
             # Set before releasing admission so duplicate requests cannot leak
             # into the next state while the vehicle is being stopped.
             self._parent_state = state
+            if state == 'Verify' and self._requested_mission_state == 'Verify':
+                self._requested_mission_state = None
+                self._requested_verify_automatic = False
         self._check_running()
         if self._airborne_ready:
             self._recovering = True
@@ -470,6 +565,53 @@ class MissionExecutive(Node):
 
     def _exploration_parent_entry(self, blackboard):
         """Publish the goal-scoped phase used by the detection monitor."""
+        try:
+            retry_delayed = bool(blackboard['verify_exploration_required'])
+        except (KeyError, RuntimeError):
+            retry_delayed = False
+        blackboard['verify_exploration_required'] = False
+        if retry_delayed and self._verify_defer_viewpoint():
+            self._report(
+                'Exploration: deferring the blocked source until translation or a new bearing')
+        cooldown = self.config['verify_retry_cooldown'] if retry_delayed else 0.0
+        self._verify_retry_after = time.monotonic() + cooldown if retry_delayed else 0.0
+        if retry_delayed:
+            self._report(f'Exploration: deferring repeat verification for {cooldown:.1f} s')
+        blackboard['verify_entered'] = False
+        blackboard['verify_approaches'] = 0
+        blackboard['verify_smoke_approach_completed'] = False
+        blackboard['verify_smoke_approach_after_ns'] = 0
+        blackboard['verify_reference_pose'] = None
+        blackboard['verify_smoke_bearing'] = None
+        blackboard['verify_arrival_after_ns'] = 0
+        blackboard['verify_inspection_geometry'] = None
+        blackboard['verify_inspection_origin'] = None
+        blackboard['verify_inspection_started'] = None
+        blackboard['verify_inspection_attempts'] = 0
+        blackboard['verify_inspection_after_ns'] = 0
+        blackboard['verify_standoff_reached'] = False
+        blackboard['verify_viewpoint_required'] = False
+        blackboard['verify_search_active'] = False
+        blackboard['verify_search_recovery_required'] = False
+        blackboard['verify_search_failures'] = 0
+        blackboard['verify_localization_steps'] = 0
+        blackboard['verify_localization_origin'] = None
+        blackboard['verify_navigation_start_refreshes'] = 0
+        blackboard['verify_navigation_refresh_origin'] = None
+        blackboard['verify_navigation_refresh_deadline'] = None
+        blackboard['verify_navigation_refresh_stamp_ns'] = 0
+        blackboard['verify_navigation_stalls'] = 0
+        blackboard['verify_navigation_visited'] = None
+        blackboard['verify_navigation_legs'] = 0
+        blackboard['verify_smoke_boundary_reached'] = False
+        blackboard['verify_fire_pending'] = False
+        blackboard['verify_fire_observed'] = False
+        blackboard['verify_fire_seen_ns'] = 0
+        blackboard['verify_fire_approach_track'] = None
+        blackboard['verify_fire_approach_steps'] = 0
+        blackboard['verify_fire_standoff_established'] = False
+        self._verify.discard_fire_confirmation()
+        self._verify_reset_source_localization()
         self._verify_parent_entry('Exploration')
 
     def _report(self, message, error=False):
@@ -489,14 +631,41 @@ class MissionExecutive(Node):
     def _check_running(self):
         if self._stop.is_set() or not rclpy.ok(context=self.context):
             raise MissionError('Mission canceled or ROS is shutting down')
+        # Admission can race an inconclusive inspection finishing. Recheck an
+        # automatic request in the mission worker before dispatch, without
+        # holding the goal lock across source-time TF/odometry association.
+        with self._goal_lock:
+            goal = self._goal_handle
+            automatic_goal = (
+                deepcopy(goal.goal_id)
+                if goal is not None and self._requested_mission_state == 'Verify'
+                and getattr(self, '_requested_verify_automatic', False) else None)
+        if automatic_goal is not None and (
+                CompletedSitesMixin._verify_request_is_completed(self)
+                or CompletedSitesMixin._verify_request_is_deferred(self, automatic_goal)):
+            with self._goal_lock:
+                goal = self._goal_handle
+                if (goal is not None
+                        and tuple(goal.goal_id.uuid) == tuple(automatic_goal.uuid)
+                        and self._requested_mission_state == 'Verify'
+                        and getattr(self, '_requested_verify_automatic', False)):
+                    self._requested_mission_state = None
+                    self._requested_verify_automatic = False
         with self._goal_lock:
             goal = self._goal_handle
             if not self._recovering and not self._command_inflight:
                 if goal is not None and goal.is_cancel_requested:
                     raise MissionCanceled('Mission canceled by client')
                 if self._requested_mission_state == 'Abort':
-                    raise MissionAbortRequested('Exploration aborted by a monitor request')
+                    raise MissionAbortRequested('Mission aborted by a monitor request')
                 if self._requested_mission_state is not None:
+                    if self._requested_mission_state == 'Verify':
+                        if not self._airborne_ready:
+                            return  # Complete takeoff before honoring a detection.
+                        if (self._parent_state == 'Exploration'
+                                and time.monotonic() < self._verify_retry_after):
+                            return  # Keep the request latched through the brief retry delay.
+                        self._verify_retry_after = 0.0
                     raise MissionStateRequested(self._requested_mission_state)
 
     def _check_motion_observation(self):
@@ -512,7 +681,7 @@ class MissionExecutive(Node):
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
-                raise MissionError(f'Timed out: {description}')
+                raise MissionTimeout(f'Timed out: {description}')
             self._stop.wait(min(0.05, remaining))
 
     def _telemetry_error_locked(self, now):
@@ -914,8 +1083,10 @@ class MissionExecutive(Node):
         with self._goal_lock:
             self._goal_handle = goal_handle
             self._requested_mission_state = None
+            self._requested_verify_automatic = False
             self._finalizing = False
             self._parent_state = None
+            self._verify_retry_after = 0.0
             self._mission_started_ns = self.get_clock().now().nanoseconds
         goal_handle.execute()
 
@@ -944,14 +1115,18 @@ class MissionExecutive(Node):
         return self._cancel_client.call_async(CancelGoal.Request(goal_info=info))
 
     def request_mission_state(self, state, goal_id=None):
-        """Latch a stop request; no request can activate a dormant higher state.
+        """Latch a higher-state transition or stop request for the active goal.
 
-        Abort, Return, and legacy Verify requests all end the action in LOITER.
+        Verify interrupts Exploration; Abort and unimplemented Return end the action.
         Requests apply only to the active goal and never start a mission.
         A supplied action UUID must match while holding the same admission lock.
         """
         if state not in {'Abort', 'Return', 'Verify'}:
             return False
+        completed = (state == 'Verify' and goal_id is not None
+                     and CompletedSitesMixin._verify_request_is_completed(self))
+        deferred = (state == 'Verify' and goal_id is not None
+                    and CompletedSitesMixin._verify_request_is_deferred(self, goal_id))
         with self._goal_lock:
             goal = self._goal_handle
             if (
@@ -961,9 +1136,14 @@ class MissionExecutive(Node):
                 return False
             if goal_id is not None and tuple(goal_id.uuid) != tuple(goal.goal_id.uuid):
                 return False
+            if state == 'Verify' and self._parent_state == 'Verify':
+                return False
+            if completed or deferred:
+                return False
             priority = {None: 0, 'Verify': 1, 'Return': 2, 'Abort': 3}
             if priority[state] >= priority[self._requested_mission_state]:
                 self._requested_mission_state = state
+                self._requested_verify_automatic = state == 'Verify' and goal_id is not None
         return True
 
     def _mission_state_request_callback(self, message):
@@ -1018,6 +1198,7 @@ class MissionExecutive(Node):
         self._airborne_ready = False
         self._motion_guard = None
         try:
+            self._verify.reset()
             self._check_running()
             self.latest_path = None
             self.sub_paths = []
@@ -1052,9 +1233,9 @@ class MissionExecutive(Node):
                 self._recovering = True
             outcome = 'aborted'
             message = {
-                'Abort': 'Exploration aborted by a monitor request',
+                'Abort': 'Mission aborted by a monitor request',
                 'Return': 'Return requested; Return is not implemented',
-                'Verify': 'Verify requested; Verify is dormant; Exploration stopped',
+                'Verify': 'Verify transition did not complete; mission stopped',
             }[state]
         except Exception as error:  # noqa: BLE001
             outcome = 'aborted'

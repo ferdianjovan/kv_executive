@@ -16,6 +16,7 @@ from launch.event_handlers import OnShutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+from launch_ros.utilities import make_namespace_absolute, prefix_namespace
 
 
 def _parse_bool(value):
@@ -60,7 +61,12 @@ def _static_rotation(
 
 
 def _launch_setup(context):
-    namespace = LaunchConfiguration('namespace').perform(context).strip('/')
+    namespace = make_namespace_absolute(
+        prefix_namespace(
+            context.launch_configurations.get('ros_namespace', ''),
+            LaunchConfiguration('namespace').perform(context),
+        )
+    )
     external_topic = LaunchConfiguration('external_odometry_topic').perform(context)
     odom_parent = LaunchConfiguration('external_odom_parent_frame').perform(context)
     odom_child = LaunchConfiguration('external_odom_child_frame').perform(context)
@@ -105,7 +111,10 @@ def _launch_setup(context):
         json.dumps(runtime_config, indent=2), encoding='utf-8'
     )
 
-    mavros_prefix = f'/{namespace}' if namespace else ''
+    # MAVROS 2.16 places plugins below the UAS node named "mavros".
+    # Adding a process namespace of "mavros" would duplicate that prefix.
+    mavros_prefix = f'{namespace.rstrip("/")}/mavros'
+    mavros_odometry_topic = f'{mavros_prefix}/odometry/out'
     mavros_node = Node(
         package='mavros',
         executable='mavros_node',
@@ -134,12 +143,27 @@ def _launch_setup(context):
                 'use_sim_time': use_sim_time,
             },
         ],
-        remappings=[
-            # MAVROS "out" means ROS odometry going out to the FCU. "in" is
-            # ODOMETRY received from the FCU.
-            (f'{mavros_prefix}/odometry/out', external_topic),
-        ],
     )
+
+    # MAVROS 2.16 plugin nodes ignore process-global topic remappings. Feed
+    # the plugin's actual input through a persistent relay instead.
+    resolved_external_topic = prefix_namespace(namespace, external_topic)
+    odometry_relay_nodes = []
+    if resolved_external_topic != mavros_odometry_topic:
+        odometry_relay_nodes.append(
+            Node(
+                package='kv_executive',
+                executable='relay_external_odometry.py',
+                namespace=namespace,
+                name='external_odometry_relay',
+                output='screen',
+                parameters=[{
+                    'input_topic': external_topic,
+                    'output_topic': mavros_odometry_topic,
+                    'use_sim_time': use_sim_time,
+                }],
+            )
+        )
 
     frame_conversion_nodes = []
     if publish_frame_conversions:
@@ -183,6 +207,7 @@ def _launch_setup(context):
     configurator = Node(
         package='kv_executive',
         executable='configure_px4_external_odometry.py',
+        namespace=namespace,
         name='configure_px4_external_odometry',
         output='screen',
         condition=IfCondition(LaunchConfiguration('configure_px4')),
@@ -230,11 +255,13 @@ def _launch_setup(context):
         LogInfo(
             msg=(
                 f'MAVROS external odometry: {external_topic} '
-                f'({odom_parent} -> {odom_child})'
+                f'-> {mavros_odometry_topic} ({odom_parent} -> {odom_child}); '
+                f'parameter services: {mavros_prefix}/param'
             )
         ),
         *frame_conversion_nodes,
         mavros_node,
+        *odometry_relay_nodes,
         configurator,
         cleanup,
     ]
@@ -253,7 +280,14 @@ def generate_launch_description():
             DeclareLaunchArgument('tgt_system', default_value='1'),
             DeclareLaunchArgument('tgt_component', default_value='1'),
             DeclareLaunchArgument('fcu_protocol', default_value='v2.0'),
-            DeclareLaunchArgument('namespace', default_value='mavros'),
+            DeclareLaunchArgument(
+                'namespace',
+                default_value='',
+                description=(
+                    'Container namespace; MAVROS topics/services are under '
+                    '/<namespace>/mavros (default: /mavros)'
+                ),
+            ),
             DeclareLaunchArgument(
                 'drone_name',
                 default_value='kv_drone',

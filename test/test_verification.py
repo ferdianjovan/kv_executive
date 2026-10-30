@@ -4,11 +4,11 @@ from copy import deepcopy
 import math
 from types import SimpleNamespace
 
-from geometry_msgs.msg import Pose
-from kv_executive.mission_geometry import quaternion_from_yaw, yaw_from_quaternion
+from geometry_msgs.msg import Point, PointStamped
+from kv_executive.mission_geometry import quaternion_from_yaw
 import kv_executive.verification as verification
 from kv_executive.verification import (
-    VerificationObservationLost, VerifyController, VerifyStateMachine,
+    VerifyController, VerifyStateMachine,
 )
 from kv_perception.msg import SmokeDetection
 from nav_msgs.msg import Odometry
@@ -20,7 +20,9 @@ from yasmin import Blackboard
 class Harness:
     def __init__(self):
         self.now = 100.0
-        self.config = {}
+        # Most tests isolate detection/centering/reporting. Approach movement
+        # is enabled explicitly by the dedicated flight-policy cases below.
+        self.config = {'verify_fire_approach_max_steps': 0}
         self.events = []
         self.odometry = Odometry()
         self.odometry.pose.pose.position.z = 6.0
@@ -29,6 +31,20 @@ class Harness:
         self.on_wait = lambda: None
         self._stop = SimpleNamespace(wait=self.wait)
         self._verify = None
+        self._verify_last_geometry_stamp_ns = int(self.now * 1e9)
+        self.map_available = True
+        self.map_stamp_ns = None
+        self.target_geometry = {
+            'point': Point(x=20.0),
+            'planning_point': PointStamped(
+                header=Header(frame_id='map'), point=Point(x=20.0)),
+            'range': 20.0,
+            'uncertainty': 0.25,
+            'method': 'thermal_multiview_bearings',
+            'target_valid': True,
+            'source_stamp': header(self.now).stamp,
+            'ground_z': 0.0,
+        }
 
     def get_clock(self):
         return SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=int(self.now * 1e9)))
@@ -48,10 +64,20 @@ class Harness:
     def _verify_parent_entry(self, name):
         self.events.append(('parent', name))
 
+    def _verify_navigation_preflight(self):
+        self.events.append(('preflight',))
+        return True
+
+    def _verify_fresh_map_stamp(self, timeout=None):
+        self.events.append(('map_poll',))
+        if not self.map_available:
+            return 0
+        return int(self.now * 1e9) if self.map_stamp_ns is None else self.map_stamp_ns
+
     def _report(self, message, error=False):
         self.events.append(('status', message))
 
-    def _verify_plan_to(self, target, guard=None, speed=None):
+    def _verify_plan_to(self, target, guard=None, speed=None, allow_plan_failure=False):
         if guard:
             guard()
         self.events.append(('plan', deepcopy(target)))
@@ -59,6 +85,7 @@ class Harness:
         if guard:
             guard()
         self.odometry.pose.pose = deepcopy(target)
+        return True
 
     def _verify_rotate(self, yaw, guard=None, hold_duration=None):
         if guard:
@@ -74,9 +101,55 @@ class Harness:
         self.on_motion()
         if guard:
             guard()
+        deadline = self.now + seconds
+        while self.now < deadline:
+            self.wait(min(0.05, deadline - self.now))
+            if guard:
+                guard()
 
     def _verify_record_fire(self, fire, bearing):
         self.events.append(('record', deepcopy(fire), bearing))
+
+    def _verify_target_geometry(self, message, source='smoke'):
+        self.events.append(('geometry', source, deepcopy(message)))
+        geometry = deepcopy(self.target_geometry)
+        geometry['source_stamp'] = deepcopy(message.header.stamp)
+        geometry['source'] = source
+        if geometry['point'] is not None:
+            point = geometry['point']
+            current = self.odometry.pose.pose.position
+            geometry['range'] = math.dist(
+                (point.x, point.y, point.z), (current.x, current.y, current.z))
+        return geometry
+
+    def _verify_smoke_boundary_reached(self, geometry):
+        return bool(geometry and geometry.get('source') == 'smoke'
+                    and geometry.get('plume_candidate')
+                    and geometry.get('obstacle_range', math.inf) <= 10.0)
+
+    def _verify_recovery_plan_to(self, target, geometry=None, guard=None,
+                                 preserve_requested_altitude=False):
+        self.events.append(('recovery_plan', deepcopy(target), preserve_requested_altitude))
+        return self._verify_plan_to(target, guard=guard, allow_plan_failure=True)
+
+    def _verify_navigation_viewpoint(self, bearing, index=0, guard=None,
+                                     geometry=None, maximum_forward=None, forward_only=False):
+        self.events.append(('navigation', bearing, deepcopy(geometry)))
+        target = deepcopy(self.odometry.pose.pose)
+        forward = 3.0 if maximum_forward is None else min(3.0, maximum_forward)
+        target.position.x += forward * math.cos(bearing)
+        target.position.y += forward * math.sin(bearing)
+        target.orientation = quaternion_from_yaw(bearing)
+        return self._verify_recovery_plan_to(target, guard=guard)
+
+    def _verify_report_inspection(self, geometry, fire_message=None, attempts=1):
+        self.events.append((
+            'inspection_report', deepcopy(geometry), deepcopy(fire_message), attempts,
+        ))
+        return SimpleNamespace(fire_found=fire_message is not None)
+
+    def _verify_complete_site(self, report, message=None, source=None):
+        self.events.append(('completed_site', report))
 
 
 @pytest.fixture
@@ -130,6 +203,28 @@ def stable_fire(executive, controller, **changes):
     return result
 
 
+def _qualified_fire(executive, controller, **changes):
+    metadata = {'confirmation_frames': 3, 'persistence_sec': 1.5, 'track_id': 1}
+    metadata.update(changes)
+    return fire(executive, controller, **metadata)
+
+
+def _approached_board():
+    """Set up a later Verify state after a completed initial smoke approach."""
+    board = Blackboard()
+    board['verify_smoke_approach_completed'] = True
+    return board
+
+
+def _complete_search(controller, blackboard):
+    """Advance successful short SEARCH_FIRE legs to the next distinct substate."""
+    for _ in range(20):
+        outcome = controller.search_fire(blackboard)
+        if outcome != 'search':
+            return outcome
+    pytest.fail('SEARCH_FIRE did not finish after twenty committed approach legs')
+
+
 def test_accept_smoke_from_any_region_and_return_owned_copy(system):
     executive, controller = system
     message = smoke(executive, controller, region=0, regions=[])
@@ -152,6 +247,50 @@ def test_expire_observation_without_negative_detector_frame(system):
     assert controller.fresh_smoke() is None
 
 
+def test_observation_diagnostics_distinguish_no_messages_from_missing_confirmation(system):
+    executive, controller = system
+
+    assert 'no messages received' in controller.observation_diagnostics()
+
+    smoke(executive, controller, status=SmokeDetection.CONFIRMING)
+    details = controller.observation_diagnostics()
+
+    assert 'detection is not confirmed' in details
+    assert 'received=1' in details and 'accepted=0' in details
+    assert f'status={SmokeDetection.CONFIRMING}' in details
+    assert 'image_age=' in details and 'receive_gap=' in details
+    assert controller.fresh_smoke() is None
+
+
+def test_observation_diagnostics_explain_stale_source_images_without_accepting_them(system):
+    executive, controller = system
+    executive.now += 10.0
+    smoke(executive, controller, header=header(executive.now - 3.0))
+
+    details = controller.observation_diagnostics()
+
+    assert 'source image is too old' in details
+    assert 'received=1' in details and 'accepted=0' in details
+    assert 'detected=True' in details
+    assert 'image_age=3.' in details and 'receive_gap=0.00s' in details
+    assert controller.fresh_smoke() is None
+
+
+def test_negative_smoke_frame_immediately_clears_guidance_and_explains_its_status(system):
+    executive, controller = system
+    smoke(executive, controller)
+    assert controller.fresh_smoke() is not None
+
+    smoke(executive, controller, detected=False, status=SmokeDetection.CONFIRMING)
+
+    assert controller.fresh_smoke() is None
+    details = controller.observation_diagnostics()
+    assert 'detected=false' in details
+    assert 'received=2' in details and 'accepted=1' in details
+    assert f'status={SmokeDetection.CONFIRMING}' in details
+    assert 'detected=False' in details
+
+
 def test_fire_needs_distinct_source_images_and_elapsed_persistence(system):
     executive, controller = system
     message = fire(executive, controller)
@@ -163,6 +302,79 @@ def test_fire_needs_distinct_source_images_and_elapsed_persistence(system):
     assert controller.stable_fire() is None
     fire(executive, controller)
     assert controller.stable_fire() is not None
+
+
+def test_confirmed_producer_persistence_does_not_require_a_second_consumer_delay(system):
+    executive, controller = system
+    started = executive.now
+    message = _qualified_fire(executive, controller)
+
+    assert controller.stable_fire() is not None
+    assert controller._stamp_ns(controller.stable_fire()) == controller._stamp_ns(message)
+    assert executive.now - started < 0.1
+
+
+@pytest.mark.parametrize('changes', [
+    {'persistence_sec': 0.0}, {'persistence_sec': 1.49}, {'persistence_sec': math.nan},
+    {'persistence_sec': math.inf}, {'confirmation_frames': 0}, {'confirmation_frames': 2},
+    {'track_id': 0}, {'detected': False}, {'status': 1}, {'area_px': 0},
+])
+def test_incomplete_or_invalid_producer_confirmation_cannot_skip_consumer_checks(system, changes):
+    executive, controller = system
+    _qualified_fire(executive, controller, **changes)
+
+    assert controller.stable_fire() is None
+
+
+def test_legacy_fire_negative_still_resets_consumer_persistence(system):
+    executive, controller = system
+    stable_fire(executive, controller)
+    fire(executive, controller, detected=False)
+    assert controller.fresh_fire() is None and controller.stable_fire() is None
+
+    fire(executive, controller)
+
+    assert controller.stable_fire() is None
+
+
+def test_qualified_fire_negative_clears_guidance_without_erasing_recent_state_intent(system):
+    executive, controller = system
+    _qualified_fire(executive, controller)
+    fire(executive, controller, detected=False)
+
+    assert controller.fresh_fire() is None and controller.stable_fire() is None
+    assert controller._inspection_fire_event(Blackboard())
+
+
+def test_expired_qualified_fire_event_cannot_reactivate_from_a_duplicate_source_image(system):
+    executive, controller = system
+    message = _qualified_fire(executive, controller)
+    fire(executive, controller, detected=False)
+    executive.now += controller.config['verify_reacquire_observation_timeout'] + 0.1
+    controller.fire_callback(message)
+
+    assert controller.stable_fire() is None
+    assert not controller._inspection_fire_event(Blackboard())
+
+
+def test_qualified_fire_with_blank_frame_uses_legacy_confirmation_instead(system):
+    executive, controller = system
+    _qualified_fire(executive, controller, header=header(executive.now + 0.01, ''))
+
+    assert controller.stable_fire() is None
+    assert not controller._inspection_fire_event(Blackboard())
+
+
+def test_discarding_fire_confirmation_does_not_keep_old_state_intent_after_negative(system):
+    executive, controller = system
+    _qualified_fire(executive, controller)
+    fire(executive, controller, detected=False)
+    assert controller._inspection_fire_event(Blackboard())
+
+    controller.discard_fire_confirmation()
+
+    assert not controller._inspection_fire_event(Blackboard())
+    assert controller.fresh_fire() is None and controller.stable_fire() is None
 
 
 @pytest.mark.parametrize('changes', [
@@ -197,238 +409,831 @@ def test_approach_step_shrinks_with_apparent_size_and_remains_bounded(system):
     assert controller.approach_distance(large) == 5.0
 
 
-def test_approach_records_reference_and_plans_toward_camera_bearing(system):
+def feed_smoke(executive, controller, **changes):
+    executive.on_wait = lambda: smoke(executive, controller, **changes)
+    smoke(executive, controller, **changes)
+
+
+def feed_fire(executive, controller, **changes):
+    executive.on_wait = lambda: _qualified_fire(executive, controller, **changes)
+    return _qualified_fire(executive, controller, **changes)
+
+
+@pytest.mark.parametrize('operation', ['approach_smoke', 'reacquire', 'search_fire'])
+@pytest.mark.parametrize('distance', [None, 0.1, 10000.0])
+def test_confirmed_visible_fire_never_requires_smoke_leg_or_fire_range(
+        system, operation, distance):
     executive, controller = system
-    smoke(executive, controller, yaw_correction_rad=math.pi / 2)
-    blackboard = Blackboard()
-    assert controller.approach_smoke(blackboard) == 'reacquire'
-    planned = next(event[1] for event in executive.events if event[0] == 'plan')
-    assert planned.position.x == pytest.approx(0.0, abs=1e-5)
-    assert 5.0 <= planned.position.y <= 20.0
-    assert planned.position.z == 6.0
-    assert blackboard['verify_reference_pose'].position.x == 0.0
-    assert blackboard['verify_reference_pose'].position.y == 0.0
-
-
-def test_approach_stops_on_observation_loss_during_planned_motion(system):
-    executive, controller = system
-    smoke(executive, controller)
-    executive.on_motion = lambda: smoke(executive, controller, detected=False)
-    assert controller.approach_smoke(Blackboard()) == 'reacquire'
-    assert executive.odometry.pose.pose.position.x == 0.0
-
-
-def test_all_quadrants_prevent_forward_approach(system):
-    executive, controller = system
-    smoke(executive, controller, regions=[1, 2, 3, 4])
-    assert controller.approach_smoke(Blackboard()) == 'reacquire'
-    assert not any(event[0] == 'plan' for event in executive.events)
-    assert controller.reacquire(Blackboard()) == 'search'
-
-
-def test_reacquire_prioritizes_persistent_fire_without_smoke(system):
-    executive, controller = system
-    stable_fire(executive, controller)
-    assert controller.reacquire(Blackboard()) == 'fire'
-    assert not executive.events
-
-
-def test_reacquire_centers_smoke_before_another_approach(system):
-    executive, controller = system
-    smoke(executive, controller, yaw_correction_rad=math.radians(20))
-    executive.on_motion = lambda: smoke(executive, controller)
-    executive.on_wait = lambda: smoke(executive, controller)
-    assert controller.reacquire(Blackboard()) == 'approach'
-    assert next(e[1] for e in executive.events if e[0] == 'rotate') == pytest.approx(
-        math.radians(20))
-
-
-def test_reacquire_restores_reference_altitude_and_bounded_heading_search(system):
-    executive, controller = system
-    reference = Pose()
-    reference.position.z = 8.0
-    reference.orientation = quaternion_from_yaw(0.5)
+    executive.target_geometry.update(point=None if distance is None else Point(x=distance),
+                                     target_valid=distance is not None)
+    feed_fire(executive, controller)
     board = Blackboard()
-    board['verify_reference_pose'] = reference
-    assert controller.reacquire(board) == 'explore'
-    plans = [e[1] for e in executive.events if e[0] == 'plan']
-    assert len(plans) == 1
-    assert plans[0].position.z == 8.0
-    assert plans[0].position.x == plans[0].position.y == 0.0
-    assert len([e for e in executive.events if e[0] == 'rotate']) == 4
-    assert executive.now < 116.0
+    assert getattr(controller, operation)(board) == 'fire'
+    assert controller.center_fire(board) == 'explore'
+    assert any(e[0] == 'inspection_report' and e[2] is not None for e in executive.events)
+    assert not any(e[0] in {'navigation', 'plan'} for e in executive.events)
 
 
-def test_centered_fire_reports_count_then_turns_away_and_plans_retreat(system):
-    executive, controller = system
-    stable_fire(executive, controller)
-    assert controller.center_fire(Blackboard()) == 'explore'
-    records = [event for event in executive.events if event[0] == 'record']
-    assert records[0][1].source_count == 2
-    assert executive.events.index(records[0]) < next(
-        index for index, event in enumerate(executive.events) if event[0] == 'plan')
-    target = next(e[1] for e in executive.events if e[0] == 'plan')
-    assert target.position.x == pytest.approx(-10.0)
-    assert target.position.z == 6.0
-    assert abs(yaw_from_quaternion(target.orientation)) == pytest.approx(math.pi)
-
-
-def test_fire_altitude_correction_is_bounded_and_planned(system):
-    executive, controller = system
-    stable_fire(executive, controller, vertical_correction_rad=0.2)
-
-    def centered():
-        fire(executive, controller)
-
-    executive.on_motion = centered
-    executive.on_wait = centered
-    assert controller.center_fire(Blackboard()) == 'explore'
-    targets = [e[1] for e in executive.events if e[0] == 'plan']
-    assert targets[0].position.z == 6.5
-    assert targets[0].position.x == 0.0
-
-
-def test_fire_loss_interrupts_centering_and_suppresses_report(system):
-    executive, controller = system
-    stable_fire(executive, controller, yaw_correction_rad=0.3)
-    executive.on_motion = lambda: fire(executive, controller, detected=False)
-    assert controller.center_fire(Blackboard()) == 'reacquire'
-    assert not any(e[0] == 'record' for e in executive.events)
-
-
-def test_creep_requires_fresh_smoke_and_has_distance_limit(system):
-    executive, controller = system
-    stable_fire(executive, controller, area_px=10)
-    smoke(executive, controller)
-    executive.on_motion = lambda: fire(executive, controller, area_px=10)
-    executive.on_wait = lambda: fire(executive, controller, area_px=10)
-    assert controller.center_fire(Blackboard()) == 'explore'
-    targets = [e[1] for e in executive.events if e[0] == 'plan']
-    assert len(targets) == 5  # Four short creeps and one retreat.
-    assert targets[-2].position.x == pytest.approx(3.0)
-
-
-def test_all_quadrants_block_fire_creep_and_retreat_before_reacquisition(system):
-    executive, controller = system
-    stable_fire(executive, controller, area_px=10)
-    smoke(executive, controller, regions=[1, 2, 3, 4])
-    assert controller.center_fire(Blackboard()) == 'reacquire'
-    targets = [e[1] for e in executive.events if e[0] == 'plan']
-    assert len(targets) == 1
-    assert targets[0].position.x == pytest.approx(-10.0)
-    assert not any(e[0] == 'record' for e in executive.events)
-    assert controller.stable_fire() is None
-
-
-def test_level_search_returns_heading_then_retreats_up_and_faces_smoke(system):
-    executive, controller = system
-    assert controller.search_fire(Blackboard()) == 'approach'
-    yaws = [e[1] for e in executive.events if e[0] == 'rotate']
-    assert yaws == pytest.approx([math.pi / 3, -math.pi / 3, 0, math.pi, 0])
-    target = next(e[1] for e in executive.events if e[0] == 'plan')
-    assert target.position.x == pytest.approx(-10.0)
-    assert target.position.z == 16.0
-    assert target.orientation.x == target.orientation.y == 0.0
-
-
-def test_persistent_fire_interrupts_search_before_escape(system):
-    executive, controller = system
-    executive.on_motion = lambda: stable_fire(executive, controller)
-    assert controller.search_fire(Blackboard()) == 'fire'
-    assert not any(e[0] == 'plan' for e in executive.events)
-
-
-def test_approach_limit_holds_instead_of_unbounded_smoke_chasing(system):
-    executive, controller = system
-    smoke(executive, controller)
-    board = Blackboard()
-    board['verify_approaches'] = 8
-    with pytest.raises(RuntimeError, match='approach limit'):
-        controller.approach_smoke(board)
-    assert not any(e[0] == 'plan' for e in executive.events)
-
-
-def test_search_retreat_cycles_are_bounded_even_when_smoke_stays_full(system):
-    executive, controller = system
-    smoke(executive, controller, regions=[1, 2, 3, 4])
-    board = Blackboard()
-    board['verify_approaches'] = 8
-    with pytest.raises(RuntimeError, match='approach limit'):
-        controller.approach_smoke(board)
-    assert not any(e[0] == 'plan' for e in executive.events)
-
-
-def test_verify_machine_declares_four_substates(system):
+def test_default_fire_policy_takes_three_guarded_legs_before_recording(system):
     executive, _ = system
-    machine = VerifyStateMachine(executive)
-    assert set(machine.get_states()) == {
-        'APPROACH_SMOKE', 'REACQUIRE', 'CENTER_FIRE', 'SEARCH_FIRE',
-    }
+    executive.config.pop('verify_fire_approach_max_steps')
+    controller = VerifyController(executive)
+    executive._verify = controller
+    executive.target_geometry.update(point=None, target_valid=False, range=math.nan)
+    feed_fire(executive, controller)
+    origin = controller._pose()
+    assert controller.center_fire(Blackboard()) == 'explore'
+    assert len([event for event in executive.events if event[0] == 'navigation']) == 3
+    assert executive.odometry.pose.pose.position.x == pytest.approx(origin.position.x + 9.0)
+    report_index = next(index for index, event in enumerate(executive.events)
+                        if event[0] == 'inspection_report')
+    assert all(index < report_index for index, event in enumerate(executive.events)
+               if event[0] == 'plan')
+    report = executive.events[report_index]
+    assert report[1]['point'] is None and not report[1]['target_valid']
+    assert report[2].detected
 
 
-def test_smoke_guard_rejects_missing_or_all_quadrants(system):
+def test_localized_fire_approach_clamps_the_leg_at_its_uncertain_standoff(system):
     executive, controller = system
-    with pytest.raises(VerificationObservationLost):
-        controller._smoke_guard()
-    smoke(executive, controller, regions=[1, 2, 3, 4])
-    with pytest.raises(VerificationObservationLost):
-        controller._smoke_guard()
+    controller.config['verify_fire_approach_max_steps'] = 3
+    executive.target_geometry.update(point=Point(x=11.0), target_valid=True, uncertainty=0.25)
+    feed_fire(executive, controller)
+    assert controller.center_fire(Blackboard()) == 'explore'
+    requests = [event for event in executive.events if event[0] == 'navigation']
+    assert len(requests) == 1
+    assert requests[0][2]['fire_keepout_radius'] == pytest.approx(10.25)
+    assert executive.odometry.pose.pose.position.x == pytest.approx(0.75)
 
 
-def test_reacquire_waits_for_visible_fire_persistence_before_rotating(system):
+def test_localized_fire_already_at_standoff_does_not_force_another_leg(system):
     executive, controller = system
-    fire(executive, controller)
-    executive.on_wait = lambda: fire(executive, controller)
-    assert controller.reacquire(Blackboard()) == 'fire'
-    assert not any(e[0] in {'rotate', 'plan'} for e in executive.events)
+    controller.config['verify_fire_approach_max_steps'] = 3
+    executive.target_geometry.update(point=Point(x=9.0), target_valid=True)
+    feed_fire(executive, controller)
+    assert controller.center_fire(Blackboard()) == 'explore'
+    assert not any(event[0] == 'navigation' for event in executive.events)
+
+
+@pytest.mark.parametrize('degradation', ['unavailable', 'uncertain'])
+def test_losing_localization_never_drops_an_established_fire_standoff(system, degradation):
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 3
+    feed_fire(executive, controller)
+    original = executive._verify_navigation_viewpoint
+
+    def move_then_degrade(*args, **kwargs):
+        moved = original(*args, **kwargs)
+        if degradation == 'unavailable':
+            executive.target_geometry.update(point=None, target_valid=False, range=math.nan)
+        else:
+            executive.target_geometry['uncertainty'] = 3.0
+        return moved
+
+    executive._verify_navigation_viewpoint = move_then_degrade
+    board = Blackboard()
+    assert controller.center_fire(board) == 'explore'
+    assert board['verify_fire_standoff_established']
+    assert len([event for event in executive.events if event[0] == 'navigation']) == 1
+    assert any('retaining the established standoff' in event[1]
+               for event in executive.events if event[0] == 'status')
+
+
+def test_blocked_fire_approach_records_visible_evidence_without_claiming_motion(system):
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 3
+    feed_fire(executive, controller)
+    before = controller._pose()
+
+    def blocked(*args, **kwargs):
+        kwargs['guard']()
+        executive.events.append(('blocked_fire_plan',))
+        return False
+
+    executive._verify_navigation_viewpoint = blocked
+    assert controller.center_fire(Blackboard()) == 'explore'
+    assert controller._pose() == before
+    assert not any(event[0] == 'plan' for event in executive.events)
+    assert any(event[0] == 'inspection_report' for event in executive.events)
+    assert any('fire approach blocked' in event[1]
+               for event in executive.events if event[0] == 'status')
+
+
+def test_fire_approach_deadline_records_held_evidence_without_restarting_a_chase(system):
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 3
+    feed_fire(executive, controller)
+    board = Blackboard()
+    board['verify_inspection_started'] = (
+        executive.now - controller.config['verify_inspection_timeout'] - 1.0)
+    assert controller.center_fire(board) == 'explore'
+    assert not any(event[0] == 'navigation' for event in executive.events)
+    assert any('fire approach time budget exhausted' in event[1]
+               for event in executive.events if event[0] == 'status')
+
+
+@pytest.mark.parametrize('interrupt', ['lost_fire', 'cancel'])
+def test_fire_approach_halts_on_track_loss_or_cancellation_before_reporting(system, interrupt):
+    from kv_executive.mission_executive import MissionCanceled
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 3
+    feed_fire(executive, controller)
+    before = controller._pose()
+
+    def stop():
+        if interrupt == 'cancel':
+            raise MissionCanceled('cancel during fire approach')
+        fire(executive, controller, detected=False)
+
+    executive.on_motion = stop
+    if interrupt == 'cancel':
+        with pytest.raises(MissionCanceled):
+            controller.center_fire(Blackboard())
+    else:
+        assert controller.center_fire(Blackboard()) == 'reacquire'
+    assert controller._pose() == before
+    assert not any(event[0] == 'inspection_report' for event in executive.events)
+
+
+def test_smoke_approach_uses_short_terrain_navigation_and_arrival_barrier(system):
+    executive, controller = system
+    feed_smoke(executive, controller)
+    board = Blackboard()
+    assert controller.approach_smoke(board) == 'reacquire'
+    target = next(e[1] for e in executive.events if e[0] == 'plan')
+    assert target.position.x == pytest.approx(3.0)
+    assert target.position.y == pytest.approx(0.0)
+    assert board['verify_arrival_after_ns'] == controller._now_ns()
+    assert board['verify_smoke_approach_completed']
+    assert controller.reacquire(board) == 'approach'
+
+
+@pytest.mark.parametrize('axis', ['horizontal', 'vertical'])
+def test_smoke_image_jitter_does_not_request_separate_axis_centering(system, axis):
+    executive, controller = system
+    correction = {'yaw_correction_rad' if axis == 'horizontal'
+                  else 'vertical_correction_rad': 0.2}
+    feed_smoke(executive, controller, **correction)
+    assert controller.approach_smoke(Blackboard()) == 'reacquire'
+    assert not any(e[0] == 'rotate' for e in executive.events)
+    assert not any(e[0] == 'recovery_plan' and e[2] is True for e in executive.events)
+    assert executive.odometry.pose.pose.position.z == 6.0
+    assert any(e[0] == 'navigation' for e in executive.events)
+
+
+def test_brief_smoke_occlusion_holds_then_resumes_forward_with_high_image_cue(system):
+    executive, controller = system
+    initial = smoke(executive, controller, yaw_correction_rad=0.1)
+    board = Blackboard()
+    board['verify_entered'] = True  # The remembered bearing belongs to this Verify episode.
+    controller._remember_smoke_bearing(board, initial, {})
+    smoke(executive, controller, detected=False)
+    started = executive.now
+
+    def return_after_two_seconds():
+        if executive.now - started >= 2.0:
+            smoke(executive, controller, yaw_correction_rad=0.12, vertical_correction_rad=0.4)
+
+    executive.on_wait = return_after_two_seconds
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert 2.0 <= executive.now - started < 5.0
+    assert any(event[0] == 'hold' for event in executive.events)
+    assert not any(event[0] == 'rotate' for event in executive.events)
+    assert executive.odometry.pose.pose.position.x > 2.9
+    assert executive.odometry.pose.pose.position.z == 6.0
+    assert board['verify_smoke_bearing'] == pytest.approx(0.105)
+
+
+def test_smoke_returns_reset_the_loss_grace_instead_of_accumulating_misses(system):
+    executive, controller = system
+    initial = smoke(executive, controller)
+    controller._remember_smoke_bearing(Blackboard(), initial, {})
+    smoke(executive, controller, detected=False)
+    started = executive.now
+
+    def return_briefly():
+        if executive.now - started >= 2.0:
+            smoke(executive, controller)
+
+    executive.on_wait = return_briefly
+    returned = controller._smoke_guidance()
+    assert returned is not None
+    controller._remember_smoke_bearing(Blackboard(), returned, {})
+    last_seen = controller._smoke_seen_at
+    smoke(executive, controller, detected=False)
+    executive.on_wait = lambda: None
+    assert controller._smoke_guidance() is None
+    assert executive.now - last_seen == pytest.approx(5.0)
+    assert executive.now - started >= 7.0
+    assert not any(event[0] in {'rotate', 'plan'} for event in executive.events)
+
+
+def test_only_continuous_five_second_loss_permits_a_reacquisition_turn(system):
+    executive, controller = system
+    initial = smoke(executive, controller)
+    controller._remember_smoke_bearing(Blackboard(), initial, {})
+    seen = controller._smoke_seen_at
+    smoke(executive, controller, detected=False)
+    rotations = []
+
+    def observe_again_during_scan():
+        rotations.append(executive.now)
+        smoke(executive, controller)
+
+    executive.on_motion = lambda: None
+    original_rotate = executive._verify_rotate
+
+    def rotate(*args, **kwargs):
+        rotations.append(executive.now)
+        executive.on_motion = observe_again_during_scan
+        return original_rotate(*args, **kwargs)
+
+    executive._verify_rotate = rotate
+    executive.on_wait = lambda: None
+    # Once a scan starts, new post-stop images must become available too.
+
+    def refresh_after_scan():
+        if rotations:
+            smoke(executive, controller)
+    executive.on_wait = refresh_after_scan
+    assert controller.reacquire(Blackboard()) == 'approach'
+    assert rotations and rotations[0] - seen >= 5.0
+    assert not any(event[0] == 'plan' for event in executive.events)
+
+
+def test_replayed_smoke_cannot_extend_memory_or_authorize_motion(system):
+    executive, controller = system
+    old = smoke(executive, controller)
+    controller._remember_smoke_bearing(Blackboard(), old, {})
+    seen = controller._smoke_seen_at
+    smoke(executive, controller, detected=False)
+    executive.on_wait = lambda: controller.smoke_callback(old)
+    assert controller._smoke_guidance() is None
+    assert executive.now - seen == pytest.approx(5.0)
+    assert not any(event[0] in {'plan', 'rotate'} for event in executive.events)
+
+
+def test_one_new_fresh_glimpse_between_negative_frames_can_resume_a_forward_leg(system):
+    executive, controller = system
+    initial = smoke(executive, controller)
+    controller._remember_smoke_bearing(Blackboard(), initial, {})
+    smoke(executive, controller, detected=False)
+    started = executive.now
+    glimpses = []
+
+    def flash_then_occlude():
+        if not glimpses and executive.now - started >= 1.0:
+            glimpses.append(smoke(executive, controller, vertical_correction_rad=0.4))
+            smoke(executive, controller, detected=False)
+
+    executive.on_wait = flash_then_occlude
+    assert controller.approach_smoke(Blackboard()) == 'reacquire'
+    assert glimpses and executive.now - started >= 1.0
+    assert executive.odometry.pose.pose.position.x > 2.9
+    assert executive.odometry.pose.pose.position.z == 6.0
+    assert controller.fresh_smoke() is None
+    assert not any(event[0] == 'rotate' for event in executive.events)
+
+
+def test_slow_geometry_query_cannot_turn_an_expired_smoke_image_into_a_new_leg(system):
+    executive, controller = system
+    feed_smoke(executive, controller)
+    original = executive._verify_target_geometry
+
+    def delayed(message, source='smoke'):
+        executive.now += 2.1
+        return original(message, source)
+
+    executive._verify_target_geometry = delayed
+    assert controller.approach_smoke(Blackboard()) == 'reacquire'
+    assert not any(event[0] in {'plan', 'navigation', 'rotate'} for event in executive.events)
+
+
+def test_smoke_bearing_memory_smooths_wraparound_once_per_source_image(system):
+    executive, controller = system
+    board = Blackboard()
+    initial = smoke(executive, controller)
+    controller._remember_smoke_bearing(board, initial, {'navigation_bearing': math.radians(179)})
+    latest = smoke(executive, controller)
+    bearing, _ = controller._remember_smoke_bearing(
+        board, latest, {'navigation_bearing': math.radians(-179)})
+    assert math.degrees(bearing) == pytest.approx(179.5)
+    repeated, _ = controller._remember_smoke_bearing(
+        board, latest, {'navigation_bearing': math.radians(-179)})
+    assert repeated == bearing
+    controller.reset()
+    assert controller._smoke_seen_at is None and controller._smoke_bearing is None
+
+
+def test_new_verify_episode_does_not_steer_toward_the_previous_site(system):
+    executive, controller = system
+    initial = smoke(executive, controller)
+    controller._remember_smoke_bearing(Blackboard(), initial, {'navigation_bearing': 0.0})
+    # Exploration has turned toward a different site in the same camera frame.
+    executive.odometry.pose.pose.orientation = quaternion_from_yaw(math.pi)
+    smoke(executive, controller)
+    board = Blackboard()
+
+    assert controller.approach_smoke(board) == 'reacquire'
+
+    bearing = next(event[1] for event in executive.events if event[0] == 'navigation')
+    assert bearing == pytest.approx(math.pi)
+    assert executive.odometry.pose.pose.position.x == pytest.approx(-3.0)
+
+
+def test_short_forward_steps_are_not_mislabeled_as_revisited_positions(system):
+    executive, controller = system
+    board = Blackboard()
+    for _ in range(3):
+        before = controller._pose()
+        executive.odometry.pose.pose.position.x += 0.4
+        assert controller._navigation_progress(board, before, 0.0, True)
+        assert board['verify_navigation_stalls'] == 0
+
+
+@pytest.mark.parametrize('vertical', [-0.25, 0.25])
+def test_both_fire_axes_attempted_and_visible_imperfect_fire_reported(system, vertical):
+    executive, controller = system
+    feed_fire(executive, controller, yaw_correction_rad=0.3,
+              vertical_correction_rad=vertical)
+    assert controller.center_fire(Blackboard()) == 'explore'
+    corrections = [e[0] for e in executive.events if e[0] in {'rotate', 'recovery_plan'}]
+    assert corrections[:2] == ['rotate', 'recovery_plan']
+    assert any(e[0] == 'recovery_plan' and e[2] is True for e in executive.events)
+    assert any(e[0] == 'inspection_report' and e[2] is not None for e in executive.events)
+
+
+@pytest.mark.parametrize('failure', ['rejected', 'start', 'escape'])
+def test_blocked_vertical_centering_still_reports_current_visible_fire(system, failure):
+    executive, controller = system
+    feed_fire(executive, controller, yaw_correction_rad=0.3, vertical_correction_rad=-0.3)
+
+    def blocked(*args, **kwargs):
+        executive.events.append(('blocked_vertical',))
+        if failure == 'rejected':
+            return False
+        error = (verification.VerificationStartUnavailable if failure == 'start'
+                 else verification.VerificationRecoveryUnavailable)
+        raise error('test blocked clearance')
+    executive._verify_recovery_plan_to = blocked
+    assert controller.center_fire(Blackboard()) == 'explore'
+    assert any(e[0] == 'rotate' for e in executive.events)
+    assert sum(e[0] == 'blocked_vertical' for e in executive.events) == 1
+    assert any(e[0] == 'inspection_report' for e in executive.events)
+
+
+def test_fire_centering_cannot_report_a_cached_pre_motion_frame(system):
+    executive, controller = system
+    _qualified_fire(executive, controller, yaw_correction_rad=0.3)
+    assert controller.center_fire(Blackboard()) == 'reacquire'
+    assert not any(e[0] == 'inspection_report' for e in executive.events)
+
+
+def test_fire_lost_during_vertical_correction_requires_new_confirmation(system):
+    executive, controller = system
+    feed_fire(executive, controller, vertical_correction_rad=0.3)
+
+    def lose():
+        fire(executive, controller, detected=False)
+        executive.on_wait = lambda: fire(executive, controller, detected=False)
+    executive.on_motion = lose
+    assert controller.center_fire(Blackboard()) == 'reacquire'
+    assert not any(e[0] == 'inspection_report' for e in executive.events)
+
+
+def test_fire_recovery_does_not_publish_a_negative_when_smoke_remains(system):
+    executive, controller = system
+    _qualified_fire(executive, controller)
+    board = Blackboard()
+    controller._route_fire(board)
+    fire(executive, controller, detected=False)
+    feed_smoke(executive, controller, coverage=0.3, regions=[1, 2, 3, 4])
+    assert controller.center_fire(board) == 'reacquire'
+    assert not any(e[0] == 'inspection_report' for e in executive.events)
+
+
+def test_fire_interrupts_committed_smoke_leg_and_routes_directly_to_center(system):
+    executive, controller = system
+    feed_smoke(executive, controller)
+    executive.on_motion = lambda: _qualified_fire(executive, controller)
+    board = Blackboard()
+    assert controller.approach_smoke(board) == 'fire'
+    assert not verification._bb_get(board, 'verify_smoke_approach_completed', False)
+    feed_fire(executive, controller)
+    assert controller.center_fire(board) == 'explore'
+
+
+def test_smoke_immersion_stops_forward_motion_without_claiming_fire_absent(system):
+    executive, controller = system
+    feed_smoke(executive, controller)
+    executive.on_motion = lambda: smoke(executive, controller, coverage=0.3,
+                                        regions=[1, 2, 3, 4])
+    board = Blackboard()
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert not verification._bb_get(board, 'verify_smoke_approach_completed', False)
+    assert not any(e[0] == 'inspection_report' for e in executive.events)
+
+
+def test_search_uses_only_smoke_geometry_for_translation(system):
+    executive, controller = system
+    feed_smoke(executive, controller)
+    executive.target_geometry.update(point=Point(x=10000.0), range=10000.0,
+                                     target_valid=True)
+    assert controller.search_fire(Blackboard()) == 'reacquire'
+    navigation = next(e for e in executive.events if e[0] == 'navigation')
+    assert navigation[2]['source'] == 'smoke'
+    assert executive.odometry.pose.pose.position.x == pytest.approx(3.0)
+
+
+def test_observed_smoke_boundary_prevents_another_forward_leg(system):
+    executive, controller = system
+    feed_smoke(executive, controller)
+    executive.target_geometry.update(plume_candidate=True, obstacle_range=8.0)
+    board = Blackboard()
+    assert controller.search_fire(board) == 'inspect'
+    assert not any(e[0] == 'navigation' for e in executive.events)
+
+
+def test_broad_smoke_with_unknown_boundary_cannot_publish_negative(system):
+    executive, controller = system
+    feed_smoke(executive, controller, coverage=0.3, regions=[1, 2, 3, 4])
+    assert controller.center_fire(Blackboard()) == 'explore'
+    assert not any(e[0] == 'inspection_report' for e in executive.events)
+
+
+@pytest.mark.parametrize('initial_bearing', [None, 0.0])
+def test_three_completed_boundary_windows_can_report_no_fire(system, initial_bearing):
+    executive, controller = system
+    feed_smoke(executive, controller, coverage=0.3, regions=[1, 2, 3, 4])
+    executive.target_geometry.update(plume_candidate=True, obstacle_range=8.0)
+    board = Blackboard()
+    board['verify_smoke_bearing'] = initial_bearing
+    assert controller.center_fire(board) == 'explore'
+    reports = [e for e in executive.events if e[0] == 'inspection_report']
+    assert len(reports) == 1 and reports[0][2] is None and reports[0][3] == 3
+    assert len([e for e in executive.events if e[0] == 'recovery_plan']) == 2
+
+
+def test_blocked_boundary_viewpoint_never_counts_as_completed_inspection(system):
+    executive, controller = system
+    feed_smoke(executive, controller, coverage=0.3, regions=[1, 2, 3, 4])
+    executive.target_geometry.update(plume_candidate=True, obstacle_range=8.0)
+    executive._verify_recovery_plan_to = lambda *a, **k: False
+    board = Blackboard()
+    assert controller.center_fire(board) == 'reacquire'
+    assert board['verify_inspection_attempts'] == 1
+    assert not any(e[0] == 'inspection_report' for e in executive.events)
+
+
+@pytest.mark.parametrize('error_type', [
+    verification.VerificationStartUnavailable, verification.VerificationRecoveryUnavailable])
+def test_map_refresh_then_explicit_hold_for_blocked_source(system, error_type):
+    executive, controller = system
+    feed_smoke(executive, controller)
+
+    def unavailable(*a, **k):
+        raise error_type('no safe clearance route')
+    executive._verify_navigation_viewpoint = unavailable
+    board = Blackboard()
+    assert controller.search_fire(board) == 'search'
+    executive.map_available = False
+    with pytest.raises(RuntimeError, match='Verify blocked'):
+        controller.search_fire(board)
+    assert not verification._bb_get(board, 'verify_exploration_required', False)
+
+
+@pytest.mark.parametrize('error_type', [
+    verification.VerificationMapUnavailable, verification.VerificationRecoveryUnavailable])
+def test_fire_found_during_map_refresh_does_not_get_abandoned(system, error_type):
+    executive, controller = system
+    feed_smoke(executive, controller)
+
+    def unavailable(*a, **k):
+        raise error_type('map or clearance unavailable')
+    executive._verify_navigation_viewpoint = unavailable
+    executive.on_wait = lambda: _qualified_fire(executive, controller)
+    board = Blackboard()
+    assert controller.search_fire(board) in {'search', 'fire'}
+    feed_fire(executive, controller)
+    assert controller.search_fire(board) == 'fire'
+    assert controller.center_fire(board) == 'explore'
+    assert any(e[0] == 'inspection_report' for e in executive.events)
+
+
+def test_map_recovery_waits_for_a_new_source_stamp_without_recentering(system):
+    executive, controller = system
+    baseline = executive._verify_last_geometry_stamp_ns
+    stamps = iter([baseline, 0, baseline, baseline + 500_000_000])
+
+    def poll(timeout=None):
+        executive.events.append(('map_poll',))
+        assert 0.0 < timeout <= 0.5
+        return next(stamps)
+
+    executive._verify_fresh_map_stamp = poll
+    board = Blackboard()
+    error = verification.VerificationMapUnavailable('source age exceeds limit', baseline)
+    assert controller._navigation_start_unavailable(board, error, resume='approach') == 'approach'
+    assert len([event for event in executive.events if event[0] == 'map_poll']) == 4
+    assert board['verify_navigation_refresh_stamp_ns'] == baseline + 500_000_000
+    assert not any(event[0] in {'rotate', 'plan', 'navigation', 'recovery_plan'}
+                   for event in executive.events)
+
+
+@pytest.mark.parametrize('available', [False, True])
+def test_missing_or_replayed_maps_exhaust_one_bounded_recovery_budget(system, available):
+    executive, controller = system
+    controller.config['verify_navigation_map_timeout'] = 1.0
+    executive.map_available = available
+    executive.map_stamp_ns = executive._verify_last_geometry_stamp_ns
+    started = executive.now
+    with pytest.raises(RuntimeError, match='recovery deadline exceeded'):
+        controller._navigation_start_unavailable(
+            Blackboard(), verification.VerificationMapUnavailable('stale source'))
+    assert executive.now == pytest.approx(started + 1.0)
+    assert not any(event[0] in {'rotate', 'plan', 'navigation'} for event in executive.events)
+
+
+@pytest.mark.parametrize('error_type', [
+    verification.VerificationStartUnavailable, verification.VerificationRecoveryUnavailable])
+def test_new_maps_do_not_restart_clearance_recovery_at_same_position(system, error_type):
+    executive, controller = system
+    controller.config['verify_navigation_map_timeout'] = 1.0
+    board = Blackboard()
+    error = error_type('current clearance unavailable')
+    assert controller._navigation_start_unavailable(board, error) == 'reacquire'
+    deadline = board['verify_navigation_refresh_deadline']
+    executive.now = deadline - 0.1
+    with pytest.raises(RuntimeError, match='recovery deadline exceeded'):
+        controller._navigation_start_unavailable(board, error)
+    assert board['verify_navigation_refresh_deadline'] == deadline
+
+
+def test_separate_map_outages_do_not_spend_budget_during_healthy_planning(system):
+    executive, controller = system
+    controller.config['verify_navigation_map_timeout'] = 1.0
+    board = Blackboard()
+    executive.now += 0.5
+    for _ in range(3):
+        # The prior map failed during motion. A new map has already arrived
+        # while the aircraft switched to LOITER, before recovery starts.
+        failed_stamp = int((executive.now - 0.5) * 1e9)
+        executive.map_stamp_ns = int(executive.now * 1e9)
+        started = executive.now
+        assert controller._navigation_start_unavailable(
+            board, verification.VerificationMapUnavailable('stale source', failed_stamp),
+            resume='approach') == 'approach'
+        assert executive.now - started < 1.0
+        # Successful planning and mode handoff can outlast the outage timeout
+        # without any completed translation, as in the reported flight.
+        executive.now += 2.0
+    assert len([event for event in executive.events if event[0] == 'map_poll']) == 3
+    assert verification._bb_get(board, 'verify_navigation_refresh_deadline', None) is None
+
+
+def test_map_outage_checks_recovered_data_despite_expired_clearance_deadline(system):
+    executive, controller = system
+    board = Blackboard()
+    executive.now += 0.5
+    board['verify_navigation_refresh_deadline'] = executive.now - 1.0
+    failed_stamp = int((executive.now - 0.5) * 1e9)
+    executive.map_stamp_ns = int(executive.now * 1e9)
+
+    assert controller._navigation_start_unavailable(
+        board, verification.VerificationMapUnavailable('old source', failed_stamp),
+        resume='approach') == 'approach'
+
+    assert any(event[0] == 'map_poll' for event in executive.events)
+    # Map recovery must not forgive a separate physical-clearance failure.
+    assert board['verify_navigation_refresh_deadline'] < executive.now
+
+
+def test_missing_map_after_a_recovered_outage_still_has_a_bounded_wait(system):
+    executive, controller = system
+    controller.config['verify_navigation_map_timeout'] = 1.0
+    board = Blackboard()
+    error = verification.VerificationMapUnavailable('stale source')
+    assert controller._navigation_start_unavailable(board, error) == 'reacquire'
+    executive.now += 2.0
+    executive.map_available = False
+    started = executive.now
+
+    with pytest.raises(RuntimeError, match='recovery deadline exceeded'):
+        controller._navigation_start_unavailable(board, error)
+
+    assert executive.now == pytest.approx(started + 1.0)
+
+
+def test_map_recovery_accepts_new_epoch_after_clock_reset_during_wait(system):
+    executive, controller = system
+    ros_time = [100_000_000_000]
+    controller._now_ns = lambda: ros_time[0]
+    polls = []
+
+    def poll(timeout=None):
+        polls.append(True)
+        if len(polls) == 1:
+            ros_time[0] = 10_000_000_000
+            return 0
+        return ros_time[0]
+
+    executive._verify_fresh_map_stamp = poll
+    board = Blackboard()
+    assert controller._navigation_start_unavailable(
+        board, verification.VerificationMapUnavailable('clock reset')) == 'reacquire'
+    assert len(polls) == 2
+    assert board['verify_navigation_refresh_stamp_ns'] == 10_000_000_000
+
+
+@pytest.mark.parametrize('failure,expected', [
+    ('cancel', 'canceled'), ('return', 'return_requested')])
+def test_outer_state_recovery_preserves_mission_interrupts(system, failure, expected):
+    from kv_executive.mission_executive import MissionCanceled, MissionStateRequested
+    executive, controller = system
+    executive.map_available = False
+
+    def unavailable(board):
+        raise verification.VerificationMapUnavailable('stale source')
+
+    def interrupt():
+        raise (MissionCanceled('cancel during map wait') if failure == 'cancel'
+               else MissionStateRequested('Return'))
+
+    controller.approach_smoke = unavailable
+    executive.on_wait = interrupt
+    assert VerifyStateMachine(executive)(Blackboard()) == expected
+
+
+def test_lateral_ping_pong_is_not_forward_smoke_progress(system):
+    executive, controller = system
+    board = Blackboard()
+    start = controller._pose()
+    executive.odometry.pose.pose.position.y = 1.0
+    assert controller._navigation_progress(board, start, 0.0, True)
+    assert board['verify_navigation_stalls'] == 1
+    before = controller._pose()
+    executive.odometry.pose.pose.position.y = 0.0
+    assert not controller._navigation_progress(board, before, 0.0, True)
+    assert not controller._navigation_progress(board, controller._pose(), 0.0, True)
+
+
+@pytest.mark.parametrize('operation', [
+    'approach_smoke', 'reacquire', 'search_fire', 'center_fire'])
+@pytest.mark.parametrize('failure', ['cancel', 'return', 'abort'])
+def test_every_state_preserves_mission_interrupts(system, operation, failure):
+    from kv_executive.mission_executive import MissionCanceled, MissionError, MissionStateRequested
+    executive, controller = system
+    feed_smoke(executive, controller)
+    errors = {'cancel': MissionCanceled('cancel'), 'return': MissionStateRequested('Return'),
+              'abort': MissionError('abort')}
+
+    def stop():
+        raise errors[failure]
+    executive._check_running = stop
+    with pytest.raises(type(errors[failure])):
+        getattr(controller, operation)(Blackboard())
+
+
+@pytest.mark.parametrize('operation', ['approach_smoke', 'search_fire', 'center_fire'])
+def test_waiting_for_new_image_preserves_cancellation(system, operation):
+    from kv_executive.mission_executive import MissionCanceled
+    executive, controller = system
+    if operation == 'center_fire':
+        _qualified_fire(executive, controller, yaw_correction_rad=0.3)
+    else:
+        smoke(executive, controller, yaw_correction_rad=0.3)
+        if operation == 'approach_smoke':
+            controller._remember_smoke_bearing(
+                Blackboard(), controller.fresh_smoke(), {})
+            smoke(executive, controller, detected=False)
+
+    def stop():
+        raise MissionCanceled('cancel while waiting')
+    executive.on_wait = stop
+    with pytest.raises(MissionCanceled):
+        getattr(controller, operation)(Blackboard())
 
 
 @pytest.mark.parametrize('failure, expected', [
-    ('cancel', 'canceled'), ('return', 'return_requested'), ('error', 'aborted'),
-])
+    ('cancel', 'canceled'), ('return', 'return_requested'), ('error', 'aborted')])
 def test_four_state_machine_propagates_cancel_return_and_failure(system, failure, expected):
-    from kv_executive.mission_executive import (
-        MissionCanceled, MissionError, MissionStateRequested,
-    )
+    from kv_executive.mission_executive import MissionCanceled, MissionError, MissionStateRequested
     executive, controller = system
-    errors = {
-        'cancel': MissionCanceled('operator cancellation'),
-        'return': MissionStateRequested('Return'),
-        'error': MissionError('planner failed'),
-    }
+    errors = {'cancel': MissionCanceled('cancel'), 'return': MissionStateRequested('Return'),
+              'error': MissionError('error')}
 
     def fail(blackboard):
         raise errors[failure]
-
     controller.approach_smoke = fail
     assert VerifyStateMachine(executive)(Blackboard()) == expected
 
 
-def test_smoke_correction_does_not_reuse_a_cached_angle_when_camera_stalls(system):
+def test_verify_machine_declares_four_substates(system):
+    executive, _ = system
+    assert set(VerifyStateMachine(executive).get_states()) == {
+        'APPROACH_SMOKE', 'REACQUIRE', 'CENTER_FIRE', 'SEARCH_FIRE'}
+
+
+def test_approach_cycle_limit_stops_smoke_chasing(system):
     executive, controller = system
-    smoke(executive, controller, yaw_correction_rad=math.radians(6.0))
-    assert controller.reacquire(Blackboard()) == 'explore'
-    assert len([event for event in executive.events if event[0] == 'rotate']) == 1
-    assert not any(event[0] == 'plan' for event in executive.events)
-    assert executive.now < 103.0
+    feed_smoke(executive, controller)
+    board = Blackboard()
+    board['verify_approaches'] = controller.config['verify_max_approaches']
+    with pytest.raises(RuntimeError, match='approach limit'):
+        controller.approach_smoke(board)
 
 
-def test_fire_correction_requires_post_motion_frame_before_reporting_or_moving_again(system):
+def test_map_retries_do_not_spend_completed_smoke_leg_budget(system):
     executive, controller = system
-    stable_fire(executive, controller, vertical_correction_rad=0.1)
-    assert controller.center_fire(Blackboard()) == 'reacquire'
-    assert len([event for event in executive.events if event[0] == 'plan']) == 1
-    assert not any(event[0] == 'record' for event in executive.events)
+    controller.config['verify_max_approaches'] = 1
+    board = Blackboard()
+    navigate = executive._verify_navigation_viewpoint
+
+    def unavailable(*args, **kwargs):
+        raise verification.VerificationMapUnavailable('temporary map outage')
+
+    executive._verify_navigation_viewpoint = unavailable
+    for _ in range(2):
+        feed_smoke(executive, controller)
+        assert controller.approach_smoke(board) == 'approach'
+        assert verification._bb_get(board, 'verify_approaches', 0) == 0
+
+    executive._verify_navigation_viewpoint = navigate
+    feed_smoke(executive, controller)
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert board['verify_approaches'] == 1
+    before = deepcopy(executive.odometry.pose.pose)
+    feed_smoke(executive, controller)
+    with pytest.raises(RuntimeError, match='approach limit'):
+        controller.approach_smoke(board)
+    assert executive.odometry.pose.pose == before
 
 
-def test_waiting_for_post_motion_image_honors_cancellation(system):
-    from kv_executive.mission_executive import MissionCanceled
+def test_smoke_loss_waits_do_not_spend_completed_leg_budget(system):
     executive, controller = system
-    smoke(executive, controller, yaw_correction_rad=0.2)
+    controller.config['verify_max_approaches'] = 1
+    board = Blackboard()
+    smoke(executive, controller, detected=False)
 
-    def cancel():
-        raise MissionCanceled('operator cancellation')
+    for _ in range(2):
+        assert controller.approach_smoke(board) == 'reacquire'
+        assert verification._bb_get(board, 'verify_approaches', 0) == 0
+    assert not any(event[0] == 'navigation' for event in executive.events)
 
-    executive.on_wait = cancel
-    with pytest.raises(MissionCanceled):
-        controller.reacquire(Blackboard())
+
+def test_noop_successful_planner_cannot_claim_a_completed_smoke_leg(system):
+    executive, controller = system
+    feed_smoke(executive, controller)
+    executive._verify_navigation_viewpoint = lambda *a, **k: True
+    board = Blackboard()
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert not verification._bb_get(board, 'verify_smoke_approach_completed', False)
+    assert verification._bb_get(board, 'verify_arrival_after_ns', 0) == 0
+
+
+def test_failed_horizontal_attempt_does_not_skip_vertical_fire_centering(system):
+    executive, controller = system
+    feed_fire(executive, controller, yaw_correction_rad=0.3, vertical_correction_rad=0.3)
+
+    def blocked(*a, **k):
+        executive.events.append(('blocked_horizontal',))
+        raise verification.VerificationStartUnavailable('yaw correction interrupted')
+
+    executive._verify_rotate = blocked
+    assert controller.center_fire(Blackboard()) == 'explore'
+    assert any(e[0] == 'blocked_horizontal' for e in executive.events)
+    assert any(e[0] == 'recovery_plan' for e in executive.events)
+    assert any(e[0] == 'inspection_report' for e in executive.events)
+
+
+def test_lost_confirmed_fire_with_smoke_eventually_holds_without_false_negative(system):
+    executive, controller = system
+    _qualified_fire(executive, controller)
+    board = Blackboard()
+    controller._route_fire(board)
+    fire(executive, controller, detected=False)
+    feed_smoke(executive, controller, coverage=0.3, regions=[1, 2, 3, 4])
+    for _ in range(controller.config['verify_search_recovery_max'] - 1):
+        assert controller.center_fire(board) == 'reacquire'
+    with pytest.raises(RuntimeError, match='Verify blocked'):
+        controller.center_fire(board)
+    assert not any(e[0] == 'inspection_report' for e in executive.events)
+
+
+def test_short_smoke_leg_can_finish_through_brief_detector_gap(system):
+    executive, controller = system
+    feed_smoke(executive, controller)
+    executive.on_motion = lambda: smoke(executive, controller, detected=False)
+    board = Blackboard()
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert board['verify_smoke_approach_completed']
+    assert executive.odometry.pose.pose.position.x == pytest.approx(3.0)
+
+
+def test_actual_new_viewpoint_resets_blocked_recovery_counter(system):
+    executive, controller = system
+    feed_smoke(executive, controller)
+    board = Blackboard()
+    board['verify_search_failures'] = 2
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert board['verify_search_failures'] == 0

@@ -1,7 +1,8 @@
-"""Abort Exploration on confirmed camera detections during an active mission."""
+"""Request Verify on confirmed camera detections during Exploration."""
 
 from collections import deque
 import math
+import time
 
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from kv_executive.msg import MissionPhase, MissionStateRequest
@@ -21,22 +22,22 @@ DEFAULTS = {
     'mission_phase_topic': 'mission_phase',
     'observation_timeout': 2.0,
     'future_tolerance': 0.25,
+    'request_retry_interval': 2.0,
 }
 
 _CLOSED_GOAL_LIMIT = 64
 
 
 class DetectionMonitor(Node):
-    """Observe detector confirmation and request a goal-scoped mission abort.
+    """Observe detector confirmation and request a goal-scoped Verify transition.
 
     The detectors establish persistence themselves. Either confirmed source is
     sufficient; visible camera detections do not establish a measured distance.
     Only fresh source images acquired strictly after both action acceptance and
-    Exploration entry can trigger. Each Exploration entry rearms this monitor.
+    Exploration entry can trigger. Requests retry at a bounded rate while that
+    phase remains active, allowing a new source after a completed site is ignored.
     Observations outside Exploration never issue additional requests. Requests
     carry that goal's UUID so delayed delivery cannot interrupt its successor.
-    Every qualifying detection can stop the mission, including a previously
-    reported fire. Verify and its location suppression are currently dormant.
     The executive owns state changes, flight commands, and safe recovery.
     """
 
@@ -53,10 +54,10 @@ class DetectionMonitor(Node):
                 raise ValueError(f'{name} must not be empty')
             if isinstance(default, float) and (
                 not math.isfinite(value) or value < 0.0
-                or (name == 'observation_timeout' and value == 0.0)
+                or (name in ('observation_timeout', 'request_retry_interval') and value == 0.0)
             ):
                 requirement = (
-                    'positive' if name == 'observation_timeout'
+                    'positive' if name in ('observation_timeout', 'request_retry_interval')
                     else 'nonnegative'
                 )
                 raise ValueError(f'{name} must be finite and {requirement}')
@@ -93,13 +94,14 @@ class DetectionMonitor(Node):
         ]
         self.get_logger().info(
             'Detection monitor ready; confirmed smoke or fire during an executing '
-            'mission will request Abort and recovery to LOITER'
+            'Exploration phase will request Verify'
         )
 
     def _initialize_tracking(self):
         self._active_goal_id = None
         self._active_goal_stamp_ns = 0
         self._request_sent = False
+        self._next_request_at = 0.0
         self._closed_goals = deque()
         self._closed_goal_ids = set()
         self._phase_goal_id = None
@@ -145,6 +147,7 @@ class DetectionMonitor(Node):
         self._active_goal_id = goal_id
         self._active_goal_stamp_ns = accepted_ns
         self._request_sent = False
+        self._next_request_at = 0.0
         if goal_id != self._phase_goal_id:
             self._phase_goal_id = None
             self._phase_sequence = -1
@@ -180,24 +183,28 @@ class DetectionMonitor(Node):
         self._phase_stamp_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
         if message.state == 'Exploration':
             self._request_sent = False
+            self._next_request_at = 0.0
 
     def _smoke_callback(self, message):
         if (
             message.detected and message.status == SmokeDetection.CONFIRMED
             and message.background_ready
         ):
-            self._request_abort(message, 'smoke')
+            self._request_verify(message, 'smoke')
 
     def _fire_callback(self, message):
         if message.detected and message.status == FireDetection.CONFIRMED:
-            self._request_abort(message, 'fire')
+            self._request_verify(message, 'fire')
 
-    def _request_abort(self, message, source):
+    def _request_verify(self, message, source):
         if (
-            self._active_goal_id is None or self._request_sent
+            self._active_goal_id is None
             or self._phase_goal_id != self._active_goal_id
             or self._phase_state != 'Exploration'
         ):
+            return
+        now = time.monotonic()
+        if self._request_sent and now < self._next_request_at:
             return
         stamp = message.header.stamp
         image_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
@@ -217,12 +224,14 @@ class DetectionMonitor(Node):
         if self._request_publisher.get_subscription_count() == 0:
             return  # Retry on a later confirmed frame after DDS discovery.
         self._request_publisher.publish(MissionStateRequest(
-            goal_id=UUID(uuid=list(self._active_goal_id)), state='Abort',
+            goal_id=UUID(uuid=list(self._active_goal_id)), state='Verify',
         ))
+        if not self._request_sent:
+            self.get_logger().info(
+                f'Confirmed {source} detected; requesting Verify from Exploration'
+            )
         self._request_sent = True
-        self.get_logger().info(
-            f'Confirmed {source} detected; aborting Exploration and requesting LOITER recovery'
-        )
+        self._next_request_at = now + self.config['request_retry_interval']
 
 
 def main(args=None):

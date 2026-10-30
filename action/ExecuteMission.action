@@ -1,14 +1,14 @@
 # Start Exploration: repeat SWEEP and freshly planned EXECUTE_PATH indefinitely.
-# Verify is dormant and disconnected from Exploration.
+# Confirmed smoke/fire enters Verify, then resumes Exploration within this goal.
 # Set true to skip the initial TAKEOFF; requires airborne, armed AUTO.LOITER.
 # The default false runs TAKEOFF once and requires a disarmed vehicle.
-# Cancellation ends the goal; monitor alerts and flight errors abort it.
-# Recovery requests LOITER. Send a new goal explicitly to resume Exploration.
+# Cancellation ends the goal; battery alerts, Abort/Return and errors abort it.
+# Recovery requests LOITER. A terminal goal requires a new goal to resume.
 bool skip_takeoff
 ---
 bool success
 string message
 ---
-# Current Exploration child state or mission lifecycle event.
+# Current Exploration/Verify child state or mission lifecycle event.
 string state
 string message

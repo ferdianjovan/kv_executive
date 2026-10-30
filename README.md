@@ -2,14 +2,15 @@
 
 The executive starts each mission in the nested YASMIN state machine
 `Exploration`. It takes off once, then repeats `SWEEP` and `EXECUTE_PATH`.
-Verify is dormant and disconnected from Exploration while startup and flight
-behavior are isolated. Confirmed smoke/fire and a valid battery return/reserve
-alert abort the action with bounded LOITER recovery. A new action goal is
-required to resume. The motion planner, detection monitor and battery monitor
-run as separate nodes. The planner exposes `plan_path` for Exploration and
-retains `plan_to_pose` for future targeted behavior. YASMIN is a required
-Python runtime dependency; the executive uses its state-machine implementation
-directly.
+Confirmed smoke or fire interrupts Exploration and enters the `Verify` higher
+state after a bounded LOITER handoff. Verify approaches and reacquires smoke,
+centers a persistent fire, and resumes Exploration without another takeoff.
+A valid battery return/reserve alert aborts the action with bounded LOITER
+recovery; a new action goal is required to resume after an abort. The motion
+planner, detection monitor and battery monitor run as separate nodes. The
+planner exposes `plan_path` for Exploration and `plan_inspection_path` for Verify.
+YASMIN is a required Python runtime dependency; the executive uses its
+state-machine implementation directly.
 
 ## Start and execute a mission
 
@@ -83,10 +84,10 @@ ros2 action send_goal /execute_mission kv_executive/action/ExecuteMission '{}' -
 `execute_mission` is now an action, replacing the old Trigger service. Its name
 is relative, so its full name follows any node namespace. The action accepts
 the goal immediately and provides `state` and `message` feedback during the
-flight. The same goal stays active across Exploration cycles; finishing a path
-does not return an action result or release the mission slot. Canceling returns
-`CANCELED`; monitor alerts, errors, and manual Verify/Return requests return
-`ABORTED`. The result
+flight. The same goal stays active across Exploration cycles and transitions
+through Verify; finishing a path or verification does not return an action
+result or release the mission slot. Canceling returns `CANCELED`; battery
+alerts, errors, and Abort/Return requests return `ABORTED`. The result
 contains `success` and `message`; there is no automatic successful completion
 for repeating Exploration. Only one goal runs at a time.
 After that goal reaches a terminal status, the server accepts another goal
@@ -124,7 +125,7 @@ returns `ABORTED`. Setpoints continue until telemetry confirms control has
 left `OFFBOARD`/`AUTO.TAKEOFF`. If the loiter handoff fails, the final result
 reports the failure and the hold stream remains active.
 
-### Abort Exploration
+### Request Verify or abort a mission
 
 Internal code can stop Exploration with `node.request_mission_state('Abort')`.
 External nodes publish the same case-sensitive name as `std_msgs/msg/String`
@@ -136,16 +137,23 @@ ros2 topic pub --once /mission_state_request std_msgs/msg/String '{data: Abort}'
 
 An Abort request stops the current motion, requests `AUTO.LOITER`, and ends
 the action as `ABORTED`. It does not fly home, land, or resume automatically.
-Verify has no connection from Exploration and no active perception, targeted
-planning, or GPS subscriptions in the executive. Compatibility requests named
-`Verify` or `Return` also abort to LOITER; neither starts a flight behavior.
+`Verify` requests interrupt Exploration, settle the vehicle in LOITER, and
+start the verification sequence within the same action. A Verify request
+received during initial takeoff waits until the configured climb is complete.
+`Return` remains unimplemented and aborts to LOITER.
 Requests are checked during motion and waits. An already dispatched mode or
 arming command is observed to its bounded outcome before recovery begins.
+
+To enter Verify manually during Exploration:
+
+```bash
+ros2 topic pub --once /mission_state_request std_msgs/msg/String '{data: Verify}'
+```
 
 Unsupported names, requests while idle, and requests during cancellation or
 recovery are ignored. The Python API returns whether a request was accepted.
 Goal-scoped requests include the active action UUID, and pending requests are
-cleared when that goal ends. The detection monitor sends `Abort`; the executive
+cleared when that goal ends. The detection monitor sends `Verify`; the executive
 also consumes the battery monitor's `return_alert` directly as described below.
 
 The planner can also be called independently from a terminal:
@@ -155,8 +163,8 @@ ros2 service call /plan_path kv_executive/srv/PlanPath '{}'
 ```
 
 It returns `success`, `message`, and the new `nav_msgs/Path`; requesting a path
-alone does not fly it. The retained explicit endpoint service can be called
-independently, but is unused by the current Exploration action:
+alone does not fly it. Verify uses the explicit endpoint service for targeted
+motion; it can also be called independently:
 
 ```bash
 ros2 service call /plan_to_pose kv_executive/srv/PlanToPose \
@@ -185,6 +193,16 @@ With `kv_world.launch.py`, map input flows from
 If OctoMap is missing, check this pipeline and the simulator launch logs.
 The self-filter restarts after an unexpected process exit and saves fault
 traces in the launch logs. Missing map data continues to prevent path flight.
+
+The mounted MID-360 covers approximately -52 to +7 degrees in elevation,
+leaving unobserved air above the aircraft. Verify defaults to the same
+occupied-obstacle policy as Exploration: unknown air is permitted, while the
+0.75 m inflated body remains checked against current and recent occupied cells.
+This assumes unmapped air is traversable; it does not certify unseen space free.
+`inspection_require_observed_free_space:=true` restores strict rejection of
+unknown body cells and unknown downward columns for deployments with sufficient
+sensor coverage. Both modes require actual observed terrain for terrain-relative
+flight and retain altitude bounds. Missing or stale maps remain unavailable.
 
 Internal callers can use
 `node.send_mission_goal(skip_takeoff=False, feedback_callback=None)`. It returns
@@ -243,15 +261,20 @@ ros2 topic echo /mission_status
 
 The retained `kv_executive/msg/MissionPhase` topic `mission_phase` also records
 the active goal UUID, monotonically increasing phase sequence and parent-state
-name. The detection monitor uses this typed phase signal to request Abort
+name. The detection monitor uses this typed phase signal to request Verify
 only during Exploration and match detections to the current goal.
 
-One active goal runs the following nested Exploration sequence:
+One active goal runs the following nested sequence:
 
 ```text
 Exploration
   TAKEOFF (initial entry only, unless skip_takeoff is true)
       -> SWEEP -> EXECUTE_PATH -> SWEEP -> EXECUTE_PATH -> ...
+  confirmed smoke/fire -> LOITER handoff -> Verify
+Verify
+  APPROACH_SMOKE -> REACQUIRE -> CENTER_FIRE or SEARCH_FIRE
+  source lost or verification complete -> Exploration/SWEEP
+  blocked terrain recovery -> explicit hold in AUTO.LOITER
 ```
 
 - `TAKEOFF` requires the vehicle to be disarmed initially unless the goal sets
@@ -296,91 +319,169 @@ returned message includes the recovery failure. A request rejected because
 the vehicle was already armed does not initiate recovery mode changes.
 Recovery also preserves an observed pilot or failsafe flight-mode takeover.
 
-### Dormant Verify reference: approach, reacquire, center and search
+### Verify: smoke guidance and visible fire inspection
 
-The Verify controller and its tests remain in the source tree for future work.
-The active mission graph contains only Exploration: it does not construct the
-Verify controller, subscribe to its detector/GPS inputs, create a targeted
-planning client, execute this sequence, or publish fire-source reports. The
-following describes the preserved design, not current autonomy behavior.
-
-The controller defines four nested states. If reconnected, every translation,
-including altitude changes and retreats, would request a collision-checked
-`plan_to_pose` path using level position setpoints, guarded short path segments
-and bounded yaw turns. Its stored sequence is:
+Entering Verify stops Exploration and confirms `AUTO.LOITER`. Every translation,
+including altitude centering and observation viewpoints, uses
+`plan_inspection_path`: inflated-body obstacle checks, recent occupied-cell
+history, home altitude bounds and terrain-envelope clearance remain mandatory.
+The default terrain floor is 5 m; navigation prefers 7.5 m and considers up to
+10 m clearance. The planner's configured unknown-air policy applies throughout
+planning and in-flight corridor revalidation; terrain heights are never invented.
 
 ```text
-Verify/APPROACH_SMOKE -> Verify/REACQUIRE
-                           | centered smoke, fewer than four regions -> APPROACH_SMOKE
-                           | persistent fire -> CENTER_FIRE -> Exploration
-                           | smoke in all four regions -> SEARCH_FIRE
-                           | no source recovered -> Exploration
-Verify/SEARCH_FIRE -> CENTER_FIRE when fire is confirmed
-                  -> retreat/climb -> APPROACH_SMOKE otherwise
+APPROACH_SMOKE -> short terrain-aware smoke leg -> REACQUIRE
+REACQUIRE     -> fresh smoke -> APPROACH_SMOKE or SEARCH_FIRE
+SEARCH_FIRE   -> smoke-boundary observation / short terrain-aware leg
+              -> boundary viewpoint inspections in CENTER_FIRE
+any Verify state -> confirmed visible fire -> CENTER_FIRE
+CENTER_FIRE   -> center -> bounded guarded fire approach -> fire_found report
+              -> completed report -> Exploration
+blocked recovery -> wait in LOITER for newer fresh maps -> bounded retry or explicit abort
 ```
 
-1. `APPROACH_SMOKE` accepts a confirmed, fresh smoke detection in any camera
-   region. It saves the current pose, altitude and heading, then targets a
-   5–20 m step along the smoke's horizontal bearing. Greater apparent smoke
-   coverage chooses a shorter step; image coverage is a movement heuristic,
-   not a measured distance to the source. Smoke is checked before planning
-   and throughout execution. Loss of smoke or smoke covering all four regions
-   stops the current movement and enters REACQUIRE through LOITER.
-2. `REACQUIRE` uses the saved altitude and heading to recover a lost view,
-   makes bounded yaw corrections to center visible smoke horizontally, and
-   checks thermal detections throughout. A persistent fire enters CENTER_FIRE;
-   centered smoke in fewer than four regions starts another approach;
-   smoke in all four regions enters SEARCH_FIRE. If no usable source is
-   recovered within `verify_reacquire_timeout`, it resumes Exploration.
-3. `CENTER_FIRE` tracks the same thermal object over distinct source images
-   for at least 1.5 seconds and three frames by default. It makes bounded yaw
-   and 0.5 m altitude corrections, then permits at most four 0.75 m creep
-   steps. Creep requires a current smoke observation and stops if smoke fills
-   all four regions. A centered, stable fire produces a `Fire source found`
-   report, then the drone turns 180 degrees, plans a 10 m retreat and resumes
-   Exploration without another takeoff. If smoke already fills all four
-   regions, the drone retreats before reacquiring the source.
-4. `SEARCH_FIRE` stays level for three seconds and sweeps left 60 degrees,
-   right 120 degrees and left 60 degrees, returning to the starting heading.
-   These position-setpoint interfaces do not safely control pitch or roll,
-   so the allowed level sweep is used. A persistent fire interrupts the
-   search and enters CENTER_FIRE. Otherwise the drone turns away, plans a
-   10 m retreat with a 10 m climb, turns back toward the smoke and approaches
-   again. Altitude bounds and obstacle clearance apply to this retreat too.
+After confirming fire, Verify takes up to `verify_fire_approach_max_steps`
+short terrain-checked legs (three by default), requiring fresh thermal guidance
+after each stop. Translated views can establish thermal multi-view coordinates.
+A reliable localized fire sets a horizontal `verify_fire_standoff` (10 m plus
+localization uncertainty), enforced by the native planner and path validators.
+Without metric range, the bounded legs follow the fresh bearing without inventing
+a distance. A blocked approach records the visible fire from the held viewpoint.
+Set the step limit to zero for centering/reporting without an additional approach.
+A confirmed fire can interrupt the first smoke leg. The controller stops in
+LOITER and requires new post-stop thermal images before further corrections.
 
-The dormant controller includes source image stamp and same-track persistence
-checks. Observations must be newer than the action and fresh against
-both ROS time and elapsed receive time. Fire matching uses track identity,
-image position and area consistency. After a targeted correction or creep,
-the next correction or report waits for a newer confirming source image.
-The controller limits approach cycles
-to eight by default; exhausted motion/centering limits, invalid telemetry,
-unavailable planning or GPS, and unsafe or unreachable targets abort to hold
-and LOITER instead of inventing a fallback trajectory. These defaults live
-in `config/mission.yaml` under `verify_*`, `global_position_*` and
-`fire_exclusion_radius`; the planner has separate bounds and clearance
-parameters in `config/planner.yaml`.
+`APPROACH_SMOKE` remembers a smoothed smoke bearing and follows it in short
+terrain-aware forward steps (`verify_navigation_step`, 3 m by default). It tries
+straight 3 m, 1.5 m and 0.75 m candidates, preferring level motion before a
+terrain-required climb. An upper-image smoke cue does not command a separate
+altitude correction. There are no lateral/retreating fallbacks for smoke pursuit.
+Each new Verify episode starts with the current smoke bearing; it does not
+average a new site's direction with the previous site's bearing.
 
-The retained reporting helper is designed to publish completed observations
-reliably with transient-local retention on `fire_sources` as
-`kv_executive/msg/FireSourceReport`. Each report includes
-the site ID and label, drone pose in PX4 local coordinates, the corresponding
-pose in the planning frame, a fresh valid `sensor_msgs/msg/NavSatFix`, observed
-fire-source count, track ID, viewing bearing and exclusion radius. The latitude
-and longitude describe the drone's observation location. Camera detections
-alone do not measure the fire's three-dimensional position. A fresh valid GPS
-fix from `/mavros/global_position/global` is required before publishing a report;
-the default freshness deadline is two seconds. No global location is fabricated
-when GPS is unavailable.
+After each stop, smoke loss holds the current position and heading until
+`verify_smoke_loss_grace` (5 wall-clock seconds by default) has elapsed since the
+last accepted confirmation. Each new confirmed glimpse restarts that grace;
+fresh, post-stop guidance resumes forward planning. A short confirmed glimpse
+between negative frames can be consumed once while still within the normal
+2-second image age limit. Bearing memory never makes an old image fresh or
+invent a smoke range. A committed short validated leg can finish through a brief
+detector gap; it cannot start another leg using stale guidance. Only sustained
+loss permits a bounded yaw scan around the remembered bearing. Fire and mission
+interrupts take priority throughout the hold.
 
-The planner retains support for sampling Exploration endpoints outside
-externally supplied observation circles (15 m radius by default). Current
-autonomy produces no new reports because Verify is disconnected. The detection
-monitor always requests Abort for qualifying fresh detections and does not
-suppress known viewing sectors. These circles are goal exclusions, not hard
-no-fly regions or measured fire boundaries. The planner retains up to 100
-reports and fails clearly if 128 random samples cannot find an eligible
-Exploration endpoint.
+The inconsistent smoke wall guides smoke-only approach. A fresh smoke ray's
+observed, history-marked plume candidate within `verify_smoke_standoff` (10 m)
+is a conservative boundary proxy, not a measured fire position. Current smoke
+coverage in all four image regions and at least `verify_full_coverage` (0.25)
+also stops forward smoke flight and starts observation. A static first-hit
+obstacle alone cannot prove a smoke boundary. A stale, unknown or non-plume
+surface cannot establish a negative inspection result.
+
+`SEARCH_FIRE` holds for fresh thermal confirmation, then reassesses smoke and
+terrain before selecting another short forward smoke leg. Collision-checked
+bent paths may follow terrain contours. Fresh camera guidance updates yaw during
+execution; a source image's correction is applied only once. Actual forward
+translation must exceed position tolerance to count as progress. Lateral motion
+or revisiting old viewpoints does not reset the smoke no-progress counter.
+Fire approach retains its separate parallax candidates and localized standoff.
+
+Sparse ground returns do not prevent a short forward leg under the default
+occupied-voxel policy. The aircraft retains altitude when no ground height is
+available; it never invents a ground height or descends on that basis. Native
+planning and flight-time validation check the whole path against occupied body
+clearance and the 5 m buffer above mapped terrain. The highest occupied voxel
+under the footprint, including recent observations, sets that terrain buffer;
+holes between lidar returns do not invalidate it. Observed rising terrain still
+raises the destination. Optional strict observed-free mode continues to require
+complete observed support. Missing or stale maps still block motion.
+
+When current terrain clearance is below the floor, the native planner first
+tries simple escape prefixes, then a bounded multi-segment search with level,
+upward and diagonal connectors. Every sampled segment retains obstacle and terrain checks.
+Until reaching the floor, height and measured terrain clearance cannot decrease,
+and the escape stays inside a 2 m horizontal radius around its original anchor.
+Once clearance is reached, ordinary terrain-aware OMPL planning can produce
+bent paths. An occupied corridor or insufficient mapped terrain clearance can
+still reject a route. `START_INVALID=4` means current body/support evidence is invalid;
+`NO_CLEARANCE_ESCAPE=6` means start collision/terrain checks passed but the bounded
+recovery search found no route. Missing/stale maps have a distinct error from
+unknown/occupied body clearance and missing terrain. Recovery holds in LOITER
+and polls for a strictly newer, valid source-stamped map before retrying
+centering or translation. Each continuous map outage has a
+`verify_navigation_map_timeout` budget (20 wall-clock seconds by default).
+Receiving a newer valid map ends that outage. Healthy planning and OFFBOARD/LOITER
+handoffs do not consume the next outage's budget. Persistent body/terrain
+clearance failures still share one budget at the same position; new maps alone
+cannot extend that clearance-recovery deadline. Expiry reports a blocked mission
+and holds for the operator.
+Geometry-service polls during recovery are bounded to 0.5 seconds; temporary
+service timeouts remain recoverable within that budget, while telemetry and
+flight-control faults still propagate.
+Fresh fire evidence, cancellation and battery alerts retain priority throughout
+recovery. Map source freshness remains 5 ROS seconds. With real time, accepted-map
+reception silence is also limited to 5 wall seconds. With simulation time, a
+progressing slow clock does not expire a source-fresh map merely because wall
+time runs faster; a frozen simulation clock still blocks inspection after
+5 wall seconds. These checks do not change OctoMap production or publication.
+
+Planner receipt diagnostics include source age before/after decoding, binary
+bytes, tree nodes and decode duration. Freshness failures distinguish old source
+observations from reception silence, invalid/future stamps and clock mismatch.
+Stale, duplicate and out-of-order stamped maps cannot replace a newer accepted
+snapshot or refresh its receipt time. Recent occupied evidence remains blocking.
+Pausing and resuming simulation does not erase observations still within their
+source-age window.
+History expires with the existing freshness window and is capped at eight maps.
+
+`CENTER_FIRE` alternates bounded horizontal yaw and vertical altitude attempts.
+A downward correction is clamped to the observed terrain floor and cannot turn
+into a climb merely to satisfy the request. A rejected correction does not
+require perfect alignment: fresh confirmed fire still inside the thermal image
+is sufficient for a positive report after the bounded approach attempt.
+Brief losses wait for new post-stop images;
+cached guidance cannot authorize another correction or a report. Cancellation,
+battery Return/Abort requests, invalid telemetry and flight-control failures
+remain authoritative.
+
+Without visible fire, broad/nearby smoke permits up to three observation
+windows, with safe lateral viewpoint changes between them. Rejected or
+unfinished viewpoint movements do not count as completed negative inspections.
+A negative report requires current broad smoke, fresh smoke-boundary evidence
+and no confirmed fire during the inspection. Otherwise the result is
+inconclusive. Previously confirmed fire cannot become a negative report during
+a detector gap. Exhausted blocked recovery retains an explicit hold outcome.
+
+The controller checks source timestamps, receive age, camera/track identity and
+confirmation persistence. Producer confirmation metadata can establish fire
+persistence immediately; messages lacking that metadata use the consumer's
+same-track frame/time checks. A correction requires a newer source image before
+the next correction or report. Feedback identifies acceptance/rejection reasons,
+readiness, source-image age and terrain recovery failures. Up to 64 completed
+smoke approach legs are allowed by default; sensor waits and map retries do not
+consume that movement budget. Legacy `verify_step_min/max` and
+`verify_localization_max_steps` parameters remain accepted for compatibility;
+fire localization no longer gates flight or completion.
+
+The retained `inspection_reports` topic publishes
+`kv_executive/msg/InspectionReport`, separating observer pose/GPS from optional
+smoke/fire target coordinates. A positive report can have
+`fire_location_valid=false`; unknown coordinates remain NaN, never the UAV's
+position relabeled as fire. Missing GPS invalidates only global coordinates.
+The legacy `fire_sources` topic still reports the observation viewpoint when
+fresh GPS is available. Its exploration exclusion circle is not a fire boundary.
+
+`query_inspection_geometry` retains source-stamped camera rays for optional
+multi-view estimation. A fresh nearby, history-associated plume wall can be
+recorded with method `lidar_smoke_plume_proxy`; it is an observed wall estimate,
+not a measured emitter location. Unassociated obstacles are not smoke positions.
+Terrain heights select candidate altitudes; the full corridor must independently
+pass the configured collision and terrain policy
+before OFFBOARD, after warmup, during flight and on arrival. Revalidation pins
+the original escape anchor and cannot restart the below-floor escape after it
+has completed. Completed fire views are associated conservatively by observer
+and bearing when target coordinates are unavailable; a new bearing, translated
+observer or unavailable association permits another inspection.
 
 ### PX4 returning home during or after Exploration
 
@@ -521,7 +622,7 @@ provide a reliable distance in metres.
 
 The monitor follows the executing goal UUID on
 `execute_mission/_action/status` and the typed parent phase on `mission_phase`.
-It publishes `kv_executive/msg/MissionStateRequest` with `state: Abort` and
+It publishes `kv_executive/msg/MissionStateRequest` with `state: Verify` and
 that goal's `goal_id` on `mission_state_request_for_goal` once per Exploration
 entry. A new action goal and fresh observation rearm the monitor.
 It sends no requests outside Exploration, while idle, or while the action is
@@ -537,11 +638,12 @@ monitor's ROS clock: no more than 2 seconds old or
 additional requests. A later goal requires a fresh observation from that
 goal, so an observation from a previous mission cannot stop a new one. A
 monitor joining an executing goal waits for its matching phase and a qualifying
-detector observation. The request aborts Exploration and requests `AUTO.LOITER`.
-The action releases its goal after recovery; it stays stopped until another
-goal is sent explicitly. The executive performs the recovery flight commands;
-the monitor only publishes the goal-scoped stop request. It does not subscribe
-to odometry or fire-source reports, and applies no known-view suppression.
+detector observation. The request interrupts Exploration, requests `AUTO.LOITER`,
+and enters Verify within the active action. Once Verify completes or loses its
+source, Exploration resumes with a new sweep. The executive performs the flight
+commands; the monitor only publishes the goal-scoped transition request. It
+does not subscribe to odometry or fire-source reports, and applies no
+known-view suppression.
 
 `monitoring.launch.py` starts this monitor and the battery monitor by default.
 To run detection monitoring alone, disable the battery monitor there or use
@@ -563,9 +665,9 @@ topics. For a separately namespaced executive, both monitor launches also
 accept `action_status_topic` and `mission_state_request_topic` overrides.
 Topic launch arguments override the corresponding YAML values. Run one
 monitor for each executive, alongside the matching detector inputs.
-Pass detector topic overrides to monitoring and configure the matching
-perception outputs. Autonomy no longer accepts detector, Verify-planning-frame,
-or GPS topic launch arguments because these are unused by Exploration.
+Pass detector topic overrides to both autonomy and monitoring, and configure
+the matching perception outputs. Autonomy also accepts `verify_planning_frame`
+and `global_position_topic` for Verify planning and fire-source reporting.
 
 ## Battery usage and return estimate
 
@@ -670,12 +772,12 @@ default receipt-age limits are 5, 2, and 10 seconds respectively.
 
 The executive subscribes to `battery_return_estimate` through its configurable
 `battery_alert_topic` parameter. A fresh valid message with `return_alert=true`
-aborts the active Exploration action and requests `AUTO.LOITER`.
+aborts the active mission, including Verify, and requests `AUTO.LOITER`.
 `battery_alert_timeout` defaults to 5 seconds; stale, invalid, or pre-goal
 messages cannot abort a new mission. With a learned model, the alert uses the
 buffered return cost. Before the model is available (`estimate_available=false`),
 the monitor can still alert when remaining charge reaches its configured
-reserve. Both alerts stop Exploration; the executive adds no separate raw
+reserve. Both alerts stop the mission; the executive adds no separate raw
 battery threshold. It does not initiate Return flight. Once recovery finishes,
 send a new action goal explicitly to resume; continued alerts can stop that
 goal too.
@@ -732,11 +834,10 @@ Detection monitor tests cover either detector independently, confirmed-status
 gating, stale/future/zero source stamps, goal and phase boundaries, duplicate
 observations, idle suppression and rearming on each
 Exploration entry. ROS integration connects typed detector messages to the
-real monitor and an active mission. Active-mission tests check monitor-triggered
-abort, LOITER recovery, subsequent goals, and the absence of a connected Verify
-state. The retained Verify controller/navigation unit tests cover bounded
-branches, perception guards, waypoint preservation and reporting validation
-without enabling that controller in autonomy.
+real monitor and an active mission. Active-mission tests check transitions into
+Verify, LOITER recovery, resuming Exploration, battery aborts and subsequent
+goals. Verify controller/navigation unit tests cover bounded branches,
+perception guards, waypoint preservation and reporting validation.
 
 The native monitor DDS test checks the installed C++ executable with zero and
 positive consumption, weighted learning, frozen home, invalid telemetry and
@@ -748,6 +849,39 @@ For Python nodes exiting with `-11` (SIGSEGV), see the
 [native crash investigation](docs/native_crashes.md). The Python entrypoints
 emit all-thread fault traces on a native crash, and the action tests include
 successive airborne goals using simulated time and separate action clients.
+
+Autonomy and monitoring always run their Python nodes through the installed
+same-version shared Python runtime. No launch argument is required:
+
+```bash
+ros2 launch kv_executive autonomy.launch.py
+ros2 launch kv_executive monitoring.launch.py
+```
+
+Keep your usual launch arguments and remove the former
+`shared_python_runtime:=true/false` argument from saved commands. The executive
+and detection monitor print `[kv_shared_python]` at startup. The launcher uses
+the installed Python shared library, retaining the Python version, environment,
+ROS interfaces, signal handling and mission sequence. Matching debugger launch
+prefixes are composed ahead of this launcher. Planner and battery processes
+remain native executables.
+
+This runtime became the normal launch path after recurring faults with Ubuntu
+Python 3.12.3 and ROS Jazzy on WSL2 kernel
+`6.6.87.2-microsoft-standard-WSL2`. The investigation reproduced the fault in
+plain ROS workers without mission code. It did not establish that all WSL
+versions, or WSL itself, cause the problem. See the
+[October 27 investigation](docs/20261027_reacquire_segfault.md).
+
+On an environment where ordinary Python/rclpy nodes run reliably, including
+an unaffected native Linux or WSL installation, this extra launcher is not
+needed for mission functionality. A deployment-specific launch file may omit
+`prefix=SharedPythonPrefix(...)` and start the same Python executable with the
+same parameters. The distributed launch files retain the shared runtime for
+consistent behavior; they no longer expose a runtime rollback flag. Do not
+choose a different path solely from the operating-system label: validate the
+actual ROS/Python environment. Building the provided launcher requires the
+configured Python version's development/embedding library (`python3-dev`).
 
 When WSL updates require administrator approval, a workspace-local CycloneDDS
 runtime is available without `sudo` or a rebuild. See the
@@ -796,11 +930,22 @@ ros2 launch kv_executive px4.launch.py \
 `<drone_name>/odom` and `<drone_name>/base_link`. The three explicit odometry
 arguments remain available when a real estimator uses another convention.
 
-The launch file remaps the external `nav_msgs/Odometry` topic to
-`/mavros/odometry/out`. In MAVROS terminology, `out` means data sent to the
+The launch file relays the external `nav_msgs/Odometry` topic to
+`/mavros/odometry/out` without changing its contents. In MAVROS terminology,
+`out` means data sent to the
 flight controller; `/mavros/odometry/in` is odometry received from it.
 MAVROS converts ROS ENU/FLU conventions to MAVLink `ODOMETRY`, and PX4
 receives it as `vehicle_visual_odometry`.
+
+MAVROS 2.16 creates plugin nodes under its own `mavros` UAS node and ignores
+process-wide plugin topic remappings. The container therefore starts in the
+root namespace, and the relay keeps forwarding odometry after the parameter
+configurator exits. Leave `namespace` empty for the usual `/mavros` interface;
+`namespace:=drone1` puts MAVROS under `/drone1/mavros`. Passing
+`namespace:=mavros` would create `/mavros/mavros` and requires consumers to use
+that prefix too. When the external topic already is the MAVROS input, the
+launch file omits the relay to avoid a forwarding loop; a publisher feeding
+MAVROS directly must use reliable QoS.
 
 The MAVROS odometry plugin requires these zero-translation static rotations,
 which the launch file publishes automatically:

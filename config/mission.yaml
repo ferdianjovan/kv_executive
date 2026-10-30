@@ -31,11 +31,11 @@ mission_executive:
     # this subscribed input label; planner map paths still need origin alignment.
     # Use [px4_odom] to require the canonical local_frame exactly.
     local_odometry_frame_aliases: [map]
-    # A fresh valid return/reserve alert aborts Exploration and requests LOITER.
+    # A fresh valid return/reserve alert aborts the mission and requests LOITER.
     battery_alert_topic: battery_return_estimate
     battery_alert_timeout: 5.0
-    # Dormant Verify defaults: preserved for future work, not used by Exploration.
-    # autonomy.launch.py no longer overrides or connects these perception inputs.
+    # Verify receives the same detector streams as the detection monitor.
+    # autonomy.launch.py exposes detector, planning-frame and GPS overrides.
     smoke_detection_topic: /kv_drone/smoke/detection
     fire_detection_topic: /kv_drone/fire/detection
     verify_planning_frame: map
@@ -45,27 +45,80 @@ mission_executive:
     fire_exclusion_radius: 15.0  # Exploration endpoint exclusion, in metres.
     verify_observation_timeout: 2.0
     verify_future_tolerance: 0.25
-    # The executive additionally confirms one unchanged thermal track.
+    # Accept the detector's fresh confirmed persistence metadata. Messages
+    # without that evidence use the executive's same-track confirmation fallback.
     verify_fire_persistence: 1.5
     verify_fire_min_frames: 3
     verify_track_center_tolerance: 0.08  # Fraction of image dimensions.
     verify_track_area_ratio: 2.0
     verify_reacquire_timeout: 15.0
+    # Wait for detector confirmation after arrival, brief misses within SEARCH/
+    # CENTER, and each recovery viewpoint; keep the current state while waiting.
+    # This waiting budget does not relax the source-image age limit above.
+    verify_reacquire_observation_timeout: 5.0
+    verify_reacquire_scan_step: 0.17453292519943295  # Missing-source scan +/-10 degrees.
+    verify_reacquire_yaw_step: 0.08726646259971647  # Visible-source corrections <=5 degrees.
+    # Failed Verify delays manual requests briefly. Automatic repeats of the
+    # same blocked bearing wait for 2 m actual translation; a new bearing can
+    # still interrupt the sweep. These are observer/bearing gates, not ranges.
+    verify_retry_cooldown: 2.0
+    verify_retry_translation: 2.0
+    verify_retry_bearing_tolerance: 0.2617993877991494  # 15 degrees.
+    # Legacy centering budget, retained for existing parameter files. Smoke
+    # pursuit now uses forward guidance rather than separate axis corrections.
+    verify_smoke_center_timeout: 30.0
+    # Remember the last confirmed smoke bearing through occlusion. Hold this
+    # long since its last accepted image before any reacquisition yaw scan.
+    verify_smoke_loss_grace: 5.0
+    # Safe lateral smoke-boundary observation offsets; every translation uses
+    # plan_inspection_path. Missing observations permit yaw scans, not blind flight.
+    verify_viewpoint_climb: 2.0
+    verify_viewpoint_lateral_step: 2.0
+    verify_viewpoint_max_steps: 3
+    verify_viewpoint_timeout: 60.0
     verify_center_timeout: 30.0
+    # After confirming fire, take up to three short terrain-checked legs while
+    # retaining fresh fire guidance. Reliable source coordinates set standoff.
+    verify_fire_approach_max_steps: 3
+    verify_fire_standoff: 10.0
     verify_yaw_tolerance: 0.08726646259971647  # Radians: 5 degrees.
     verify_yaw_step: 0.5235987755982988  # Radians: at most 30 degrees per correction.
     verify_vertical_step: 0.5
     verify_minimum_altitude: 2.0  # Local z floor; planner home limits also apply.
-    # Apparent smoke coverage selects a step; this is not a measured source range.
+    # Legacy coverage-to-step parameters remain accepted for compatibility.
+    # Active smoke acquisition uses verify_navigation_step with measured terrain
+    # checks. Confirmed fire interrupts smoke flight and starts its bounded approach.
     verify_step_min: 5.0
     verify_step_max: 20.0
+    # Also the broad-smoke stop threshold when all four regions are occupied.
     verify_full_coverage: 0.25
-    verify_target_fire_fraction: 0.005
-    verify_creep_step: 0.75
-    verify_creep_max_steps: 4
     verify_motion_speed: 0.5
-    verify_escape_distance: 10.0
-    verify_escape_climb: 10.0
     # Keep the aircraft level; these position setpoints cannot safely request tilt.
-    verify_search_hold: 3.0
-    verify_max_approaches: 8
+    verify_search_hold: 5.0
+    verify_search_center_timeout: 15.0  # Best effort; partial smoke remains usable.
+    verify_search_recovery_max: 3  # Consecutive blocked metric approaches per inspection.
+    verify_localization_max_steps: 6  # Legacy; fire range never gates navigation.
+    # Short smoke-guided goals in both APPROACH_SMOKE and SEARCH_FIRE.
+    # Inspection paths retain occupied-obstacle and measured terrain checks.
+    verify_navigation_step: 3.0
+    verify_navigation_preferred_agl: 7.5
+    verify_navigation_max_agl: 10.0
+    verify_navigation_candidate_limit: 18
+    verify_navigation_map_wait: 5.0
+    # Maximum wait per continuous map outage. A fresh map ends that outage;
+    # healthy planning and mode handoffs do not consume the next outage's wait.
+    # Persistent clearance failures share a bounded budget at the same position.
+    verify_navigation_map_timeout: 20.0
+    verify_navigation_no_progress_max: 2
+    # Proximity to a fresh observed plume/smoke-wall proxy, never fire distance.
+    verify_smoke_standoff: 10.0
+    # Clearance above a validated observed support surface; unknown means no descent.
+    verify_inspection_altitude: 5.0
+    verify_inspection_lateral_step: 5.0
+    verify_inspection_max_attempts: 3
+    verify_inspection_yaw_step: 0.08726646259971647  # +/-5 degree inspection checks.
+    verify_inspection_timeout: 300.0
+    verify_inspection_max_range: 40.0
+    verify_inspection_max_uncertainty: 2.0
+    verify_geometry_timeout: 5.0
+    verify_max_approaches: 64

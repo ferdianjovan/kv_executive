@@ -14,7 +14,7 @@ from kv_executive.mission_executive import MissionExecutive
 from kv_executive.mission_geometry import (
     angular_distance, quaternion_from_yaw, yaw_from_quaternion,
 )
-from kv_executive.srv import PlanPath, PlanToPose
+from kv_executive.srv import PlanInspectionPath, PlanPath, PlanToPose, QueryInspectionGeometry
 from mavros_msgs.msg import State as VehicleState
 from mavros_msgs.srv import CommandBool, ParamPull, SetMode
 from nav_msgs.msg import Odometry, Path
@@ -68,6 +68,14 @@ class SimulatedFcu(Node):
         self.arming_requests = []
         self.planning_requests = 0
         self.target_requests = []
+        self.geometry_requests = []
+        self.inspection_planning_requests = []
+        self.inspection_target = None
+        self.inspection_obstacle = None
+        # Terrain-aware navigation must see a stationary world surface. The
+        # legacy inspection fixtures retain their pose-relative support below.
+        self.inspection_terrain_z = self.pose.position.z - 5.0
+        self.inspection_terrain_height = None
         # MAVROS emits state on the FCU heartbeat, independently of the much
         # faster local odometry stream. Keep their delivery controls separate.
         self.heartbeat_interval = 1.0
@@ -125,6 +133,14 @@ class SimulatedFcu(Node):
                 callback_group=self.callbacks,
             ),
         ]
+        self.geometry_service = self.create_service(
+            QueryInspectionGeometry, 'query_inspection_geometry', self.query_inspection_geometry,
+            callback_group=self.callbacks,
+        )
+        self.inspection_planning_service = self.create_service(
+            PlanInspectionPath, 'plan_inspection_path', self.plan_inspection_path,
+            callback_group=self.callbacks,
+        )
         self.telemetry_timer = self.create_timer(
             0.05, self.publish_telemetry, callback_group=self.telemetry_callbacks,
         )
@@ -187,6 +203,34 @@ class SimulatedFcu(Node):
         response.path = path
         return response
 
+    def plan_inspection_path(self, request, response):
+        """Expose the strict planning RPC while preserving existing flight spies."""
+        with self.lock:
+            self.inspection_planning_requests.append(deepcopy(request))
+        response.error_code = response.OK
+        response = self.fake_services[-1].callback(request, response)
+        if response.success and request.minimum_radius > 0.0 and len(response.path.poses) == 2:
+            start, end = response.path.poses
+            center = request.keepout_center.point
+            first = (start.pose.position.x - center.x, start.pose.position.y - center.y)
+            last = (end.pose.position.x - center.x, end.pose.position.y - center.y)
+            first_radius, last_radius = math.hypot(*first), math.hypot(*last)
+            if min(first_radius, last_radius) > 0.0:
+                cosine = sum(a * b for a, b in zip(first, last)) / (first_radius * last_radius)
+                if 1e-6 < cosine < 1.0 - 1e-8:
+                    # Intersect endpoint tangents, so the route remains outside
+                    # the requested cylinder between equal-radius side views.
+                    midpoint = deepcopy(end)
+                    denominator = 1.0 + cosine
+                    midpoint.pose.position.x = center.x + (
+                        first[0] / first_radius + last[0] / last_radius) * max(
+                            first_radius, last_radius) / denominator
+                    midpoint.pose.position.y = center.y + (
+                        first[1] / first_radius + last[1] / last_radius) * max(
+                            first_radius, last_radius) / denominator
+                    response.path.poses.insert(1, midpoint)
+        return response
+
     def receive_setpoint(self, message):
         with self.lock:
             self.last_setpoint = time.monotonic()
@@ -238,6 +282,68 @@ class SimulatedFcu(Node):
             type=ParameterType.PARAMETER_DOUBLE,
             double_value=self.takeoff_height,
         )]
+        return response
+
+    def query_inspection_geometry(self, request, response):
+        """Supply explicit measured geometry for the isolated flight scenarios."""
+        with self.lock:
+            self.geometry_requests.append(deepcopy(request))
+            current = deepcopy(self.pose)
+            if request.direction.header.frame_id and self.inspection_target is None:
+                yaw = yaw_from_quaternion(current.orientation)
+                self.inspection_target = Point(
+                    x=current.position.x + 20.0 * math.cos(yaw),
+                    y=current.position.y + 20.0 * math.sin(yaw),
+                    z=current.position.z,
+                )
+            target = deepcopy(self.inspection_target)
+            obstacle = deepcopy(self.inspection_obstacle or self.inspection_target)
+        response.success = True
+        response.error_code = response.OK
+        response.message = 'Simulated measured surface and safe inspection corridor'
+        response.map_header.frame_id = 'px4_odom'
+        response.map_header.stamp = self.get_clock().now().to_msg()
+        if request.direction.header.frame_id and target is not None:
+            response.ray_origin.header = deepcopy(response.map_header)
+            response.ray_origin.header.stamp = deepcopy(request.origin.header.stamp)
+            response.ray_origin.point = deepcopy(current.position)
+            response.ray_direction.header = deepcopy(response.map_header)
+            response.ray_direction.header.stamp = deepcopy(request.direction.header.stamp)
+            distance = math.dist(
+                (target.x, target.y, target.z),
+                (current.position.x, current.position.y, current.position.z))
+            for axis in 'xyz':
+                setattr(response.ray_direction.vector, axis,
+                        (getattr(target, axis) - getattr(current.position, axis)) / distance)
+            response.surface_valid = True
+            response.surface.header = deepcopy(response.map_header)
+            response.surface.point = obstacle
+            response.surface_range = math.dist(
+                (obstacle.x, obstacle.y, obstacle.z),
+                (current.position.x, current.position.y, current.position.z))
+            response.surface_uncertainty = 0.1
+            response.occupied_samples = 3
+        if request.ground_query.header.frame_id:
+            response.ground_valid = True
+            response.ground_surface.header = deepcopy(response.map_header)
+            response.ground_surface.point = deepcopy(request.ground_query.point)
+            if getattr(request, 'terrain_envelope', False):
+                point = request.ground_query.point
+                response.ground_surface.point.z = (
+                    self.inspection_terrain_height(point.x, point.y)
+                    if self.inspection_terrain_height is not None else self.inspection_terrain_z)
+            else:
+                response.ground_surface.point.z = current.position.z - 5.0
+            response.ground_uncertainty = 0.0
+        response.corridor_safe = True
+        if (getattr(request, 'terrain_envelope', False) and request.corridor.poses
+                and hasattr(response, 'current_clearance_reached')):
+            actual = request.corridor.poses[0].pose.position
+            ground_z = (self.inspection_terrain_height(actual.x, actual.y)
+                        if self.inspection_terrain_height is not None
+                        else self.inspection_terrain_z)
+            response.current_clearance_reached = (
+                actual.z - ground_z >= request.minimum_agl)
         return response
 
     def plan_path(self, request, response):
@@ -303,9 +409,13 @@ def prepare_airborne(mission):
 @pytest.fixture
 def mission(monkeypatch, tmp_path, request):
     # Keep this test's simulated MAVROS services isolated from other ROS graphs.
-    monkeypatch.setenv('ROS_DOMAIN_ID', str(40 + os.getpid() % 50))
+    monkeypatch.setenv('ROS_DOMAIN_ID', os.environ.get(
+        'ROS_DOMAIN_ID', str(40 + os.getpid() % 50),
+    ))
     monkeypatch.setenv('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST')
-    monkeypatch.setenv('ROS_LOG_DIR', str(tmp_path / 'ros_logs'))
+    monkeypatch.setenv('ROS_LOG_DIR', os.environ.get(
+        'ROS_LOG_DIR', str(tmp_path / 'ros_logs'),
+    ))
     use_sim_time = getattr(request, 'param', False)
     parameters = {
         'use_sim_time': use_sim_time,
@@ -767,7 +877,7 @@ def test_planner_failure_aborts_and_action_server_remains_available(mission):
     cancel_goal(next_goal)
 
 
-@pytest.mark.parametrize('state', ['Abort', 'Return', 'Verify'])
+@pytest.mark.parametrize('state', ['Abort', 'Return'])
 def test_requested_higher_state_stops_exploration_and_recovers_to_loiter(mission, state):
     executive, fcu = mission.executive, mission.fcu
     executive.config['sweep_step_duration'] = 1.0
@@ -785,8 +895,6 @@ def test_requested_higher_state_stops_exploration_and_recovers_to_loiter(mission
     assert not result.result.success
     if state == 'Return':
         assert 'Return is not implemented' in result.result.message
-    elif state == 'Verify':
-        assert 'Verify is dormant' in result.result.message
     else:
         assert 'abort' in result.result.message.lower()
     assert 'AUTO.LOITER confirmed' in result.result.message
@@ -802,7 +910,6 @@ def test_requested_higher_state_stops_exploration_and_recovers_to_loiter(mission
         assert not {'AUTO.RTL', 'AUTO.LAND'} & set(fcu.mode_requests)
         assert not fcu.offboard_losses
         assert not fcu.target_requests
-    assert not hasattr(executive, '_verify')
 
 
 def test_cancel_keeps_offboard_hold_when_px4_rejects_loiter(mission):

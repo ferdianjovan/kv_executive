@@ -1,6 +1,6 @@
-"""Run smoke/fire monitoring that requests Exploration abort and LOITER."""
+"""Run smoke/fire monitoring that requests Verify from Exploration."""
 
-from kv_executive.launch_support import fastdds_udp_environment
+from kv_executive.launch_support import fastdds_udp_environment, SharedPythonPrefix
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -53,7 +53,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'mission_state_request_topic',
             default_value='mission_state_request_for_goal',
-            description='Goal-scoped Abort request topic in the executive namespace',
+            description='Goal-scoped Verify request topic in the executive namespace',
         ),
         DeclareLaunchArgument(
             'use_sim_time',
@@ -65,6 +65,7 @@ def generate_launch_description():
             Node(
                 package='kv_executive',
                 executable='detection_monitor_node.py',
+                prefix=SharedPythonPrefix('detection_monitor_node.py'),
                 name='detection_monitor',
                 output='screen',
                 additional_env={'PYTHONFAULTHANDLER': '1'},

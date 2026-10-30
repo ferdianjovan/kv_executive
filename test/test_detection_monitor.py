@@ -5,6 +5,7 @@ from types import MethodType, SimpleNamespace
 
 from action_msgs.msg import GoalInfo, GoalStatus, GoalStatusArray
 from builtin_interfaces.msg import Time
+import kv_executive.detection_monitor as monitor_module
 from kv_executive.detection_monitor import DEFAULTS, DetectionMonitor
 from kv_executive.msg import MissionPhase
 from kv_perception.msg import FireDetection, SmokeDetection
@@ -83,17 +84,20 @@ class Harness:
 
 
 @pytest.fixture
-def monitor():
-    return Harness()
+def monitor(monkeypatch):
+    harness = Harness()
+    harness.monotonic_seconds = 0.0
+    monkeypatch.setattr(monitor_module.time, 'monotonic', lambda: harness.monotonic_seconds)
+    return harness
 
 
 @pytest.mark.parametrize('source', ['smoke', 'fire'])
-def test_either_confirmed_detector_can_request_abort_alone(monitor, source):
+def test_either_confirmed_detector_can_request_verify_alone(monitor, source):
     monitor.status(goal_status())
     monitor.phase()
     monitor.detection(source)
 
-    assert [message.state for message in monitor._request_publisher.messages] == ['Abort']
+    assert [message.state for message in monitor._request_publisher.messages] == ['Verify']
     assert monitor._request_publisher.messages[0].goal_id == UUID(uuid=[1] * 16)
     assert source in monitor.logs[-1]
 
@@ -113,7 +117,7 @@ def test_idle_detection_does_not_carry_into_later_goal(monitor, source):
     GoalStatus.STATUS_UNKNOWN, GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_CANCELING,
     GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_CANCELED, GoalStatus.STATUS_ABORTED,
 ])
-def test_only_executing_goals_can_be_stopped(monitor, status):
+def test_only_executing_goals_can_request_verify(monitor, status):
     monitor.status(goal_status(status=status))
     monitor.phase()
     monitor.detection('smoke')
@@ -132,7 +136,7 @@ def test_only_executing_goals_can_be_stopped(monitor, status):
     ('fire', {'status': FireDetection.SEARCHING}),
     ('fire', {'status': FireDetection.CONFIRMING}),
 ])
-def test_candidates_and_inconsistent_flags_never_stop_exploration(monitor, source, fields):
+def test_candidates_and_inconsistent_flags_never_interrupt_exploration(monitor, source, fields):
     monitor.status(goal_status())
     monitor.phase()
     monitor.detection(source, **fields)
@@ -159,7 +163,7 @@ def test_freshness_boundaries_are_inclusive(monitor, acquired):
     assert len(monitor._request_publisher.messages) == 1
 
 
-def test_one_request_per_exploration_despite_repeated_and_simultaneous_detections(monitor):
+def test_requests_are_throttled_despite_repeated_and_simultaneous_detections(monitor):
     monitor.status(goal_status())
     monitor.phase()
     monitor.detection('smoke')
@@ -177,6 +181,24 @@ def test_one_request_per_exploration_despite_repeated_and_simultaneous_detection
     monitor.detection('fire')
     assert len(monitor._request_publisher.messages) == 2
     assert monitor._request_publisher.messages[1].goal_id == UUID(uuid=[2] * 16)
+
+
+def test_ignored_completed_source_does_not_latch_out_later_new_source(monitor):
+    monitor.status(goal_status())
+    monitor.phase()
+    monitor.detection('fire')
+    monitor.monotonic_seconds = monitor.config['request_retry_interval'] - 0.01
+    monitor.seconds += 0.1
+    monitor.detection('smoke')
+    assert len(monitor._request_publisher.messages) == 1
+    monitor.monotonic_seconds += 0.01
+    monitor.detection('smoke')
+    assert len(monitor._request_publisher.messages) == 2
+    assert len(monitor.logs) == 1
+    monitor.phase('Verify', sequence=2)
+    monitor.monotonic_seconds += 10.0
+    monitor.detection('fire')
+    assert len(monitor._request_publisher.messages) == 2
 
 
 @pytest.mark.parametrize('terminal', [
@@ -266,7 +288,7 @@ def test_zero_acceptance_stamp_still_requires_a_fresh_initialized_source_image(m
 
 
 @pytest.mark.parametrize('source', ['smoke', 'fire'])
-def test_source_image_on_goal_acceptance_tick_cannot_stop_the_goal(monitor, source):
+def test_source_image_on_goal_acceptance_tick_cannot_interrupt_the_goal(monitor, source):
     monitor.status(goal_status(accepted=20.0))
     monitor.phase()
     monitor.detection(source, acquired=20.0)
@@ -325,6 +347,9 @@ def test_verify_disables_requests_and_new_exploration_rearms_with_new_images(mon
     assert len(monitor._request_publisher.messages) == 1
     monitor.detection('fire')
     assert len(monitor._request_publisher.messages) == 2
+    assert all(message.state == 'Verify' for message in monitor._request_publisher.messages)
+    assert all(message.goal_id == UUID(uuid=[1] * 16)
+               for message in monitor._request_publisher.messages)
 
 
 def test_verify_cannot_be_overridden_by_old_phase_sequence_or_other_goal(monitor):

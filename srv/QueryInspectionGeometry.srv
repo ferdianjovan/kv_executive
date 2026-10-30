@@ -1,0 +1,58 @@
+# Empty direction or ground_query frame skips that query. An empty corridor
+# requests geometry only. All nonempty inputs must resolve into the map frame.
+geometry_msgs/PointStamped origin
+geometry_msgs/Vector3Stamped direction
+float64 max_range
+geometry_msgs/PointStamped ground_query
+nav_msgs/Path corridor
+geometry_msgs/PointStamped keepout_center
+float64 minimum_radius
+float64 minimum_agl
+geometry_msgs/Vector3Stamped keepout_axis
+bool allow_initial_climb
+# Flight revalidation only: bounded measured tracking drift around the fixed
+# horizontal climb axis. Planning itself always uses zero tolerance.
+float64 initial_climb_tracking_tolerance
+# Use a conservative observed terrain/canopy envelope rather than a flat support patch.
+# ground_query then estimates the highest observed surface below its supplied z;
+# that estimate does not certify unknown space above it as free. Corridor checks
+# still enforce the planner's configured unknown-air policy and measured terrain clearance.
+bool terrain_envelope
+# Permit an initial collision-checked terrain escape within 2 m horizontal radius,
+# with nondecreasing height/clearance until minimum_agl is reached.
+bool allow_terrain_escape
+# Anchor the initial escape to the original planned start across flight queries.
+# Empty frame preserves the first-corridor-vertex convention.
+geometry_msgs/PointStamped escape_origin
+# Once actual odometry has proved minimum_agl, no later query may reopen escape.
+bool terrain_escape_complete
+---
+uint8 OK=0
+uint8 MAP_UNAVAILABLE=1
+uint8 INVALID_REQUEST=2
+uint8 TRANSFORM_ERROR=3
+bool success
+uint8 error_code
+string message
+std_msgs/Header map_header
+bool surface_valid
+geometry_msgs/PointStamped surface
+float64 surface_range
+float64 surface_uncertainty
+# Temporal inconsistency is a suspected plume cue, never permission to fly
+# through occupied space, or unknown space when strict mode is selected.
+bool plume_candidate
+uint32 occupied_samples
+uint32 free_samples
+bool ground_valid
+# An observed support surface may be canopy rather than bare ground.
+geometry_msgs/PointStamped ground_surface
+float64 ground_uncertainty
+bool corridor_safe
+# The first corridor vertex alone passes the configured body/terrain checks.
+# This remains meaningful when a later corridor segment is rejected.
+bool current_clearance_reached
+# Source-image-stamped camera ray transformed into the map frame. Valid even
+# when no obstacle is hit; obstacle surfaces do not establish source identity.
+geometry_msgs/PointStamped ray_origin
+geometry_msgs/Vector3Stamped ray_direction

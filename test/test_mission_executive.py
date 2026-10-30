@@ -19,7 +19,7 @@ from kv_executive.mission_geometry import (
 )
 from kv_executive.msg import BatteryReturnEstimate, MissionStateRequest
 from kv_executive.srv import PlanPath
-from kv_executive.verification import VERIFY_DEFAULTS
+from kv_executive.verification import VERIFY_DEFAULTS, VerifyController
 from mavros_msgs.msg import State as VehicleState
 from mavros_msgs.srv import CommandBool, ParamPull, SetMode
 from nav_msgs.msg import Odometry, Path
@@ -91,6 +91,10 @@ class Harness:
     _check_motion_observation = MissionExecutive._check_motion_observation
     _verify_parent_entry = MissionExecutive._verify_parent_entry
     _exploration_parent_entry = MissionExecutive._exploration_parent_entry
+    _verify_reset_source_localization = MissionExecutive._verify_reset_source_localization
+    _verify_request_is_completed = MissionExecutive._verify_request_is_completed
+    _verify_defer_viewpoint = MissionExecutive._verify_defer_viewpoint
+    _verify_request_is_deferred = MissionExecutive._verify_request_is_deferred
     _goal_callback = MissionExecutive._goal_callback
     _goal_accepted_callback = MissionExecutive._goal_accepted_callback
     request_mission_state = MissionExecutive.request_mission_state
@@ -136,6 +140,7 @@ class Harness:
         self._mission_started_ns = 122_000_000_000
         self._requested_mission_state = None
         self._parent_state = None
+        self._verify_retry_after = 0.0
         self._airborne_ready = True
         self._motion_guard = None
         self._phase_sequence = 0
@@ -162,6 +167,7 @@ class Harness:
         self._mode_client = object()
         self._arming_client = object()
         self._planning_client = object()
+        self._verify = VerifyController(self, error_type=MissionError)
 
     def get_clock(self):
         return SimpleNamespace(now=lambda: SimpleNamespace(
@@ -445,6 +451,10 @@ class SequenceExecutive:
         self.reports = []
         self._last_error = ''
         self._airborne_ready = False
+        self._verify = SimpleNamespace(
+            approach_smoke=lambda bb: 'reacquire', reacquire=lambda bb: 'explore',
+            center_fire=lambda bb: 'explore', search_fire=lambda bb: 'approach',
+        )
 
     def _exploration_parent_entry(self, blackboard):
         self._check_running()
@@ -481,8 +491,9 @@ def test_actual_yasmin_machine_nests_exploration_and_repeats_without_takeoff():
     blackboard = Blackboard()
     machine = build_state_machine(fake)
     assert machine.get_start_state() == 'Exploration'
-    assert set(machine.get_states()) == {'Exploration'}
-    assert machine.get_transitions()['Exploration']['verify_requested'] == 'verify_requested'
+    assert set(machine.get_states()) == {'Exploration', 'Verify'}
+    assert machine.get_transitions()['Exploration']['verify_requested'] == 'Verify'
+    assert machine.get_transitions()['Verify']['explore'] == 'Exploration'
     exploration = machine.get_states()['Exploration']['state']
     assert isinstance(exploration, ExplorationStateMachine)
     assert exploration.get_start_state() == 'ENTER_EXPLORATION'
@@ -680,8 +691,8 @@ def test_cancel_during_arming_observes_armed_ack_before_recovery(harness):
 
 
 @pytest.mark.parametrize('state', ['Return', 'Verify'])
-def test_transition_during_arming_waits_for_ack_before_interrupting(harness, state):
-    configure_takeoff_services(harness)
+def test_transition_during_arming_waits_for_safe_handoff(harness, state):
+    height = configure_takeoff_services(harness)
     harness._goal_handle = Goal()
     call = harness._call
 
@@ -698,7 +709,12 @@ def test_transition_during_arming_waits_for_ack_before_interrupting(harness, sta
     assert harness.state.armed
     assert harness.state.mode == 'AUTO.TAKEOFF'
     assert not harness._command_inflight
-    assert harness.odometry.pose.pose.position.z < 14.0
+    if state == 'Verify':
+        assert harness._airborne_ready
+        assert harness.odometry.pose.pose.position.z >= 10 + height - 0.3
+    else:
+        assert not harness._airborne_ready
+        assert harness.odometry.pose.pose.position.z < 14.0
 
 
 def test_operator_arming_during_parameter_fetch_stops_takeoff_before_mode_change(harness):
@@ -1580,18 +1596,56 @@ def test_abort_cannot_be_downgraded_to_another_state_request(harness, first):
     assert harness._requested_mission_state == 'Abort'
 
 
-def test_dormant_verify_cannot_be_entered_or_publish_a_phase(harness):
+def test_verify_entry_consumes_request_stops_motion_and_publishes_phase(harness):
     harness._goal_handle = Goal(skip_takeoff=True)
     harness._owns_flight = True
     harness.state.mode = 'OFFBOARD'
     assert harness.request_mission_state('Verify')
 
-    with pytest.raises(MissionError, match='Verify is dormant'):
+    harness._verify_parent_entry('Verify')
+
+    assert harness._parent_state == 'Verify'
+    assert harness._requested_mission_state is None
+    assert harness.state.mode == 'AUTO.LOITER'
+    phase = next(event[1] for event in harness.events if event[0] == 'phase')
+    assert phase.state == 'Verify'
+    assert not harness.request_mission_state('Verify')
+    harness._check_running()
+    assert harness._goal_handle.is_active
+
+
+@pytest.mark.parametrize('state,exception', [
+    ('Return', MissionStateRequested), ('Abort', MissionAbortRequested),
+])
+def test_stop_request_supersedes_verify_before_parent_entry(harness, state, exception):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness.request_mission_state('Verify')
+    harness.request_mission_state(state)
+
+    with pytest.raises(exception):
         harness._verify_parent_entry('Verify')
 
-    assert harness._parent_state is None
+    assert harness._requested_mission_state == state
     assert not any(event[0] == 'phase' for event in harness.events)
-    assert harness._goal_handle.is_active
+
+
+def test_verify_entry_requires_confirmed_loiter_before_publishing_phase(harness):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._owns_flight = True
+    harness.state.mode = 'OFFBOARD'
+    harness.request_mission_state('Verify')
+
+    def reject_loiter():
+        raise MissionError('mode refused')
+
+    harness._loiter = reject_loiter
+    with pytest.raises(MissionError):
+        harness._verify_parent_entry('Verify')
+
+    assert harness.state.mode == 'OFFBOARD'
+    assert harness._target == harness.odometry.pose.pose
+    assert not any(event[0] == 'phase' for event in harness.events)
+    assert not harness._recovering
 
 
 def test_pending_return_interrupts_exploration_parent_entry(harness):
@@ -1619,20 +1673,292 @@ def test_parent_phase_requires_initialized_ros_clock_before_takeoff(harness):
     assert not any(event[0] in {'phase', 'service'} for event in harness.events)
 
 
-def test_exploration_phase_publishes_without_verify_runtime(harness):
+def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     harness._goal_handle = Goal(skip_takeoff=True)
     harness._parent_state = 'Verify'
     harness._phase_sequence = 2
     blackboard = Blackboard()
+    blackboard['verify_entered'] = True
+    blackboard['verify_approaches'] = 8
+    blackboard['verify_smoke_approach_completed'] = True
+    blackboard['verify_smoke_approach_after_ns'] = 99_000_000_000
+    blackboard['verify_reference_pose'] = make_pose(100, 100, 100)
+    blackboard['verify_smoke_bearing'] = 0.7
+    blackboard['verify_arrival_after_ns'] = 100_000_000_000
+    blackboard['verify_viewpoint_required'] = True
 
     harness._exploration_parent_entry(blackboard)
     harness._takeoff(blackboard)
 
-    assert not hasattr(harness, '_verify')
+    assert not blackboard['verify_entered']
+    assert blackboard['verify_approaches'] == 0
+    assert not blackboard['verify_smoke_approach_completed']
+    assert blackboard['verify_smoke_approach_after_ns'] == 0
+    assert blackboard['verify_reference_pose'] is None
+    assert blackboard['verify_smoke_bearing'] is None
+    assert blackboard['verify_arrival_after_ns'] == 0
+    assert not blackboard['verify_viewpoint_required']
+    assert harness._verify_retry_after == 0.0
     phase = next(event[1] for event in harness.events if event[0] == 'phase')
     assert phase.state == 'Exploration'
     assert phase.sequence == 3
     assert not any(event[0] == 'service' for event in harness.events)
+
+
+def test_failed_verify_defers_repeat_detection_only_until_retry_deadline(harness):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._parent_state = 'Verify'
+    board = Blackboard()
+    board['verify_exploration_required'] = True
+    board['verify_approaches'] = 3
+
+    harness._exploration_parent_entry(board)
+
+    assert harness._parent_state == 'Exploration'
+    deadline = harness.config['verify_retry_cooldown']
+    assert harness._verify_retry_after == deadline
+    assert not board['verify_exploration_required']
+    assert board['verify_approaches'] == 0
+    assert harness.request_mission_state('Verify')
+    harness._check_running()
+    assert harness._requested_mission_state == 'Verify'
+    harness._stop.clock.now = deadline
+    with pytest.raises(MissionStateRequested) as request:
+        harness._check_running()
+    assert request.value.state == 'Verify'
+    assert harness._verify_retry_after == 0.0
+    assert not any(event[0] == 'ramp' for event in harness.events)
+
+
+def test_inconclusive_verify_defers_source_before_exploration_resets_guidance(harness):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._parent_state = 'Verify'
+    board = Blackboard()
+    board['verify_exploration_required'] = True
+    board['verify_smoke_bearing'] = 0.7
+    deferred = []
+
+    def remember_viewpoint():
+        deferred.append((harness._parent_state, board['verify_smoke_bearing']))
+        return True
+
+    harness._verify_defer_viewpoint = remember_viewpoint
+    harness._exploration_parent_entry(board)
+
+    assert deferred == [('Verify', 0.7)]
+    assert harness._parent_state == 'Exploration'
+    assert board['verify_smoke_bearing'] is None
+
+
+def test_normal_exploration_entry_does_not_defer_uninspected_source(harness):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._parent_state = 'Verify'
+    harness._verify_defer_viewpoint = lambda: pytest.fail('No inconclusive search occurred')
+
+    harness._exploration_parent_entry(Blackboard())
+
+    assert harness._parent_state == 'Exploration'
+
+
+def test_pending_automatic_verify_is_rechecked_after_viewpoint_becomes_deferred(
+        harness, monkeypatch):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._parent_state = 'Exploration'
+    deferred = [False]
+    monkeypatch.setattr(
+        executive_module.CompletedSitesMixin, '_verify_request_is_deferred',
+        lambda _self, _goal_id: deferred[0])
+    assert harness.request_mission_state('Verify', goal_id=harness._goal_handle.goal_id)
+
+    deferred[0] = True
+    harness._check_running()
+
+    assert harness._requested_mission_state is None
+    assert not harness._requested_verify_automatic
+    assert harness._parent_state == 'Exploration'
+
+
+def test_pending_manual_verify_never_uses_automatic_dispatch_veto(harness, monkeypatch):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._parent_state = 'Exploration'
+    assert harness.request_mission_state('Verify')
+
+    def unexpected_veto(*_args):
+        pytest.fail('Manual Verify must bypass the automatic source association')
+
+    monkeypatch.setattr(
+        executive_module.CompletedSitesMixin, '_verify_request_is_deferred', unexpected_veto)
+
+    with pytest.raises(MissionStateRequested) as request:
+        harness._check_running()
+
+    assert request.value.state == 'Verify'
+    assert harness._requested_mission_state == 'Verify'
+    assert not harness._requested_verify_automatic
+
+
+@pytest.mark.parametrize('replacement', ['new_goal', 'manual'])
+def test_dispatch_recheck_cannot_clear_a_replacement_verify_request(
+        harness, monkeypatch, replacement):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._parent_state = 'Exploration'
+    assert harness.request_mission_state('Verify', goal_id=harness._goal_handle.goal_id)
+
+    def source_association(_self, goal_id):
+        assert tuple(goal_id.uuid) == (1,) * 16
+        if replacement == 'new_goal':
+            harness._goal_handle = Goal(skip_takeoff=True)
+            harness._goal_handle.goal_id = UUID(uuid=[2] * 16)
+        else:
+            harness._requested_verify_automatic = False
+        return True
+
+    monkeypatch.setattr(
+        executive_module.CompletedSitesMixin, '_verify_request_is_deferred', source_association)
+
+    with pytest.raises(MissionStateRequested) as request:
+        harness._check_running()
+
+    assert request.value.state == 'Verify'
+    assert harness._requested_mission_state == 'Verify'
+    assert harness._requested_verify_automatic == (replacement == 'new_goal')
+
+
+@pytest.mark.parametrize('state', ['Abort', 'Return'])
+def test_dispatch_source_association_cannot_erase_a_new_higher_priority_request(
+        harness, monkeypatch, state):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._parent_state = 'Exploration'
+    assert harness.request_mission_state('Verify', goal_id=harness._goal_handle.goal_id)
+
+    def source_association(_self, _goal_id):
+        assert harness.request_mission_state(state)
+        return True
+
+    monkeypatch.setattr(
+        executive_module.CompletedSitesMixin, '_verify_request_is_deferred', source_association)
+    exception = MissionAbortRequested if state == 'Abort' else MissionStateRequested
+
+    with pytest.raises(exception):
+        harness._check_running()
+
+    assert harness._requested_mission_state == state
+    assert not harness._requested_verify_automatic
+
+
+def test_retry_deadline_interrupts_first_sweep_turn_without_waiting_for_path(motion_harness):
+    harness = motion_harness
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._parent_state = 'Verify'
+    board = Blackboard()
+    board['verify_exploration_required'] = True
+    harness._exploration_parent_entry(board)
+    deadline = harness._verify_retry_after
+
+    def detect_during_sweep():
+        if harness._stop.clock.now >= 0.5:
+            assert harness.request_mission_state('Verify')
+
+    harness._stop.on_wait = detect_during_sweep
+
+    with pytest.raises(MissionStateRequested) as request:
+        harness._sweep(Blackboard())
+
+    assert request.value.state == 'Verify'
+    assert deadline <= harness._stop.clock.now <= deadline + 0.1
+    assert harness._requested_mission_state == 'Verify'
+    assert harness._verify_retry_after == 0.0
+    assert len([event for event in harness.events if event[0] == 'ramp_started']) == 1
+    assert not any(event[0] == 'ramp_finished' for event in harness.events)
+    assert not any(event[0] == 'service' for event in harness.events)
+
+
+def test_finishing_a_short_path_does_not_clear_retry_delay_early(harness):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._parent_state = 'Exploration'
+    deadline = harness.config['verify_retry_cooldown']
+    harness._verify_retry_after = deadline
+    assert harness.request_mission_state('Verify')
+    path = Path(header=Header(frame_id='px4_odom'), poses=[
+        PoseStamped(pose=make_pose(1, 2, 3)),
+        PoseStamped(pose=make_pose(7, 2, 3)),
+    ])
+    harness._call = lambda *args, **kwargs: PlanPath.Response(success=True, path=path)
+    harness._execute_path(Blackboard())
+
+    assert harness._verify_retry_after == deadline
+    assert harness.state.mode == 'AUTO.LOITER'
+    assert harness._requested_mission_state == 'Verify'
+    harness._check_running()
+    harness._stop.clock.now = deadline
+    with pytest.raises(MissionStateRequested) as request:
+        harness._check_running()
+    assert request.value.state == 'Verify'
+
+
+@pytest.mark.parametrize('failure', ['first_leg', 'destination_loiter'])
+def test_retry_deadline_is_independent_of_incomplete_exploration(harness, failure):
+    harness._goal_handle = Goal(skip_takeoff=True)
+    harness._parent_state = 'Exploration'
+    deadline = harness.config['verify_retry_cooldown']
+    harness._verify_retry_after = deadline
+    assert harness.request_mission_state('Verify')
+    path = Path(header=Header(frame_id='px4_odom'), poses=[
+        PoseStamped(pose=make_pose(1, 2, 3)),
+        PoseStamped(pose=make_pose(7, 2, 3)),
+    ])
+    harness._call = lambda *args, **kwargs: PlanPath.Response(success=True, path=path)
+    report = harness._report
+
+    def fail_after_first_leg(message, error=False):
+        report(message, error)
+        if message == 'EXECUTE_PATH: sub-path 1/3 done':
+            raise MissionError('Controlled incomplete Exploration path')
+
+    def fail_destination_loiter():
+        raise MissionError('Controlled incomplete Exploration path')
+
+    if failure == 'first_leg':
+        harness._report = fail_after_first_leg
+    else:
+        harness._loiter = fail_destination_loiter
+
+    with pytest.raises(MissionError, match='Controlled incomplete Exploration path'):
+        harness._execute_path(Blackboard())
+
+    assert harness._verify_retry_after == deadline
+    assert harness._requested_mission_state == 'Verify'
+    harness._check_running()
+    if failure == 'first_leg':
+        assert xyz(harness.odometry.pose.pose) != pytest.approx((7, 2, 3))
+    harness._stop.clock.now = deadline
+    with pytest.raises(MissionStateRequested) as request:
+        harness._check_running()
+    assert request.value.state == 'Verify'
+
+
+@pytest.mark.parametrize('interruption', ['cancel', 'Abort', 'Return'])
+def test_verify_retry_cooldown_preserves_stop_request_priority(harness, interruption):
+    goal = Goal(skip_takeoff=True)
+    harness._goal_handle = goal
+    harness._parent_state = 'Exploration'
+    harness._verify_retry_after = harness.config['verify_retry_cooldown']
+    assert harness.request_mission_state('Verify')
+    harness._check_running()
+    if interruption == 'cancel':
+        goal.is_cancel_requested = True
+        exception = MissionCanceled
+    else:
+        assert harness.request_mission_state(interruption)
+        exception = MissionAbortRequested if interruption == 'Abort' else MissionStateRequested
+
+    with pytest.raises(exception) as stopped:
+        harness._wait_until(lambda: False, 10.0, 'Exploration motion')
+
+    if interruption == 'Return':
+        assert stopped.value.state == 'Return'
+    assert harness._verify_retry_after == harness.config['verify_retry_cooldown']
+    assert harness._stop.clock.now == 0.0
 
 
 def test_state_request_topic_uses_same_transition_entry_point(harness):
@@ -1657,12 +1983,14 @@ def test_goal_state_request_rejects_previous_goal_uuid(harness, state):
 
 def test_new_goal_clears_previous_state_request(harness):
     harness._requested_mission_state = 'Return'
+    harness._verify_retry_after = 10.0
     executed = []
     goal = SimpleNamespace(execute=lambda: executed.append(True))
 
     harness._goal_accepted_callback(goal)
 
     assert harness._requested_mission_state is None
+    assert harness._verify_retry_after == 0.0
     assert harness._goal_handle is goal
     assert executed == [True]
 
@@ -1698,7 +2026,7 @@ def test_return_supersedes_verify_between_machine_exit_and_recovery(harness, mon
     assert not harness._mission_lock.locked()
 
 
-@pytest.mark.parametrize('state', ['Abort', 'Return', 'Verify'])
+@pytest.mark.parametrize('state', ['Abort', 'Return'])
 @pytest.mark.parametrize('loiter_acknowledged', [True, False])
 def test_stop_request_aborts_recovers_and_clears_request(
     harness, state, loiter_acknowledged,
@@ -1729,7 +2057,6 @@ def test_stop_request_aborts_recovers_and_clears_request(
     expected = {
         'Abort': 'aborted by a monitor request',
         'Return': 'Return is not implemented',
-        'Verify': 'Verify is dormant',
     }[state]
     assert expected in result.message
     assert harness._requested_mission_state is None

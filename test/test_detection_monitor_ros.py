@@ -1,13 +1,11 @@
-"""Confirmed observations abort Exploration through DDS and recover LOITER."""
+"""Confirmed DDS observations enter Verify within the executing mission goal."""
 
-from copy import deepcopy
 import threading
 import time
 
 from action_msgs.msg import GoalStatus
 from kv_executive.detection_monitor import DetectionMonitor
-from kv_executive.mission_geometry import yaw_from_quaternion
-from kv_executive.msg import FireSourceReport, MissionPhase, MissionStateRequest
+from kv_executive.msg import MissionPhase, MissionStateRequest
 from kv_perception.msg import FireDetection, SmokeDetection
 import pytest
 from rclpy.qos import DurabilityPolicy, QoSProfile
@@ -15,7 +13,7 @@ from rclpy.time import Time
 from std_msgs.msg import Header
 
 from test_mission_action import (  # noqa: F401
-    mission, mission_result, prepare_airborne, received_state, send_goal, wait_for,
+    cancel_goal, mission, prepare_airborne, received_state, send_goal, wait_for,
 )
 
 
@@ -92,14 +90,14 @@ def source_time(flight, monitor):
     return flight.executive.get_clock().now()
 
 
-def assert_aborted_in_loiter(flight, goal):
+def assert_canceled_in_loiter(flight, goal):
     """Recovery must finish before releasing the action's exclusive goal slot."""
     started = time.monotonic()
-    result = mission_result(goal)
+    result = cancel_goal(goal)
     assert time.monotonic() - started < 8.0
-    assert result.status == GoalStatus.STATUS_ABORTED
+    assert result.status == GoalStatus.STATUS_CANCELED
     assert not result.result.success
-    assert 'abort' in result.result.message.lower()
+    assert 'cancel' in result.result.message.lower()
     assert not flight.executive._mission_lock.locked()
     assert flight.executive._state_machine is None
     with flight.fcu.lock:
@@ -107,12 +105,11 @@ def assert_aborted_in_loiter(flight, goal):
         assert flight.fcu.state.armed
         assert not {'AUTO.RTL', 'AUTO.LAND'} & set(flight.fcu.mode_requests)
         assert not flight.fcu.offboard_losses
-        assert not flight.fcu.target_requests
 
 
 @pytest.mark.parametrize('source', ['smoke', 'fire'])
 @pytest.mark.parametrize('mission', [True], indirect=True, ids=['sim_clock'])
-def test_confirmed_detection_aborts_exploration_and_next_goal_requires_new_images(
+def test_confirmed_detection_enters_verify_and_next_goal_requires_new_images(
     mission, source,  # noqa: F811
 ):
     executive, fcu = mission.executive, mission.fcu
@@ -124,21 +121,7 @@ def test_confirmed_detection_aborts_exploration_and_next_goal_requires_new_image
     monitor, publishers, requests, phases = attach_monitor(mission)
     assert monitor.get_parameter('use_sim_time').value
 
-    # A previously recorded fire must never mask an abort in the dormant mode.
-    known_fire_publisher = fcu.create_publisher(
-        FireSourceReport, 'fire_sources',
-        QoSProfile(depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL),
-    )
-    with fcu.lock:
-        known_fire = FireSourceReport(
-            site_id=1, label='Fire source found', exclusion_radius=100.0,
-            bearing_rad=yaw_from_quaternion(fcu.pose.orientation),
-        )
-        known_fire.local_pose.header.frame_id = 'px4_odom'
-        known_fire.local_pose.pose = deepcopy(fcu.pose)
-    known_fire_publisher.publish(known_fire)
-
-    # A confirmed observation while idle cannot stop a later action.
+    # A confirmed observation while idle cannot interrupt a later action.
     publishers[source].publish(observation(source, source_time(mission, monitor).to_msg()))
     prepare_airborne(mission)
     goal = send_goal(mission, skip_takeoff=True)
@@ -170,12 +153,25 @@ def test_confirmed_detection_aborts_exploration_and_next_goal_requires_new_image
 
     old_frame = observation(source, source_time(mission, monitor).to_msg())
     publishers[source].publish(old_frame)
-    wait_for(lambda: len(requests) == 1, 2.0, 'one goal-scoped Abort request')
-    assert requests[0].state == 'Abort'
+    wait_for(lambda: len(requests) == 1, 2.0, 'one goal-scoped Verify request')
+    assert requests[0].state == 'Verify'
     assert tuple(requests[0].goal_id.uuid) == goal_id
-    assert_aborted_in_loiter(mission, goal)
+    wait_for(
+        lambda: monitor._phase_state == 'Verify'
+        and any(phase.state == 'Verify' and tuple(phase.goal_id.uuid) == goal_id
+                for phase in phases),
+        5.0, 'Verify entered for the same mission action',
+    )
+    assert monitor._active_goal_id == goal_id
+    assert not result_future.done()
+    assert executive._mission_lock.locked()
+    # Neither source can issue another request while Verify owns the mission.
+    for other_source, publisher in publishers.items():
+        publisher.publish(observation(other_source, source_time(mission, monitor).to_msg()))
+    threading.Event().wait(0.1)
+    assert len(requests) == 1
+    assert_canceled_in_loiter(mission, goal)
     wait_for(lambda: monitor._active_goal_id is None, 3.0, 'terminal goal status at monitor')
-    assert all(phase.state == 'Exploration' for phase in phases)
 
     # Observations while idle cannot leave an outstanding flag for the next goal.
     for other_source, publisher in publishers.items():
@@ -200,17 +196,24 @@ def test_confirmed_detection_aborts_exploration_and_next_goal_requires_new_image
              8.0, 'next Exploration starts without an old detection flag')
     wait_for(lambda: len(requests) == 2, 2.0, 'delayed request delivery')
     wait_for(
-        lambda: any(text == "MISSION: ignored goal state request 'Abort'"
+        lambda: any(text == "MISSION: ignored goal state request 'Verify'"
                     for _, text in fcu.statuses),
         3.0, 'executive rejects the previous goal request',
     )
     assert not second_goal.get_result_async().done()
     assert all(tuple(request.goal_id.uuid) == goal_id for request in requests)
+    assert monitor._phase_state == 'Exploration'
 
-    # Only a fresh confirmed image for this new action can stop it.
+    # Only a fresh confirmed image for this action can enter Verify again.
     publishers[source].publish(observation(source, source_time(mission, monitor).to_msg()))
-    wait_for(lambda: len(requests) == 3, 3.0, 'fresh image triggers the second action abort')
-    assert requests[-1].state == 'Abort'
+    wait_for(lambda: len(requests) == 3, 3.0, 'fresh image triggers Verify for the new action')
+    assert requests[-1].state == 'Verify'
     assert tuple(requests[-1].goal_id.uuid) == second_id
-    assert_aborted_in_loiter(mission, second_goal)
-    assert all(phase.state == 'Exploration' for phase in phases)
+    wait_for(
+        lambda: monitor._phase_state == 'Verify'
+        and any(phase.state == 'Verify' and tuple(phase.goal_id.uuid) == second_id
+                for phase in phases),
+        5.0, 'Verify entered for the second action',
+    )
+    assert not second_goal.get_result_async().done()
+    assert_canceled_in_loiter(mission, second_goal)

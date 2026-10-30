@@ -10,7 +10,11 @@ from kv_executive.mission_geometry import (
     angular_distance, interpolate_pose, quaternion_from_yaw, relative_transform,
     split_path, transform_pose, yaw_from_quaternion,
 )
-from kv_executive.verification import VerificationObservationLost
+from kv_executive.verification import (
+    VerificationMapUnavailable, VerificationObservationLost,
+    VerificationRecoveryUnavailable, VerificationStartUnavailable,
+)
+from nav_msgs.msg import Path
 from sensor_msgs.msg import NavSatFix, NavSatStatus
 
 
@@ -96,19 +100,30 @@ class VerifyNavigationMixin:
             self._loiter()
 
     def _verify_hold(self, duration, guard=None):
-        """Hold a level position for a measured dwell, then finish in LOITER."""
+        """Observe for a full measured dwell after AUTO.LOITER is confirmed."""
         from kv_executive.mission_executive import MissionError
         if not math.isfinite(duration) or duration <= 0.0:
             raise MissionError('Verify hold duration must be finite and positive')
         with self._verify_guarded(guard):
-            current = self._verify_offboard()
-            current.orientation = quaternion_from_yaw(yaw_from_quaternion(current.orientation))
-            self._set_target(current)
-            self._wait_at_pose(current, hold_duration=duration)
-            self._loiter()
+            state, _ = self._verify_control_pose()
+            if state.mode == 'OFFBOARD':
+                self._loiter()
+            self._snapshot('AUTO.LOITER', require_armed=True)
+            deadline = time.monotonic() + duration
+            while True:
+                self._check_running()
+                self._snapshot('AUTO.LOITER', require_armed=True)
+                if guard:
+                    guard()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                self._stop.wait(min(0.05, remaining))
 
-    def _verify_plan_to(self, target_local_pose, guard=None, speed=None):
-        """Validate a target plan, retain its vertices, and fly in short ramps."""
+    def _verify_plan_to(self, target_local_pose, guard=None, speed=None,
+                        allow_plan_failure=False, look_at_point=None, path_validator=None,
+                        planning_client=None, request_builder=None, heading_provider=None):
+        """Fly a validated plan; optionally decline an unavailable candidate."""
         from kv_executive.mission_executive import MissionError
         from kv_executive.srv import PlanToPose
         speed = self.config['verify_motion_speed'] if speed is None else speed
@@ -118,22 +133,70 @@ class VerifyNavigationMixin:
         target.orientation = quaternion_from_yaw(yaw_from_quaternion(target.orientation))
         if target.position.z < self.config['verify_minimum_altitude']:
             raise MissionError('Verify target is below the configured minimum altitude')
+
+        def heading_at(pose):
+            if heading_provider is not None:
+                yaw = heading_provider(pose)
+                if yaw is not None:
+                    if not math.isfinite(yaw):
+                        raise MissionError('Verify camera guidance returned an invalid heading')
+                    return quaternion_from_yaw(yaw)
+            if look_at_point is None:
+                return deepcopy(target.orientation)
+            dx = look_at_point.x - pose.position.x
+            dy = look_at_point.y - pose.position.y
+            if not all(math.isfinite(value) for value in (dx, dy)):
+                raise MissionError('Inspection path cannot face an invalid target')
+            if math.hypot(dx, dy) < 0.01:
+                return deepcopy(target.orientation)  # A source directly below has no azimuth.
+            return quaternion_from_yaw(math.atan2(dy, dx))
+
+        def validated(poses):
+            if path_validator is None:
+                return True
+            candidate = Path()
+            candidate.header.frame_id = self.config['local_frame']
+            candidate.poses = [PoseStamped(header=deepcopy(candidate.header), pose=deepcopy(pose))
+                               for pose in poses]
+            return bool(path_validator(candidate))
+
         with self._verify_guarded(guard):
             _, current = self._verify_control_pose()
             frame = self.config['verify_planning_frame']
             conversion = self._path_frame_transform(frame)
-            request = PlanToPose.Request()
-            request.target = PoseStamped()
-            request.target.header.frame_id = frame
-            request.target.pose = transform_pose(target, _inverse(conversion))
+            map_from_local = _inverse(conversion)
+            stamped_target = PoseStamped()
+            stamped_target.header.frame_id = frame
+            stamped_target.pose = transform_pose(target, map_from_local)
+            if request_builder is None:
+                request = PlanToPose.Request()
+                request.target = stamped_target
+            else:
+                request = request_builder(stamped_target, map_from_local)
             response = self._call(
-                self._target_planning_client, request, 'Plan Verify target',
+                self._target_planning_client if planning_client is None else planning_client,
+                request, 'Plan Verify target',
                 timeout=self.config['planning_timeout'],
             )
             self._verify_control_pose()
             if guard:
                 guard()
             if not response.success:
+                if getattr(response, 'error_code', 0) == 1:
+                    raise VerificationMapUnavailable(
+                        f'Inspection planning map unavailable: {response.message}',
+                        getattr(self, '_verify_last_geometry_stamp_ns', 0))
+                if getattr(response, 'error_code', 0) == 6:
+                    raise VerificationRecoveryUnavailable(
+                        f'No observed-free clearance recovery: {response.message}')
+                if getattr(response, 'error_code', 0) == 4:
+                    raise VerificationStartUnavailable(
+                        f'Verify current clearance unavailable: {response.message}')
+                if getattr(response, 'error_code', 0) in (2, 3):
+                    raise MissionError(f'Verify planner failed: {response.message}')
+                if allow_plan_failure:
+                    self._report(f'Verify: candidate unavailable: {response.message}')
+                    return False
                 raise MissionError(f'Verify planner failed: {response.message}')
             path = response.path
             if path.header.frame_id != frame:
@@ -148,15 +211,30 @@ class VerifyNavigationMixin:
             if any(pose.position.z < self.config['verify_minimum_altitude'] for pose in vertices):
                 raise MissionError('Verify path drops below the configured minimum altitude')
             _, current = self._verify_control_pose()
-            if _distance(vertices[0], current) > self.config['position_tolerance']:
+            planned_start = deepcopy(vertices[0])
+            if _distance(planned_start, current) > self.config['position_tolerance']:
                 raise MissionError('Vehicle moved from the Verify planned start')
+            if (path_validator is not None and getattr(request, 'allow_initial_climb', False)
+                    and len(vertices) > 1):
+                # The original start is a planning anchor, not an ascent
+                # waypoint. Returning to it after upward drift would command a
+                # descent below the required clearance. The actual→next-leg
+                # connector remains subject to every corridor validator.
+                vertices = vertices[1:]
+            if not validated([current, *vertices]):
+                self._report('Verify: inspection path lacks required clearance or range evidence')
+                return False
             self.latest_path = deepcopy(path)
             current = self._verify_offboard()
-            if _distance(vertices[0], current) > self.config['position_tolerance']:
+            if _distance(planned_start, current) > self.config['position_tolerance']:
                 raise MissionError('Vehicle moved from Verify planned start during warmup')
+            if not validated([current, *vertices]):
+                self._loiter()
+                self._report('Verify: inspection path became unavailable during warmup')
+                return False
             # Preserve the requested camera heading throughout a detour. The
             # planner's arbitrary per-vertex orientations are not camera guidance.
-            heading = deepcopy(target.orientation)
+            heading = heading_at(current)
             facing = deepcopy(current)
             facing.orientation = heading
             turn = abs(angular_distance(
@@ -171,19 +249,40 @@ class VerifyNavigationMixin:
             # far a stale camera observation can advance the commanded position.
             spacing = min(self.config.get('verify_path_step', 0.25),
                           speed / self.config['setpoint_rate'])
-            for vertex in vertices:
-                vertex.orientation = deepcopy(heading)
+            last_validation = time.monotonic()
+            for vertex_index, vertex in enumerate(vertices):
+                vertex.orientation = heading_at(vertex)
                 start = deepcopy(current)
                 length = _distance(start, vertex)
                 pieces = max(1, math.ceil(length / spacing))
                 for index in range(1, pieces + 1):
                     next_pose = interpolate_pose(start, vertex, index / pieces)
+                    next_pose.orientation = heading_at(next_pose)
+                    if path_validator is not None and time.monotonic() - last_validation >= 1.0:
+                        _, odometry = self._snapshot('OFFBOARD', require_armed=True)
+                        actual = deepcopy(odometry.pose.pose)
+                        if not validated([
+                                actual, next_pose, vertex, *vertices[vertex_index + 1:]]):
+                            raise VerificationObservationLost(
+                                'Inspection corridor is no longer safe')
+                        last_validation = time.monotonic()
                     self._ramp(current, next_pose, _distance(current, next_pose) / speed,
                                hold_duration=0.0 if index < pieces else None)
                     current = next_pose
+            if path_validator is not None:
+                _, actual = self._verify_control_pose()
+                if not validated([actual]):
+                    raise VerificationObservationLost(
+                        'Actual inspection arrival has not reached safe destination clearance')
             self._loiter()
+            if path_validator is not None:
+                _, actual = self._verify_control_pose()
+                if not validated([actual]):
+                    raise VerificationObservationLost(
+                        'Inspection arrival clearance became unavailable while stopping')
+        return True
 
-    def _verify_record_fire(self, fire_message, bearing_yaw):
+    def _verify_record_fire(self, fire_message, bearing_yaw, require_centering=True):
         """Publish a fresh GPS/local/map observation viewpoint and exclusion site."""
         from kv_executive.mission_executive import MissionError
         from kv_executive.msg import FireSourceReport
@@ -256,8 +355,8 @@ class VerifyNavigationMixin:
             or getattr(current_fire, 'track_id', 0) != track_id
             or (current_fire.header.stamp.sec * 1_000_000_000
                 + current_fire.header.stamp.nanosec) < fire_ns
-            or not all(math.isfinite(angle) and abs(angle)
-                       <= self.config['verify_yaw_tolerance'] for angle in (
+            or not all(math.isfinite(angle) and (not require_centering or abs(angle)
+                       <= self.config['verify_yaw_tolerance']) for angle in (
                            current_fire.yaw_correction_rad,
                            current_fire.vertical_correction_rad))
         ):

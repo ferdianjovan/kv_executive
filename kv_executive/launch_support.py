@@ -1,9 +1,41 @@
-"""Scoped launch settings for the Fast DDS shared-memory crash workaround."""
+"""Scoped interpreter and DDS runtime settings for launched Python nodes."""
+
+from pathlib import Path
+import re
+import shlex
+import sys
+
+from ament_index_python.packages import get_package_prefix
 
 from launch.actions import LogInfo, SetEnvironmentVariable
 from launch.conditions import IfCondition
+from launch.substitution import Substitution
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
+
+
+class SharedPythonPrefix(Substitution):
+    """Select the same-version shared runtime for only the specified Python node."""
+
+    def __init__(self, executable_name=''):
+        super().__init__()
+        self.executable_name = executable_name
+
+    def describe(self):
+        return f'shared Python runtime for {self.executable_name}'
+
+    def perform(self, context):
+        executable = Path(get_package_prefix('kv_executive')) / (
+            'lib/kv_executive/python_shared_runtime')
+        if not executable.is_file():
+            raise RuntimeError('Build kv_executive before launching its Python nodes')
+        arguments = []
+        selected = LaunchConfiguration('launch-prefix-filter', default='').perform(context)
+        if re.match(selected, self.executable_name) is not None:
+            arguments = shlex.split(
+                LaunchConfiguration('launch-prefix', default='').perform(context))
+        arguments.extend([str(executable), '--python', sys.executable, '--'])
+        return shlex.join(arguments)
 
 
 def fastdds_udp_environment(context, switch_name, label, package_name='kv_executive'):

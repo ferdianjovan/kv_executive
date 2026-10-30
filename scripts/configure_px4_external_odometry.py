@@ -148,7 +148,15 @@ class ExternalOdometryConfigurator(Node):
                 return True
 
             self.get_logger().info(
-                'Waiting for the MAVROS parameter services...',
+                'Waiting for MAVROS parameter services: '
+                + ', '.join(
+                    client.srv_name
+                    for client, ready in (
+                        (self.pull_client, pull_ready),
+                        (self.set_client, set_ready),
+                    )
+                    if not ready
+                ),
                 throttle_duration_sec=5.0,
             )
 
@@ -205,7 +213,9 @@ class ExternalOdometryConfigurator(Node):
 
         if not self._wait_for_parameter_services(deadline):
             self.get_logger().error(
-                'Timed out waiting for the MAVROS parameter services'
+                'Timed out waiting for MAVROS parameter services '
+                f'{self.pull_client.srv_name} and {self.set_client.srv_name}. '
+                'Check the MAVROS namespace and that the param plugin is loaded.'
             )
             return False
 

@@ -1,6 +1,6 @@
-"""Launch repeating Exploration and the planner with optional MAVROS startup."""
+"""Launch Exploration/Verify and the planner with optional MAVROS startup."""
 
-from kv_executive.launch_support import fastdds_udp_environment
+from kv_executive.launch_support import fastdds_udp_environment, SharedPythonPrefix
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction,
@@ -75,6 +75,26 @@ def generate_launch_description():
                 'robot_base_frame',
                 default_value=[drone_name, '/base_link'],
                 description='Body frame used to align map paths with PX4 local odometry',
+            ),
+            DeclareLaunchArgument(
+                'smoke_detection_topic',
+                default_value=['/', drone_name, '/smoke/detection'],
+                description='Smoke observations for Verify; match monitoring.launch.py',
+            ),
+            DeclareLaunchArgument(
+                'fire_detection_topic',
+                default_value=['/', drone_name, '/fire/detection'],
+                description='Thermal observations for Verify; match monitoring.launch.py',
+            ),
+            DeclareLaunchArgument(
+                'verify_planning_frame',
+                default_value='map',
+                description='Planner frame for targeted Verify paths',
+            ),
+            DeclareLaunchArgument(
+                'global_position_topic',
+                default_value='/mavros/global_position/global',
+                description='GPS fixes for verified fire observation reports',
             ),
             DeclareLaunchArgument(
                 'external_odometry_topic',
@@ -167,12 +187,17 @@ def generate_launch_description():
                 Node(
                     package='kv_executive',
                     executable='executive_node.py',
+                    prefix=SharedPythonPrefix('executive_node.py'),
                     name='mission_executive',
                     output='screen',
                     parameters=[
                         mission_config,
                         {
                             'robot_base_frame': LaunchConfiguration('robot_base_frame'),
+                            'smoke_detection_topic': LaunchConfiguration('smoke_detection_topic'),
+                            'fire_detection_topic': LaunchConfiguration('fire_detection_topic'),
+                            'verify_planning_frame': LaunchConfiguration('verify_planning_frame'),
+                            'global_position_topic': LaunchConfiguration('global_position_topic'),
                             'auto_start_mission': ParameterValue(
                                 LaunchConfiguration('auto_start_mission'),
                                 value_type=bool,

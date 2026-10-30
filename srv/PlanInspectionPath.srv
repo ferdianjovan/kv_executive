@@ -1,0 +1,29 @@
+# History-aware terrain planning; unknown-air policy is configured on the planner.
+geometry_msgs/PoseStamped target
+geometry_msgs/PointStamped keepout_center
+# Unit vertical axis of the local horizontal constraint plane, in a TF-resolvable frame.
+# An empty frame selects map +Z.
+geometry_msgs/Vector3Stamped keepout_axis
+float64 minimum_radius
+float64 minimum_agl
+# Permit only an observed, collision-free fixed-XY upward prefix to reach minimum_agl.
+bool allow_initial_climb
+# Enforce clearance above the observed terrain/canopy envelope, including slopes.
+bool terrain_envelope
+# Bounded monotonic lateral/diagonal/contour escape before full-clearance planning.
+# Requires terrain_envelope and minimum_agl>0; never waives occupied body clearance.
+bool allow_terrain_escape
+---
+bool success
+uint8 OK=0
+uint8 MAP_UNAVAILABLE=1
+uint8 INVALID_REQUEST=2
+uint8 TRANSFORM_ERROR=3
+uint8 START_INVALID=4
+uint8 GOAL_INVALID=5
+# Start collision/terrain checks passed; no bounded safe climb/escape was found.
+# This must not be treated as unknown current-body clearance.
+uint8 NO_CLEARANCE_ESCAPE=6
+uint8 error_code
+string message
+nav_msgs/Path path

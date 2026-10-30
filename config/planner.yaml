@@ -29,3 +29,15 @@ motion_planner:
     # viewpoint. Explicit targets and paths through these regions remain valid.
     reported_site_exclusion_radius: 15.0
     maximum_reported_sites: 100
+    # Match Exploration's occupied-voxel policy for limited-FOV lidar. Strict
+    # observed-free air can be required when the sensor covers the whole body.
+    # Occupied history, observed terrain, minimum AGL and inflated body stay checked.
+    inspection_require_observed_free_space: false
+    # Source observation age uses ROS time, including slow simulation time.
+    # Wall time bounds reception silence with a real clock, or a frozen /clock
+    # in simulation. A progressing slow simulation does not age maps early.
+    # The same source deadline also bounds occupied-map history.
+    inspection_map_timeout: 5.0
+    inspection_future_tolerance: 0.25
+    inspection_max_range: 50.0
+    inspection_ground_patch_radius: 0.5
