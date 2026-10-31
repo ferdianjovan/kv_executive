@@ -1,4 +1,4 @@
-"""Repeat smoke approach and bounded fire yaw centering in an isolated process.
+"""Repeat smoke approach and bounded fire centering in an isolated process.
 
 KV_VERIFY_PROCESS_PYTHON selects a compatible Python executable or launcher.
 Only a private simulated FCU is used; every MAVROS endpoint is remapped.
@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from kv_executive.mission_geometry import angular_distance, yaw_from_quaternion
+from kv_executive.verification import VERIFY_DEFAULTS
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 
@@ -57,8 +58,8 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
         'verify_navigation_step': 0.8,
         'verify_motion_speed': 5.0,
         'verify_center_timeout': 20.0,
-        # Isolate native runtime and centering; fire movement has separate coverage.
-        'verify_fire_approach_max_steps': 0,
+        # Isolate native runtime and centering at an explicitly measured smoke wall.
+        'verify_fire_approach_max_steps': 3,
         'verify_inspection_yaw_step': 0.25,
         'verify_reacquire_timeout': 1.0,
         'verify_viewpoint_max_steps': 2,
@@ -100,6 +101,16 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
             fcu.offboard_loss_timeout = 2.0
             fcu.heartbeat_interval = 0.2
         sensors = MonitoringSensors()
+        original_geometry = fcu.query_inspection_geometry
+
+        def near_smoke_wall(request, response):
+            response = original_geometry(request, response)
+            if request.smoke_wall_width:
+                response.smoke_wall_range = response.smoke_wall_nearest_range = (
+                    VERIFY_DEFAULTS['verify_smoke_standoff'] + 0.4)
+            return response
+
+        fcu.geometry_service.callback = near_smoke_wall
         sensors.smoke_regions = [1, 2]
         source = {}
 
@@ -183,7 +194,7 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
             with sensors.lock:
                 sensors.source = 'smoke_fire'
             alive_wait(lambda: len(sensors.inspection_reports) > first_report,
-                       25.0, 'bounded yaw centering followed by visible-fire inspection result')
+                       35.0, 'bounded yaw and altitude correction followed by fire inspection')
             with sensors.lock:
                 sensors.source = None
                 report = deepcopy(sensors.inspection_reports[first_report])
@@ -193,6 +204,7 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
                 targets = deepcopy(recovery_targets[first_target:])
                 statuses = list(fcu.statuses[first_status:])
             assert report.fire_found and report.source_count == 2
+            assert abs(report.observer_local_pose.pose.position.z - source['z']) < 0.03
             assert targets  # Terrain-checked smoke translation still precedes yaw centering.
             assert any('one bounded fire-heading correction' in text for _, text in statuses)
             with fcu.lock:

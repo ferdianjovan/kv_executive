@@ -1,6 +1,6 @@
 """Bounded, observation-driven verification; all translations use the planner.
 
-Camera coverage determines a conservative *step*, never a measured distance.
+Camera coverage never establishes proximity or interrupts a committed smoke leg.
 Fire range never selects motion or completion. The search keeps the aircraft level.
 """
 
@@ -9,6 +9,7 @@ import math
 import threading
 import time
 
+from kv_executive.inspection_navigation import smoke_wall_standoff_reached
 from kv_executive.mission_geometry import yaw_from_quaternion
 from yasmin import State, StateMachine
 
@@ -35,6 +36,10 @@ VERIFY_DEFAULTS = {
     'verify_yaw_tolerance': math.radians(5.0),
     'verify_yaw_step': math.radians(30.0),
     'verify_vertical_step': 0.5,
+    'verify_vertical_tolerance': math.radians(5.0),
+    'verify_vertical_hysteresis': math.radians(2.0),
+    'verify_vertical_edge_threshold': math.radians(15.0),
+    'verify_vertical_max_corrections': 3,
     'verify_minimum_altitude': 2.0,
     'verify_step_min': 5.0,
     'verify_step_max': 20.0,
@@ -55,7 +60,7 @@ VERIFY_DEFAULTS = {
     'verify_fire_leg_timeout': 60.0,
     'verify_fire_standoff': 10.0,
     'verify_navigation_no_progress_max': 2,
-    'verify_smoke_standoff': 10.0,
+    'verify_smoke_standoff': 20.0,
     'verify_inspection_altitude': 5.0,
     'verify_inspection_lateral_step': 5.0,
     'verify_inspection_max_attempts': 3,
@@ -451,14 +456,6 @@ class VerifyController:
         if self.fresh_smoke() is None:
             raise VerificationObservationLost('Smoke observation lost')
 
-    def _approach_guard(self):
-        """Keep mission and immersion checks without canceling on detector gaps."""
-        self._check()
-        if self.stable_fire() is not None:
-            raise _FireFound('Confirmed fire is visible; stopping smoke approach')
-        if self.all_quadrants(self.fresh_smoke()):
-            raise VerificationObservationLost('Smoke occupies all quadrants')
-
     def _smoke_guidance(self, blackboard=None, after_ns=0):
         """Hold through brief occlusion; only fresh images can start another leg."""
         grace = self.config['verify_smoke_loss_grace']
@@ -544,8 +541,6 @@ class VerifyController:
                 return self._route_fire(blackboard)
             if smoke is None:
                 return 'reacquire'
-            if self.all_quadrants(smoke):
-                return 'reacquire'
             geometry = self._inspection_geometry(blackboard, smoke, source='smoke')
             if self._stamp_issue(smoke):
                 self.executive._report(
@@ -553,13 +548,17 @@ class VerifyController:
                 return 'reacquire'
             if self.executive._verify_smoke_boundary_reached(geometry):
                 blackboard['verify_smoke_boundary_reached'] = True
+                self._inspection_begin(blackboard)
                 return 'reacquire'
             before = self._pose()
             bearing, geometry = self._remember_smoke_bearing(blackboard, smoke, geometry)
             self.executive._report(
                 'Verify: smoke visible; following a short terrain-aware smoke leg')
+            # Finish the selected leg through fire detections and smoke coverage
+            # changes. Live heading follows fire when available; the planner and
+            # corridor validators still enforce obstacle and terrain clearance.
             moved = self.executive._verify_navigation_viewpoint(
-                bearing, geometry=geometry, guard=self._approach_guard, forward_only=True)
+                bearing, geometry=geometry, guard=self._check, forward_only=True)
             if moved is False:
                 reason = getattr(self.executive, '_verify_navigation_failure_reason',
                                  'no validated forward smoke path')
@@ -651,8 +650,7 @@ class VerifyController:
         if self._reacquire_fire(blackboard) is not None:
             return self._route_fire(blackboard)
         if smoke is not None:
-            if (self.all_quadrants(smoke)
-                    or _bb_get(blackboard, 'verify_search_active', False)
+            if (_bb_get(blackboard, 'verify_search_active', False)
                     or _bb_get(blackboard, 'verify_smoke_boundary_reached', False)):
                 return 'search'
             return 'approach'
@@ -848,7 +846,7 @@ class VerifyController:
         return None
 
     def _center_fire_once(self, blackboard, fire):
-        """One best-effort yaw correction; terrain planning selects climbing height."""
+        """One best-effort yaw correction before planning fire-informed altitude."""
         error = fire.yaw_correction_rad
         if abs(error) <= self.config['verify_yaw_tolerance']:
             return fire
@@ -862,29 +860,63 @@ class VerifyController:
         blackboard['verify_inspection_after_ns'] = self._now_ns()
         return self._inspection_wait_fire(blackboard)
 
+    def _fire_vertical_preference(self, blackboard, fire):
+        """Consume one fresh image for a bounded, track-consistent height preference."""
+        tolerance = self.config['verify_vertical_tolerance']
+        hysteresis = self.config['verify_vertical_hysteresis']
+        edge = self.config['verify_vertical_edge_threshold']
+        step = self.config['verify_vertical_step']
+        attempts = self.config['verify_vertical_max_corrections']
+        if (not all(math.isfinite(v) for v in (tolerance, hysteresis, edge, step))
+                or not 0.0 < tolerance < tolerance + hysteresis < edge < math.pi / 2
+                or step <= 0.0 or not isinstance(attempts, int) or isinstance(attempts, bool)
+                or attempts < 0):
+            raise self.error_type('Invalid fire vertical guidance settings')
+        if fire is None or self._stamp_issue(fire):
+            return 0.0
+        identity = (fire.header.frame_id, getattr(fire, 'track_id', 0))
+        if _bb_get(blackboard, 'verify_vertical_track', None) != identity:
+            blackboard['verify_vertical_track'] = identity
+            blackboard['verify_vertical_stamp'] = 0
+            blackboard['verify_vertical_direction'] = 0
+            blackboard['verify_vertical_attempts'] = 0
+        stamp = self._stamp_ns(fire)
+        if stamp <= _bb_get(blackboard, 'verify_vertical_stamp', 0):
+            return 0.0
+        blackboard['verify_vertical_stamp'] = stamp
+        error = fire.vertical_correction_rad
+        previous = _bb_get(blackboard, 'verify_vertical_direction', 0)
+        direction = 0
+        if math.isfinite(error) and abs(error) < math.pi / 2:
+            sign = 1 if error > 0.0 else -1
+            threshold = tolerance if previous == sign else tolerance + hysteresis
+            if abs(error) > threshold:
+                direction = sign
+        blackboard['verify_vertical_direction'] = direction
+        return direction * step
+
     def _approach_visible_fire(self, blackboard, fire):
         """Finish one checked move through flicker, then require post-stop fire guidance."""
         limit = self.config['verify_fire_approach_max_steps']
-        while _bb_get(blackboard, 'verify_fire_approach_steps', 0) < limit:
-            try:
-                self._inspection_guard(blackboard)
-            except _InspectionTimeout:
-                self.executive._report(
-                    'Verify: fire approach time budget exhausted; recording held observations')
-                return self._inspection_fire(blackboard)
+        while True:
+            self._inspection_guard(blackboard)
             current_fire = self._inspection_fire(blackboard)
             if current_fire is None:
                 return None
             wall = self.executive._verify_center_fire_wall(current_fire.header.frame_id)
             if wall is None:
                 self.executive._report(
-                    'Verify/CENTER_FIRE: smoke-wall distance unavailable; holding for fresh geometry')
+                    'Verify/CENTER_FIRE: smoke-wall distance unavailable; '
+                    'holding for fresh geometry')
                 self.executive._verify_hold(
                     self.config['verify_reacquire_observation_timeout'], guard=self._check)
                 wall = self.executive._verify_center_fire_wall(current_fire.header.frame_id)
                 current_fire = self._inspection_fire(blackboard)
                 if wall is None or current_fire is None:
                     return None
+            # A geometry query or observation hold may consume the remaining
+            # budget. Do not begin another leg after that wait has expired it.
+            self._inspection_guard(blackboard)
             current_fire = self._inspection_fire(blackboard)
             if current_fire is None:
                 return None
@@ -896,7 +928,13 @@ class VerifyController:
             self.executive._report(
                 f'Verify/CENTER_FIRE: 3 x 3 m smoke wall mean={wall["mean"]:.2f} m, '
                 f'nearest={wall["nearest"]:.2f} m, uncertainty={wall["uncertainty"]:.2f} m')
-            if -2.0 * tolerance <= remaining <= tolerance:
+            at_standoff = smoke_wall_standoff_reached(wall, standoff, tolerance)
+            vertical = self._fire_vertical_preference(blackboard, current_fire)
+            vertical_attempts = _bb_get(blackboard, 'verify_vertical_attempts', 0)
+            step = _bb_get(blackboard, 'verify_fire_approach_steps', 0)
+            if at_standoff and (vertical == 0.0 or step >= limit
+                                or vertical_attempts >= self.config[
+                                    'verify_vertical_max_corrections']):
                 self.executive._report(
                     'Verify/CENTER_FIRE: smoke-wall standoff reached with fresh fire visible')
                 return current_fire
@@ -905,31 +943,72 @@ class VerifyController:
                         'navigation_bearing': bearing, 'center_fire_wall': wall,
                         'center_fire_max_path_length': self.config['verify_fire_leg_max_length'],
                         'center_fire_motion_timeout': self.config['verify_fire_leg_timeout']}
-            step = _bb_get(blackboard, 'verify_fire_approach_steps', 0)
+            if step >= limit:
+                raise self.error_type(
+                    'Verify: fire approach step limit reached before smoke-wall standoff; '
+                    'inspection incomplete; holding for operator')
             self.executive._report(
                 f'Verify/CENTER_FIRE: planning short smoke-wall approach leg {step + 1}/{limit}')
+            vertical_only = vertical != 0.0 and (at_standoff or (
+                remaining >= 0.0 and abs(current_fire.vertical_correction_rad)
+                >= self.config['verify_vertical_edge_threshold']))
             # Detector loss and track-ID changes do not cancel an already
             # committed leg. Vehicle checks and live wall/terrain validation do.
-            if remaining < 0.0:
+            if vertical_only:
+                target = deepcopy(before)
+                target.position.z += vertical
+                if at_standoff:
+                    blackboard['verify_vertical_attempts'] = vertical_attempts + 1
+                self.executive._report(
+                    f'Verify/CENTER_FIRE: vertical fire correction {vertical:+.2f} m '
+                    'before further forward motion')
+                moved = self.executive._verify_recovery_plan_to(
+                    target, geometry=geometry, guard=self._check,
+                    preserve_requested_altitude=True)
+            elif remaining < 0.0:
                 target = deepcopy(before)
                 retreat = min(self.config['verify_navigation_step'], -remaining)
                 target.position.x -= retreat * math.cos(bearing)
                 target.position.y -= retreat * math.sin(bearing)
+                target.position.z += vertical
                 moved = self.executive._verify_recovery_plan_to(
-                    target, geometry=geometry, guard=self._check)
+                    target, geometry=geometry, guard=self._check,
+                    preserve_requested_altitude=vertical != 0.0)
             else:
                 moved = self.executive._verify_navigation_viewpoint(
                     bearing, geometry=geometry, guard=self._check, index=step,
-                    maximum_forward=min(self.config['verify_navigation_step'], remaining))
+                    maximum_forward=min(self.config['verify_navigation_step'], remaining),
+                    vertical_offset=vertical)
             blackboard['verify_fire_approach_steps'] = step + 1
             after = self._pose().position
             displacement = math.dist(
                 tuple(getattr(before.position, a) for a in 'xyz'),
                 tuple(getattr(after, a) for a in 'xyz'))
             if moved is False or displacement <= tolerance:
+                if vertical_only and at_standoff:
+                    # Centering is best effort once measured proximity is met.
+                    # A rejected path must not loop or bypass fresh post-stop evidence.
+                    blackboard['verify_vertical_attempts'] = self.config[
+                        'verify_vertical_max_corrections']
+                    blackboard['verify_inspection_after_ns'] = self._now_ns()
+                    self.executive._report(
+                        'Verify/CENTER_FIRE: vertical correction blocked at standoff; '
+                        'rechecking visible fire and wall before completion')
+                    if self._inspection_wait_fire(blackboard) is None:
+                        return None
+                    continue
+                failures = _bb_get(blackboard, 'verify_search_failures', 0) + 1
+                blackboard['verify_search_failures'] = failures
                 self.executive._report(
-                    'Verify: fire approach blocked; recording visible fire from the held position')
-                return self._inspection_fire(blackboard)
+                    f'Verify: fire approach blocked before smoke-wall standoff; '
+                    f'recovery {failures}/{self.config["verify_search_recovery_max"]}')
+                if failures >= self.config['verify_search_recovery_max']:
+                    raise self.error_type(
+                        'Verify: fire approach blocked; inspection incomplete; '
+                        'holding for operator')
+                self.executive._verify_hold(
+                    self.config['verify_navigation_map_wait'], guard=self._check)
+                return None
             blackboard['verify_search_failures'] = 0
             blackboard['verify_inspection_after_ns'] = self._now_ns()
             self.executive._report(
@@ -942,17 +1021,17 @@ class VerifyController:
                 return None
             # Localization remains optional report metadata, never the distance gate.
             self._inspection_geometry(blackboard, current_fire, source='fire')
-        return self._inspection_fire(blackboard)
 
     def center_fire(self, blackboard):
         """Center and approach visible fire, or inspect the smoke boundary."""
         self._check()
-        self._inspection_begin(blackboard)
         try:
+            self._inspection_guard(blackboard)
             fire = self._inspection_fire(blackboard)
             if fire is None and _bb_get(blackboard, 'verify_fire_pending', False):
                 fire = self._inspection_wait_fire(blackboard)
             if fire is not None:
+                self._inspection_begin(blackboard)
                 self._route_fire(blackboard)
                 centered = self._center_fire_once(blackboard, fire)
                 if centered is None:
@@ -969,13 +1048,15 @@ class VerifyController:
                 return 'explore'
             if _bb_get(blackboard, 'verify_fire_observed', False) or self.had_fire_confirmation():
                 self.executive._report(
-                    'Verify/CENTER_FIRE: fire guidance missing after observation wait; reacquiring')
+                    'Verify/CENTER_FIRE: fire guidance missing after observation wait; '
+                    'reacquiring')
                 return 'reacquire'
             smoke = self.fresh_smoke()
             geometry = self._inspection_geometry(blackboard, smoke, source='smoke')
-            if not (smoke is not None and (self.all_quadrants(smoke)
-                    or self.executive._verify_smoke_boundary_reached(geometry))):
+            if not (smoke is not None
+                    and self.executive._verify_smoke_boundary_reached(geometry)):
                 return 'search'
+            self._inspection_begin(blackboard)
             origin = _bb_get(blackboard, 'verify_inspection_origin', None) or self._pose()
             blackboard['verify_inspection_origin'] = origin
 
@@ -1027,9 +1108,9 @@ class VerifyController:
         except (VerificationStartUnavailable, VerificationRecoveryUnavailable) as error:
             return self._navigation_start_unavailable(blackboard, error, resume='search')
         except _InspectionTimeout:
-            if self.stable_fire() is not None:
-                return self._route_fire(blackboard)
-            return self._search_blocked(blackboard, 'smoke inspection deadline reached')
+            raise self.error_type(
+                'Verify: inspection time budget exhausted before confirmed completion; '
+                'inspection incomplete; holding for operator')
         except VerificationObservationLost:
             return 'reacquire'
 
@@ -1156,12 +1237,10 @@ class VerifyController:
     def search_fire(self, blackboard):
         """Search along smoke-boundary guidance; fire range never selects a goal."""
         self._check()
-        self._inspection_begin(blackboard)
         blackboard['verify_search_active'] = True
 
         def guard():
             self._inspection_guard(blackboard, interrupt_fire=True)
-            self._approach_guard()
 
         try:
             if self._inspection_fire(blackboard) is not None:
@@ -1171,8 +1250,8 @@ class VerifyController:
             if smoke is None:
                 return 'reacquire'
             geometry = self._inspection_geometry(blackboard, smoke, source='smoke')
-            if (self.all_quadrants(smoke)
-                    or self.executive._verify_smoke_boundary_reached(geometry)):
+            if self.executive._verify_smoke_boundary_reached(geometry):
+                self._inspection_begin(blackboard)
                 blackboard['verify_smoke_boundary_reached'] = True
                 return 'inspect'
             self.executive._report(
@@ -1188,8 +1267,8 @@ class VerifyController:
                 self.executive._report(
                     'Verify: smoke image aged during geometry query; holding for fresh guidance')
                 return 'reacquire'
-            if (self.all_quadrants(observation)
-                    or self.executive._verify_smoke_boundary_reached(geometry)):
+            if self.executive._verify_smoke_boundary_reached(geometry):
+                self._inspection_begin(blackboard)
                 blackboard['verify_smoke_boundary_reached'] = True
                 return 'inspect'
             before = self._pose()

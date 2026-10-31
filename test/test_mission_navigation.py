@@ -784,6 +784,20 @@ def test_report_contains_local_map_and_real_global_observation_and_count(executi
     assert executive._fire_sites[0] is not report
 
 
+def test_prepared_fire_report_has_no_publication_or_exclusion_until_commit(executive):
+    report = executive._verify_record_fire(fire(executive), 0.4, publish=False)
+
+    assert report.site_id == 0
+    assert executive._site_sequence == 0
+    assert not executive._fire_sites
+    assert not any(event[0] == 'report' for event in executive.events)
+
+    executive._verify_publish_fire_report(report)
+    assert report.site_id == 1
+    assert len(executive._fire_sites) == 1
+    assert len([event for event in executive.events if event[0] == 'report']) == 1
+
+
 @pytest.mark.parametrize('invalid', [
     'missing', 'no_fix', 'stale_receipt', 'stale_source', 'future', 'nan', 'latitude',
     'longitude', 'fire_source', 'odometry_source', 'zero_count',

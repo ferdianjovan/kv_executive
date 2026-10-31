@@ -79,6 +79,7 @@ mission_executive:
     verify_center_timeout: 30.0
     # CENTER_FIRE: short committed moves toward the observed smoke wall,
     # requiring fresh fire confirmation after each stop.
+    # Reaching a step/time limit never substitutes for measured wall proximity.
     verify_fire_approach_max_steps: 64
     # CENTER_FIRE uses a 3 x 3 m observed smoke wall, not fire range.
     verify_fire_leg_max_length: 12.0  # Actual planned route length, metres.
@@ -87,13 +88,20 @@ mission_executive:
     verify_yaw_tolerance: 0.08726646259971647  # Radians: 5 degrees.
     verify_yaw_step: 0.5235987755982988  # Radians: at most 30 degrees per correction.
     verify_vertical_step: 0.5
+    # Fire-guided altitude goals are chosen between committed legs. The target
+    # may descend only when observed terrain and the full corridor permit it.
+    verify_vertical_tolerance: 0.08726646259971647  # Stop correcting inside 5 degrees.
+    verify_vertical_hysteresis: 0.03490658503988659  # Start outside 7 degrees.
+    verify_vertical_edge_threshold: 0.2617993877991494  # 15 degrees: correct height first.
+    verify_vertical_max_corrections: 3  # Best-effort vertical attempts at the standoff.
     verify_minimum_altitude: 2.0  # Local z floor; planner home limits also apply.
     # Legacy coverage-to-step parameters remain accepted for compatibility.
     # Active smoke acquisition uses verify_navigation_step with measured terrain
-    # checks. Confirmed fire interrupts smoke flight and starts its bounded approach.
+    # checks. Selected smoke legs finish through fire/smoke detector changes;
+    # fresh fire adjusts yaw and receives priority after arrival.
     verify_step_min: 5.0
     verify_step_max: 20.0
-    # Also the broad-smoke stop threshold when all four regions are occupied.
+    # Broad-smoke evidence for negative inspection reports, not a navigation stop.
     verify_full_coverage: 0.25
     verify_motion_speed: 0.5
     # Keep the aircraft level; these position setpoints cannot safely request tilt.
@@ -114,12 +122,13 @@ mission_executive:
     verify_navigation_map_timeout: 20.0
     verify_navigation_no_progress_max: 2
     # Proximity to a fresh observed plume/smoke-wall proxy, never fire distance.
-    verify_smoke_standoff: 10.0
+    verify_smoke_standoff: 20.0
     # Clearance above a validated observed support surface; unknown means no descent.
     verify_inspection_altitude: 5.0
     verify_inspection_lateral_step: 5.0
     verify_inspection_max_attempts: 3
     verify_inspection_yaw_step: 0.08726646259971647  # +/-5 degree inspection checks.
+    # Starts with confirmed fire or measured boundary inspection, not broad coverage.
     verify_inspection_timeout: 300.0
     verify_inspection_max_range: 40.0
     verify_inspection_max_uncertainty: 2.0

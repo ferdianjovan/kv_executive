@@ -24,6 +24,19 @@ def _finite_point(point):
     return all(math.isfinite(getattr(point, axis)) for axis in 'xyz')
 
 
+def smoke_wall_standoff_reached(wall, standoff, tolerance=0.3):
+    """Require the observed wall's conservative range to be at the standoff."""
+    if wall is None:
+        return False
+    nearest = wall.get('nearest', math.nan)
+    uncertainty = wall.get('uncertainty', math.nan)
+    if (not all(math.isfinite(value) for value in (nearest, uncertainty, standoff, tolerance))
+            or nearest <= 0.0 or uncertainty < 0.0 or standoff <= 0.0 or tolerance <= 0.0):
+        return False
+    distance = nearest - uncertainty
+    return standoff - 1e-9 <= distance <= standoff + 2.0 * tolerance + 1e-9
+
+
 def _unknown_point(frame='', stamp=None):
     result = PointStamped()
     result.header.frame_id = frame
@@ -557,6 +570,9 @@ class InspectionNavigationMixin:
             if geometry and geometry.get('center_fire_wall') is not None:
                 if not self._verify_center_fire_wall_path(path, geometry):
                     return False
+            if geometry and geometry.get('smoke_navigation_wall') is not None:
+                if not self._verify_wall_plane_path(path, geometry['smoke_navigation_wall']):
+                    return False
             if terrain is None and any(
                     vertex.pose.position.z < floor - self.config.get('position_tolerance', 0.3)
                     for vertex in path.poses):
@@ -592,8 +608,8 @@ class InspectionNavigationMixin:
                 point=keepout_point, minimum_radius=keepout_radius,
                 minimum_agl=minimum_agl, allow_initial_climb=True,
                 terrain_envelope=True, allow_terrain_escape=True),
-            **(dict(maximum_path_length=geometry['center_fire_max_path_length'],
-                    motion_timeout=geometry['center_fire_motion_timeout']) if center_fire else {}),
+            **({'maximum_path_length': geometry['center_fire_max_path_length'],
+                'motion_timeout': geometry['center_fire_motion_timeout']} if center_fire else {}),
         )
 
     def _verify_center_fire_wall(self, camera_frame):
@@ -608,9 +624,9 @@ class InspectionNavigationMixin:
         response = self._inspection_query(request, require_map=True)
         if not response.smoke_wall_valid:
             return None
-        mean, nearest, uncertainty = (response.smoke_wall_range,
-                                     response.smoke_wall_nearest_range,
-                                     response.smoke_wall_uncertainty)
+        mean, nearest, uncertainty = (
+            response.smoke_wall_range, response.smoke_wall_nearest_range,
+            response.smoke_wall_uncertainty)
         if (response.smoke_wall_samples < 3
                 or not all(math.isfinite(v) for v in (mean, nearest, uncertainty))
                 or not 0.0 < nearest <= mean <= request.max_range
@@ -632,8 +648,13 @@ class InspectionNavigationMixin:
         norm = math.hypot(*axis)
         if norm < 1e-6:
             return None
-        return dict(origin=local, axis=tuple(v / norm for v in axis), mean=mean,
-                    nearest=nearest, uncertainty=uncertainty, camera_frame=camera_frame)
+        # TF lookup can wait after the query's initial map freshness check.
+        age = (self.get_clock().now().nanoseconds - _stamp_ns(response.map_header)) / 1e9
+        if not -self.config['verify_future_tolerance'] <= age <= self.config.get(
+                'verify_geometry_timeout', 5.0):
+            return None
+        return {'origin': local, 'axis': tuple(v / norm for v in axis), 'mean': mean,
+                'nearest': nearest, 'uncertainty': uncertainty, 'camera_frame': camera_frame}
 
     def _verify_center_fire_wall_path(self, path, geometry):
         """Protect the observed wall plane through a short maneuver and map flicker."""
@@ -644,17 +665,57 @@ class InspectionNavigationMixin:
         for measured in (wall, live):
             if measured is None:
                 continue
-            allowed = (measured['nearest'] - measured['uncertainty']
-                       - self.config.get('verify_smoke_standoff', 10.0)
-                       - self.config.get('position_tolerance', 0.3))
-            allowed = max(0.0, allowed)
-            for vertex in path.poses:
-                advance = sum((getattr(vertex.pose.position, a) - getattr(measured['origin'], a))
-                              * measured['axis'][i] for i, a in enumerate('xyz'))
-                if advance > allowed + 1e-6:
-                    self._report('Verify/CENTER_FIRE: path would cross the 10 m smoke-wall boundary')
-                    return False
+            if not self._verify_wall_plane_path(path, measured):
+                return False
         return True
+
+    def _verify_wall_plane_path(self, path, wall):
+        """Keep every path vertex behind the same measured smoke-wall plane."""
+        standoff = self.config.get('verify_smoke_standoff', 20.0)
+        allowed = max(0.0, wall['nearest'] - wall['uncertainty'] - standoff
+                      - self.config.get('position_tolerance', 0.3))
+        for vertex in path.poses:
+            advance = sum((getattr(vertex.pose.position, axis) - getattr(wall['origin'], axis))
+                          * wall['axis'][i] for i, axis in enumerate('xyz'))
+            if advance > allowed + 1e-6:
+                self._report(
+                    f'Verify: path would cross the {standoff:g} m smoke-wall boundary')
+                return False
+        return True
+
+    def _verify_smoke_navigation_wall(self, geometry):
+        """Use only a fresh history-associated plume hit to bound a smoke leg."""
+        if (not geometry or geometry.get('source') != 'smoke'
+                or not geometry.get('plume_candidate', False)
+                or geometry.get('occupied_samples', 0) < 2
+                or geometry.get('free_samples', 0) < 1):
+            return None
+        origin, point = geometry.get('ray_origin'), geometry.get('obstacle_point')
+        distance = geometry.get('obstacle_range', math.nan)
+        uncertainty = geometry.get('obstacle_uncertainty', math.nan)
+        stamp, map_header = geometry.get('source_stamp'), geometry.get('map_header')
+        if (origin is None or point is None or not _finite_point(origin)
+                or not _finite_point(point) or stamp is None or map_header is None
+                or map_header.frame_id != self.config['verify_planning_frame']
+                or not all(math.isfinite(v) for v in (distance, uncertainty))
+                or not 0.0 < distance <= self.config.get('verify_inspection_max_range', 40.0)
+                or not 0.0 <= uncertainty <= self.config.get(
+                    'verify_inspection_max_uncertainty', 2.0)):
+            return None
+        now_ns = self.get_clock().now().nanoseconds
+        for source_stamp, timeout in (
+                (stamp, self.config['verify_observation_timeout']),
+                (map_header.stamp, self.config.get('verify_geometry_timeout', 5.0))):
+            stamp_ns = source_stamp.sec * 1_000_000_000 + source_stamp.nanosec
+            age = (now_ns - stamp_ns) / 1e9
+            if stamp_ns <= 0 or not -self.config['verify_future_tolerance'] <= age <= timeout:
+                return None
+        axis = tuple(getattr(point, a) - getattr(origin, a) for a in 'xyz')
+        norm = math.hypot(*axis)
+        if norm < 1e-6:
+            return None
+        return {'origin': deepcopy(origin), 'axis': tuple(v / norm for v in axis),
+                'nearest': distance, 'uncertainty': uncertainty}
 
     def _verify_localization_viewpoint(
         self, geometry=None, index=0, guard=None, origin=None, bearing=None,
@@ -717,7 +778,7 @@ class InspectionNavigationMixin:
 
     def _verify_navigation_viewpoint(
         self, bearing, index=0, guard=None, geometry=None, maximum_forward=None,
-        forward_only=False,
+        forward_only=False, vertical_offset=0.0,
     ):
         """Advance along a source bearing with terrain clearance and parallax.
 
@@ -729,8 +790,18 @@ class InspectionNavigationMixin:
         self._verify_navigation_failure_reason = ''
         if (not isinstance(index, int) or isinstance(index, bool) or index < 0
                 or not isinstance(bearing, (float, int)) or not math.isfinite(bearing)
-                or not isinstance(forward_only, bool)):
-            raise MissionError('Navigation viewpoint requires a finite heading and valid index')
+                or not isinstance(forward_only, bool)
+                or isinstance(vertical_offset, bool)
+                or not isinstance(vertical_offset, (float, int))
+                or not math.isfinite(vertical_offset)
+                or abs(vertical_offset) > self.config.get('verify_vertical_step', 0.5) + 1e-9):
+            raise MissionError(
+                'Navigation viewpoint requires a finite heading, valid index and bounded '
+                'vertical offset')
+        # Accept the wall while its image and map evidence are fresh. A slow
+        # preflight must not silently discard an already observed boundary and
+        # replace a limited final leg with an unrestricted forward destination.
+        smoke_wall = self._verify_smoke_navigation_wall(geometry)
         current = self._verify_navigation_preflight(guard)
         if geometry and math.isfinite(geometry.get('navigation_bearing', math.nan)):
             stamp = geometry.get('source_stamp')
@@ -745,6 +816,23 @@ class InspectionNavigationMixin:
             if not math.isfinite(maximum_forward) or maximum_forward <= 0.0:
                 raise MissionError('Navigation forward limit must be finite and positive')
             step = min(step, maximum_forward)
+        if smoke_wall is not None:
+            # Commit this measured bound with the route. Image ageing or loss
+            # during flight must not discard it or interrupt the selected leg.
+            geometry = {**geometry, 'smoke_navigation_wall': smoke_wall}
+            remaining = (smoke_wall['nearest'] - smoke_wall['uncertainty']
+                         - self.config.get('verify_smoke_standoff', 20.0)
+                         - self.config.get('position_tolerance', 0.3)
+                         - sum((getattr(current.position, a) - getattr(smoke_wall['origin'], a))
+                               * smoke_wall['axis'][i] for i, a in enumerate('xyz')))
+            projection = (math.cos(bearing) * smoke_wall['axis'][0]
+                          + math.sin(bearing) * smoke_wall['axis'][1])
+            if remaining <= 1e-6:
+                self._verify_navigation_failure_reason = 'measured smoke-wall boundary reached'
+                self._report('Verify: further smoke advance withheld at the measured boundary')
+                return False
+            if projection > 1e-6:
+                step = min(step, remaining / projection)
         minimum_agl = self.config.get('verify_inspection_altitude', 5.0)
         preferred_agl = self.config.get('verify_navigation_preferred_agl', 7.5)
         maximum_agl = self.config.get('verify_navigation_max_agl', 10.0)
@@ -756,7 +844,7 @@ class InspectionNavigationMixin:
             raise MissionError(
                 'Invalid terrain navigation step, clearance band or candidate limit')
         minimum_step = max(0.1, 2.0 * self.config.get('position_tolerance', 0.3))
-        if geometry and geometry.get('center_fire_wall') is not None:
+        if geometry and (geometry.get('center_fire_wall') is not None or smoke_wall is not None):
             # The last wall-limited advance may be shorter than a survey leg.
             minimum_step = min(minimum_step, step)
         sign = 1.0 if index % 2 == 0 else -1.0
@@ -799,7 +887,7 @@ class InspectionNavigationMixin:
                     missing_terrain.add(key)
                 for clearance in clearances if terrain is not None else (None,):
                     requested_agl = minimum_agl if clearance is None else clearance
-                    target.position.z = max(current.position.z,
+                    target.position.z = max(current.position.z + vertical_offset,
                                             self.config['verify_minimum_altitude'])
                     if terrain is not None:
                         ground_z, uncertainty = terrain
@@ -807,12 +895,18 @@ class InspectionNavigationMixin:
                             target.position.z, ground_z + requested_agl + uncertainty,
                             ground_z + minimum_agl + uncertainty
                             + self.config.get('position_tolerance', 0.3))
+                    if vertical_offset < 0.0 and (
+                            terrain is None or target.position.z >= current.position.z - 0.01):
+                        # A lower fire must not silently turn into another
+                        # forward or climbing leg when descent cannot be checked.
+                        continue
                     displacement = math.dist(
                         tuple(getattr(current.position, axis) for axis in 'xyz'),
                         tuple(getattr(target.position, axis) for axis in 'xyz'))
                     # This is a local observation leg, not an unbounded climb
                     # to an arbitrary overhead structure in a large map.
-                    if displacement < minimum_step or displacement > max(10.0, step * 4.0):
+                    if (displacement + 1e-9 < minimum_step
+                            or displacement > max(10.0, step * 4.0) + 1e-9):
                         continue
                     coordinates = tuple(round(getattr(target.position, axis), 6) for axis in 'xyz')
                     if coordinates in attempted:
@@ -820,7 +914,13 @@ class InspectionNavigationMixin:
                     attempted.add(coordinates)
                     yield deepcopy(target), terrain, forward, lateral, clearance
 
-        if forward_only:
+        if vertical_offset:
+            offsets = ([(step, 0.0), (step * 0.5, 0.0), (step * 0.25, 0.0)]
+                       if forward_only else forward_offsets + fallback_offsets)
+            # The fire selects a small change from the current altitude. The
+            # preferred AGL bands must not replace it with an unrelated climb.
+            batches = ((offsets, (None,), limit),)
+        elif forward_only:
             straight = [(step, 0.0), (step * 0.5, 0.0), (step * 0.25, 0.0)]
             # Try all straight distances near current altitude before requesting
             # extra height. The measured terrain floor can still require a climb.
@@ -849,7 +949,9 @@ class InspectionNavigationMixin:
                     f'{target.position.z:.2f}) m, requested AGL={requested_agl:.2f} m, '
                     + ('level preferred; ' if clearance is None else '') +
                     f'{terrain_status}, ' + range_status)
-                if self._verify_recovery_plan_to(target, geometry, guard, terrain=terrain):
+                if self._verify_recovery_plan_to(
+                        target, geometry, guard, terrain=terrain,
+                        preserve_requested_altitude=bool(vertical_offset)):
                     return True
         mode = 'forward' if forward_only else 'terrain navigation'
         if attempts:
@@ -932,9 +1034,12 @@ class InspectionNavigationMixin:
             tuple(getattr(current.position, axis) for axis in 'xyz'),
             tuple(getattr(point, axis) for axis in 'xyz'))
         # A steep downward ray must not claim arrival solely from its XY distance.
-        limit = (self.config.get('verify_smoke_standoff', 10.0) + uncertainty
-                 + self.config.get('position_tolerance', 0.3))
-        return max(distance, current_distance) <= limit
+        # Match the outer arrival band so a final smoke leg need not be smaller
+        # than the controller's position tolerance. Positive reports separately
+        # enforce the conservative range's strict lower standoff bound.
+        limit = (self.config.get('verify_smoke_standoff', 20.0) + uncertainty
+                 + 2.0 * self.config.get('position_tolerance', 0.3))
+        return max(distance, current_distance) <= limit + 1e-9
 
     def _verify_source_at_standoff(self, geometry):
         """Compatibility alias for smoke-wall arrival; fire range never qualifies."""
@@ -1085,15 +1190,28 @@ class InspectionNavigationMixin:
             report, 'smoke', smoke_geometry, fix, odometry.pose.pose, report.header.stamp)
         self._inspection_target_fields(
             report, 'fire', fire_geometry, fix, odometry.pose.pose, report.header.stamp)
-        legacy_site_id = None
+        legacy = None
+        if report.fire_found:
+            wall = self._verify_center_fire_wall(fire_message.header.frame_id)
+            if not smoke_wall_standoff_reached(
+                    wall, self.config['verify_smoke_standoff'],
+                    self.config.get('position_tolerance', 0.3)):
+                raise VerificationObservationLost(
+                    'A fresh smoke wall at the standoff is required for a fire-found result')
+            latest = self._verify.stable_fire()
+            if (not self._inspection_detection_valid(latest, 'fire')
+                    or latest.header.frame_id != fire_message.header.frame_id
+                    or getattr(latest, 'track_id', 0) != getattr(fire_message, 'track_id', 0)):
+                raise VerificationObservationLost(
+                    'Fire changed while measuring smoke-wall standoff')
+            fix = self._inspection_fresh_fix()
         if report.fire_found and fix is not None:
             # Preserve the existing observation-viewpoint topic for consumers
             # that have not migrated. Target coordinates live only above.
             legacy = self._verify_record_fire(
                 latest, yaw_from_quaternion(odometry.pose.pose.orientation)
-                + latest.yaw_correction_rad, require_centering=False,
+                + latest.yaw_correction_rad, require_centering=False, publish=False,
             )
-            legacy_site_id = int(legacy.site_id)
         fix = self._inspection_fresh_fix()
         report.observer_global_valid = fix is not None
         report.observer_global_position = deepcopy(fix) if fix is not None else _unknown_fix(
@@ -1102,14 +1220,16 @@ class InspectionNavigationMixin:
             report, 'smoke', smoke_geometry, fix, odometry.pose.pose, report.header.stamp)
         self._inspection_target_fields(
             report, 'fire', fire_geometry, fix, odometry.pose.pose, report.header.stamp)
-        with self._data_lock:
-            if legacy_site_id is None:
-                self._site_sequence += 1
-                report.site_id = self._site_sequence
-            else:
-                report.site_id = legacy_site_id
-        # All potentially blocking transforms, map queries and legacy reporting
-        # are complete. Decide the classification again at the commit point.
+        # Re-measure after optional localization, transforms and legacy preparation;
+        # a previous approach measurement cannot authorize a distant/stale result.
+        if report.fire_found:
+            wall = self._verify_center_fire_wall(fire_message.header.frame_id)
+            if not smoke_wall_standoff_reached(
+                    wall, self.config['verify_smoke_standoff'],
+                    self.config.get('position_tolerance', 0.3)):
+                raise VerificationObservationLost(
+                    'Smoke-wall standoff evidence became unavailable before publishing')
+        # Decide classification after the last potentially blocking query too.
         self._check_running()
         latest = self._verify.stable_fire()
         if not report.fire_found and not self._verify_smoke_boundary_reached(smoke_geometry):
@@ -1130,6 +1250,50 @@ class InspectionNavigationMixin:
                     or not self._verify.all_quadrants(current_smoke)):
                 raise VerificationObservationLost(
                     'Broad smoke or no-fire evidence changed before publishing')
+        # Geometry queries can wait. Refresh observer telemetry at the commit
+        # point, using the map conversion already resolved before those queries.
+        self._verify_control_pose()
+        _, odometry = self._snapshot(require_armed=True)
+        now_ns = self.get_clock().now().nanoseconds
+        odometry_age = (now_ns - _stamp_ns(odometry)) / 1e9
+        if (_stamp_ns(odometry) <= 0
+                or not -self.config['verify_future_tolerance'] <= odometry_age
+                <= self.config['telemetry_timeout']):
+            raise MissionError('Observation pose became stale before publishing inspection')
+        report.header.stamp = self.get_clock().now().to_msg()
+        report.observer_local_pose.header = deepcopy(odometry.header)
+        report.observer_local_pose.pose = deepcopy(odometry.pose.pose)
+        report.observer_planning_pose.header = deepcopy(report.header)
+        report.observer_planning_pose.pose = transform_pose(
+            odometry.pose.pose, _inverse(conversion))
+        fix = self._inspection_fresh_fix()
+        report.observer_global_valid = fix is not None
+        report.observer_global_position = deepcopy(fix) if fix is not None else _unknown_fix(
+            report.header.stamp)
+        self._inspection_target_fields(
+            report, 'smoke', smoke_geometry, fix, odometry.pose.pose, report.header.stamp)
+        self._inspection_target_fields(
+            report, 'fire', fire_geometry, fix, odometry.pose.pose, report.header.stamp)
+        if report.fire_found:
+            source_count = int(getattr(latest, 'source_count', 1))
+            if not 0 < source_count < 2 ** 32:
+                raise MissionError(
+                    'Invalid current fire source count before publishing inspection')
+            report.source_count = source_count
+        if legacy is not None and fix is not None:
+            legacy.header = deepcopy(report.header)
+            legacy.local_pose = deepcopy(report.observer_local_pose)
+            legacy.planning_pose = deepcopy(report.observer_planning_pose)
+            legacy.global_position = deepcopy(fix)
+            legacy.source_count = report.source_count
+            legacy.bearing_rad = float(math.remainder(
+                yaw_from_quaternion(odometry.pose.pose.orientation) + latest.yaw_correction_rad,
+                math.tau))
+            report.site_id = int(self._verify_publish_fire_report(legacy).site_id)
+        else:
+            with self._data_lock:
+                self._site_sequence += 1
+                report.site_id = self._site_sequence
         self._inspection_report_publisher.publish(report)
         self._report(f'Verify: inspection result {report.status}; '
                      f'smoke location valid={report.smoke_location_valid}, '

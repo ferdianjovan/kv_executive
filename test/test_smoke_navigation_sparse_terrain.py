@@ -1,6 +1,7 @@
 """Exercise smoke navigation against the real native planner on incomplete terrain."""
 
 from copy import deepcopy
+import math
 
 from geometry_msgs.msg import Transform
 from kv_executive.inspection_navigation import InspectionNavigationMixin
@@ -83,6 +84,35 @@ class SmokeNavigationProbe(InspectionNavigationMixin):
         self.paths.append(deepcopy(response.path))
         self.arrive(response.path.poses[-1].pose)
         return True
+
+
+@pytest.mark.parametrize('ground_absent', [False, True])
+def test_fire_guided_descent_uses_native_terrain_checks(planner_factory, ground_absent):
+    planner = _terrain_planner(
+        planner_factory, ground_absent=ground_absent, planner_parameters={
+            'inspection_require_observed_free_space': None,
+            'inspection_map_timeout': 5.0, 'drone_radius': 0.45,
+            'obstacle_clearance': 0.3, 'maximum_altitude': 30.0,
+        })
+    probe = SmokeNavigationProbe(planner)
+    probe.arrive(planner.target(x=3.0, z=10.0).pose)
+    initial = deepcopy(probe.pose)
+    # Face back down the mapped slope. A lower fire requests half a metre of
+    # descent, but an absent ground surface cannot authorize that descent.
+    bearing = math.pi - 0.1
+    moved = probe._verify_navigation_viewpoint(
+        bearing, vertical_offset=-0.5, forward_only=True)
+    assert moved is not ground_absent, '\n'.join(probe.messages)
+    if ground_absent:
+        assert probe.pose == initial
+        assert not probe.paths
+    else:
+        assert probe.pose.position.z == pytest.approx(9.5)
+        assert probe.pose.position.x == pytest.approx(3.0 + 3.0 * math.cos(bearing))
+        assert len(probe.paths) == 1
+        checked = planner.query_geometry(QueryInspectionGeometry.Request(
+            corridor=probe.paths[0], minimum_agl=5.0, terrain_envelope=True))
+        assert checked.success and checked.corridor_safe, checked.message
 
 
 def test_smoke_advances_over_missing_ground_then_climbs_for_observed_terrain(planner_factory):

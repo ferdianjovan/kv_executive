@@ -245,7 +245,8 @@ class VerifyNavigationMixin:
                     if previous_guard:
                         previous_guard()
                     if time.monotonic() >= deadline:
-                        raise VerificationObservationLost('CENTER_FIRE movement time limit exceeded')
+                        raise VerificationObservationLost(
+                            'CENTER_FIRE movement time limit exceeded')
 
                 self._motion_guard = bounded_guard
                 self._report('Verify/CENTER_FIRE: starting committed short movement')
@@ -305,8 +306,10 @@ class VerifyNavigationMixin:
                         'Inspection arrival clearance became unavailable while stopping')
         return True
 
-    def _verify_record_fire(self, fire_message, bearing_yaw, require_centering=True):
-        """Publish a fresh GPS/local/map observation viewpoint and exclusion site."""
+    def _verify_record_fire(
+        self, fire_message, bearing_yaw, require_centering=True, *, publish=True,
+    ):
+        """Prepare a fresh observation viewpoint, optionally publishing it immediately."""
         from kv_executive.mission_executive import MissionError
         from kv_executive.msg import FireSourceReport
         self._verify_control_pose()
@@ -389,6 +392,10 @@ class VerifyNavigationMixin:
         if not 0 < current_count < 2 ** 32:
             raise MissionError('Current fire source count is invalid')
         report.source_count = current_count
+        return self._verify_publish_fire_report(report) if publish else report
+
+    def _verify_publish_fire_report(self, report):
+        """Commit an already validated viewpoint without another blocking operation."""
         with self._data_lock:
             self._site_sequence += 1
             report.site_id = self._site_sequence
