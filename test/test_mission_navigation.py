@@ -841,3 +841,25 @@ def test_report_rechecks_live_fire_after_transform_lookup(executive, change):
         executive._verify_record_fire(observation, 0.0)
     assert not executive._fire_sites
     assert not any(event[0] == 'report' for event in executive.events)
+
+
+def test_committed_fire_path_limit_counts_detour_not_endpoint_distance(executive):
+    executive.path_vertices = [pose(), pose(0.0, 8.0), pose(1.0)]
+    assert executive._verify_plan_to(pose(1.0), maximum_path_length=12.0) is False
+    assert not any(e[0] == 'offboard' for e in executive.events)
+
+
+def test_committed_fire_motion_timeout_recovers_to_loiter(executive):
+    def stall():
+        executive.now += 61.0
+    executive.on_motion = stall
+    with pytest.raises(VerificationObservationLost, match='movement time limit'):
+        executive._verify_plan_to(pose(1.0), maximum_path_length=12.0, motion_timeout=60.0)
+    assert executive.state.mode == 'AUTO.LOITER'
+    assert executive._motion_guard is None
+
+
+def test_committed_fire_timeout_starts_after_offboard_preparation(executive):
+    executive.on_warmup = lambda: setattr(executive, 'now', executive.now + 70.0)
+    assert executive._verify_plan_to(pose(1.0), maximum_path_length=12.0, motion_timeout=60.0)
+    assert executive.state.mode == 'AUTO.LOITER'

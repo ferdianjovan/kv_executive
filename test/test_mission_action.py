@@ -323,6 +323,12 @@ class SimulatedFcu(Node):
                 (current.position.x, current.position.y, current.position.z))
             response.surface_uncertainty = 0.1
             response.occupied_samples = 3
+            if request.smoke_wall_width > 0.0:
+                response.smoke_wall_valid = True
+                response.smoke_wall_range = response.surface_range
+                response.smoke_wall_nearest_range = response.surface_range
+                response.smoke_wall_uncertainty = 0.1
+                response.smoke_wall_samples = 25
         if request.ground_query.header.frame_id:
             response.ground_valid = True
             response.ground_surface.header = deepcopy(response.map_header)

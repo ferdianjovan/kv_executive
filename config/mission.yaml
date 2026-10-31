@@ -77,10 +77,13 @@ mission_executive:
     verify_viewpoint_max_steps: 3
     verify_viewpoint_timeout: 60.0
     verify_center_timeout: 30.0
-    # After confirming fire, take up to three short terrain-checked legs while
-    # retaining fresh fire guidance. Reliable source coordinates set standoff.
-    verify_fire_approach_max_steps: 3
-    verify_fire_standoff: 10.0
+    # CENTER_FIRE: short committed moves toward the observed smoke wall,
+    # requiring fresh fire confirmation after each stop.
+    verify_fire_approach_max_steps: 64
+    # CENTER_FIRE uses a 3 x 3 m observed smoke wall, not fire range.
+    verify_fire_leg_max_length: 12.0  # Actual planned route length, metres.
+    verify_fire_leg_timeout: 60.0  # Execution only; includes safe mode recovery on expiry.
+    verify_fire_standoff: 10.0  # Legacy parameter; CENTER_FIRE uses verify_smoke_standoff.
     verify_yaw_tolerance: 0.08726646259971647  # Radians: 5 degrees.
     verify_yaw_step: 0.5235987755982988  # Radians: at most 30 degrees per correction.
     verify_vertical_step: 0.5

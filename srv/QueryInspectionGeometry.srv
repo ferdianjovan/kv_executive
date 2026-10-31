@@ -3,6 +3,9 @@
 geometry_msgs/PointStamped origin
 geometry_msgs/Vector3Stamped direction
 float64 max_range
+# Opt-in CENTER_FIRE measurement: side length of a square of parallel camera
+# +X rays, spanning camera Y/Z. Zero leaves all existing queries unchanged.
+float64 smoke_wall_width
 geometry_msgs/PointStamped ground_query
 nav_msgs/Path corridor
 geometry_msgs/PointStamped keepout_center
@@ -56,3 +59,9 @@ bool current_clearance_reached
 # when no obstacle is hit; obstacle surfaces do not establish source identity.
 geometry_msgs/PointStamped ray_origin
 geometry_msgs/Vector3Stamped ray_direction
+# Observed occupied/free changes across fresh map history, not a fire range.
+bool smoke_wall_valid
+float64 smoke_wall_range
+float64 smoke_wall_nearest_range
+float64 smoke_wall_uncertainty
+uint32 smoke_wall_samples

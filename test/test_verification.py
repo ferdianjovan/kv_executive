@@ -107,6 +107,11 @@ class Harness:
             if guard:
                 guard()
 
+    def _verify_center_fire_wall(self, camera_frame):
+        distance = 20.0 - self.odometry.pose.pose.position.x
+        return dict(origin=deepcopy(self.odometry.pose.pose.position), axis=(1.0, 0.0, 0.0),
+                    mean=distance, nearest=distance, uncertainty=0.2, camera_frame=camera_frame)
+
     def _verify_record_fire(self, fire, bearing):
         self.events.append(('record', deepcopy(fire), bearing))
 
@@ -434,69 +439,50 @@ def test_confirmed_visible_fire_never_requires_smoke_leg_or_fire_range(
     assert not any(e[0] in {'navigation', 'plan'} for e in executive.events)
 
 
-def test_default_fire_policy_takes_three_guarded_legs_before_recording(system):
+def test_default_fire_policy_approaches_smoke_wall_without_fire_range(system):
     executive, _ = system
     executive.config.pop('verify_fire_approach_max_steps')
     controller = VerifyController(executive)
     executive._verify = controller
     executive.target_geometry.update(point=None, target_valid=False, range=math.nan)
     feed_fire(executive, controller)
-    origin = controller._pose()
     assert controller.center_fire(Blackboard()) == 'explore'
-    assert len([event for event in executive.events if event[0] == 'navigation']) == 3
-    assert executive.odometry.pose.pose.position.x == pytest.approx(origin.position.x + 9.0)
-    report_index = next(index for index, event in enumerate(executive.events)
-                        if event[0] == 'inspection_report')
-    assert all(index < report_index for index, event in enumerate(executive.events)
-               if event[0] == 'plan')
-    report = executive.events[report_index]
-    assert report[1]['point'] is None and not report[1]['target_valid']
-    assert report[2].detected
+    assert executive.odometry.pose.pose.position.x == pytest.approx(9.5)
+    assert len([e for e in executive.events if e[0] == 'navigation']) == 4
+    assert any('standoff reached' in e[1] for e in executive.events if e[0] == 'status')
+    assert any(e[0] == 'inspection_report' and e[2].detected for e in executive.events)
 
 
-def test_localized_fire_approach_clamps_the_leg_at_its_uncertain_standoff(system):
+def test_fire_coordinates_do_not_control_center_fire_motion(system):
     executive, controller = system
-    controller.config['verify_fire_approach_max_steps'] = 3
-    executive.target_geometry.update(point=Point(x=11.0), target_valid=True, uncertainty=0.25)
+    controller.config['verify_fire_approach_max_steps'] = 1
+    executive.target_geometry.update(point=Point(x=1.0), target_valid=True, uncertainty=0.25)
     feed_fire(executive, controller)
     assert controller.center_fire(Blackboard()) == 'explore'
-    requests = [event for event in executive.events if event[0] == 'navigation']
-    assert len(requests) == 1
-    assert requests[0][2]['fire_keepout_radius'] == pytest.approx(10.25)
-    assert executive.odometry.pose.pose.position.x == pytest.approx(0.75)
+    request = next(e for e in executive.events if e[0] == 'navigation')
+    assert 'fire_keepout_radius' not in request[2]
+    assert request[2]['target_valid'] is False
+    assert executive.odometry.pose.pose.position.x == pytest.approx(3.0)
 
 
-def test_localized_fire_already_at_standoff_does_not_force_another_leg(system):
+def test_smoke_wall_at_ten_metres_stops_even_if_fire_range_is_unknown(system):
     executive, controller = system
     controller.config['verify_fire_approach_max_steps'] = 3
-    executive.target_geometry.update(point=Point(x=9.0), target_valid=True)
+    executive.odometry.pose.pose.position.x = 9.5
+    executive.target_geometry.update(point=None, target_valid=False)
     feed_fire(executive, controller)
     assert controller.center_fire(Blackboard()) == 'explore'
-    assert not any(event[0] == 'navigation' for event in executive.events)
+    assert not any(e[0] == 'navigation' for e in executive.events)
 
 
-@pytest.mark.parametrize('degradation', ['unavailable', 'uncertain'])
-def test_losing_localization_never_drops_an_established_fire_standoff(system, degradation):
+def test_missing_wall_measurement_holds_without_inventing_distance(system):
     executive, controller = system
     controller.config['verify_fire_approach_max_steps'] = 3
+    executive._verify_center_fire_wall = lambda frame: None
     feed_fire(executive, controller)
-    original = executive._verify_navigation_viewpoint
-
-    def move_then_degrade(*args, **kwargs):
-        moved = original(*args, **kwargs)
-        if degradation == 'unavailable':
-            executive.target_geometry.update(point=None, target_valid=False, range=math.nan)
-        else:
-            executive.target_geometry['uncertainty'] = 3.0
-        return moved
-
-    executive._verify_navigation_viewpoint = move_then_degrade
-    board = Blackboard()
-    assert controller.center_fire(board) == 'explore'
-    assert board['verify_fire_standoff_established']
-    assert len([event for event in executive.events if event[0] == 'navigation']) == 1
-    assert any('retaining the established standoff' in event[1]
-               for event in executive.events if event[0] == 'status')
+    assert controller.center_fire(Blackboard()) == 'reacquire'
+    assert any(e[0] == 'hold' and e[1] == 5.0 for e in executive.events)
+    assert not any(e[0] in {'navigation', 'inspection_report'} for e in executive.events)
 
 
 def test_blocked_fire_approach_records_visible_evidence_without_claiming_motion(system):
@@ -533,7 +519,7 @@ def test_fire_approach_deadline_records_held_evidence_without_restarting_a_chase
 
 
 @pytest.mark.parametrize('interrupt', ['lost_fire', 'cancel'])
-def test_fire_approach_halts_on_track_loss_or_cancellation_before_reporting(system, interrupt):
+def test_fire_leg_completes_through_loss_but_cancellation_still_stops(system, interrupt):
     from kv_executive.mission_executive import MissionCanceled
     executive, controller = system
     controller.config['verify_fire_approach_max_steps'] = 3
@@ -544,6 +530,7 @@ def test_fire_approach_halts_on_track_loss_or_cancellation_before_reporting(syst
         if interrupt == 'cancel':
             raise MissionCanceled('cancel during fire approach')
         fire(executive, controller, detected=False)
+        executive.on_wait = lambda: fire(executive, controller, detected=False)
 
     executive.on_motion = stop
     if interrupt == 'cancel':
@@ -551,7 +538,10 @@ def test_fire_approach_halts_on_track_loss_or_cancellation_before_reporting(syst
             controller.center_fire(Blackboard())
     else:
         assert controller.center_fire(Blackboard()) == 'reacquire'
-    assert controller._pose() == before
+    if interrupt == 'cancel':
+        assert controller._pose() == before
+    else:
+        assert controller._pose().position.x == pytest.approx(before.position.x + 3.0)
     assert not any(event[0] == 'inspection_report' for event in executive.events)
 
 
@@ -752,14 +742,13 @@ def test_short_forward_steps_are_not_mislabeled_as_revisited_positions(system):
 
 
 @pytest.mark.parametrize('vertical', [-0.25, 0.25])
-def test_both_fire_axes_attempted_and_visible_imperfect_fire_reported(system, vertical):
+def test_center_fire_uses_one_yaw_correction_and_leaves_height_to_terrain(system, vertical):
     executive, controller = system
     feed_fire(executive, controller, yaw_correction_rad=0.3,
               vertical_correction_rad=vertical)
     assert controller.center_fire(Blackboard()) == 'explore'
     corrections = [e[0] for e in executive.events if e[0] in {'rotate', 'recovery_plan'}]
-    assert corrections[:2] == ['rotate', 'recovery_plan']
-    assert any(e[0] == 'recovery_plan' and e[2] is True for e in executive.events)
+    assert corrections == ['rotate']
     assert any(e[0] == 'inspection_report' and e[2] is not None for e in executive.events)
 
 
@@ -778,7 +767,7 @@ def test_blocked_vertical_centering_still_reports_current_visible_fire(system, f
     executive._verify_recovery_plan_to = blocked
     assert controller.center_fire(Blackboard()) == 'explore'
     assert any(e[0] == 'rotate' for e in executive.events)
-    assert sum(e[0] == 'blocked_vertical' for e in executive.events) == 1
+    assert not any(e[0] == 'blocked_vertical' for e in executive.events)
     assert any(e[0] == 'inspection_report' for e in executive.events)
 
 
@@ -791,7 +780,7 @@ def test_fire_centering_cannot_report_a_cached_pre_motion_frame(system):
 
 def test_fire_lost_during_vertical_correction_requires_new_confirmation(system):
     executive, controller = system
-    feed_fire(executive, controller, vertical_correction_rad=0.3)
+    feed_fire(executive, controller, yaw_correction_rad=0.3)
 
     def lose():
         fire(executive, controller, detected=False)
@@ -1191,7 +1180,7 @@ def test_noop_successful_planner_cannot_claim_a_completed_smoke_leg(system):
     assert verification._bb_get(board, 'verify_arrival_after_ns', 0) == 0
 
 
-def test_failed_horizontal_attempt_does_not_skip_vertical_fire_centering(system):
+def test_failed_horizontal_attempt_retains_visible_fire_without_vertical_dancing(system):
     executive, controller = system
     feed_fire(executive, controller, yaw_correction_rad=0.3, vertical_correction_rad=0.3)
 
@@ -1202,7 +1191,7 @@ def test_failed_horizontal_attempt_does_not_skip_vertical_fire_centering(system)
     executive._verify_rotate = blocked
     assert controller.center_fire(Blackboard()) == 'explore'
     assert any(e[0] == 'blocked_horizontal' for e in executive.events)
-    assert any(e[0] == 'recovery_plan' for e in executive.events)
+    assert not any(e[0] == 'recovery_plan' for e in executive.events)
     assert any(e[0] == 'inspection_report' for e in executive.events)
 
 
@@ -1215,8 +1204,8 @@ def test_lost_confirmed_fire_with_smoke_eventually_holds_without_false_negative(
     feed_smoke(executive, controller, coverage=0.3, regions=[1, 2, 3, 4])
     for _ in range(controller.config['verify_search_recovery_max'] - 1):
         assert controller.center_fire(board) == 'reacquire'
-    with pytest.raises(RuntimeError, match='Verify blocked'):
-        controller.center_fire(board)
+    assert controller.center_fire(board) == 'reacquire'
+    assert verification._bb_get(board, 'verify_search_failures', 0) == 0
     assert not any(e[0] == 'inspection_report' for e in executive.events)
 
 
@@ -1237,3 +1226,43 @@ def test_actual_new_viewpoint_resets_blocked_recovery_counter(system):
     board['verify_search_failures'] = 2
     assert controller.approach_smoke(board) == 'reacquire'
     assert board['verify_search_failures'] == 0
+
+
+def test_center_fire_climb_longer_than_five_seconds_finishes_before_observation_wait(system):
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 1
+    feed_fire(executive, controller)
+    def climb(bearing, **kwargs):
+        kwargs['guard']()
+        fire(executive, controller, detected=False)
+        executive.now += 8.0
+        kwargs['guard']()
+        executive.odometry.pose.pose.position.x += 3.0
+        executive.odometry.pose.pose.position.z += 3.0
+        return True
+    executive._verify_navigation_viewpoint = climb
+    executive.on_wait = lambda: fire(executive, controller, detected=False)
+    assert controller.center_fire(Blackboard()) == 'reacquire'
+    assert executive.odometry.pose.pose.position.x == pytest.approx(3.0)
+    assert executive.odometry.pose.pose.position.z == pytest.approx(9.0)
+    assert not any(e[0] == 'inspection_report' for e in executive.events)
+
+
+def test_center_fire_track_id_change_does_not_cancel_committed_leg(system):
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 1
+    feed_fire(executive, controller)
+    executive.on_motion = lambda: _qualified_fire(executive, controller, track_id=99)
+    executive.on_wait = lambda: _qualified_fire(executive, controller, track_id=99)
+    assert controller.center_fire(Blackboard()) == 'explore'
+    assert executive.odometry.pose.pose.position.x == pytest.approx(3.0)
+
+
+def test_center_fire_retreats_if_smoke_wall_is_already_too_close(system):
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 1
+    executive.odometry.pose.pose.position.x = 12.0
+    feed_fire(executive, controller)
+    assert controller.center_fire(Blackboard()) == 'explore'
+    assert executive.odometry.pose.pose.position.x < 12.0
+    assert not any(e[0] == 'navigation' for e in executive.events)

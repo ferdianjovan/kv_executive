@@ -16,6 +16,7 @@
 #include <sstream>
 #include <utility>
 #include <vector>
+#include <set>
 
 #include <octomap/OcTree.h>
 #include <octomap/AbstractOcTree.h>
@@ -1068,6 +1069,12 @@ private:
       {
         throw std::invalid_argument("Inspection clearances or corridor size are invalid");
       }
+      if (!std::isfinite(request->smoke_wall_width) || request->smoke_wall_width < 0.0 ||
+        request->smoke_wall_width > 3.0 ||
+        (request->smoke_wall_width > 0.0 && request->direction.header.frame_id.empty()))
+      {
+        throw std::invalid_argument("Smoke wall width must be between zero and 3 metres");
+      }
       const auto & frame = latest.header.frame_id;
       if (!request->direction.header.frame_id.empty()) {
         if (!std::isfinite(request->max_range) || request->max_range <= 0.0 ||
@@ -1102,6 +1109,59 @@ private:
         response->ray_direction.vector.x = ray_direction.x();
         response->ray_direction.vector.y = ray_direction.y();
         response->ray_direction.vector.z = ray_direction.z();
+        if (request->smoke_wall_width > 0.0) {
+          // Sample a physical 3-D aperture, not an angular cone or an inferred
+          // emitter position. Missing/unknown voxels are never free evidence.
+          geometry_msgs::msg::Vector3Stamped camera_y, camera_z, side, up;
+          camera_y.header = camera_z.header = request->direction.header;
+          camera_y.vector.y = camera_z.vector.z = 1.0;
+          tf_buffer_->transform(camera_y, side, frame, tf2::durationFromSec(transform_timeout_));
+          tf_buffer_->transform(camera_z, up, frame, tf2::durationFromSec(transform_timeout_));
+          const octomap::point3d lateral(side.vector.x, side.vector.y, side.vector.z);
+          const octomap::point3d vertical(up.vector.x, up.vector.y, up.vector.z);
+          std::vector<double> ranges;
+          std::set<int> rows, columns;
+          double voxel_uncertainty = 0.0;
+          for (int row = -2; row <= 2; ++row) {
+            for (int column = -2; column <= 2; ++column) {
+              const auto sample = ray_origin + lateral * (column * request->smoke_wall_width / 4.0) +
+                vertical * (row * request->smoke_wall_width / 4.0);
+              double nearest = request->max_range + 1.0;
+              for (const auto & map : history) {
+                octomap::point3d wall_hit;
+                if (!map.tree->castRay(sample, ray_direction, wall_hit, true, request->max_range)) {
+                  continue;
+                }
+                uint32_t occupied = 0, free = 0;
+                occupancyEvidence(history, wall_hit, occupied, free);
+                const double depth = (wall_hit - sample).dot(ray_direction);
+                if (occupied > 0 && free > 0 && depth > 0.0 && depth < nearest) {
+                  nearest = depth;
+                  voxel_uncertainty = std::max(voxel_uncertainty,
+                    std::sqrt(3.0) * leafSizeAt(*map.tree, wall_hit) * 0.5);
+                }
+              }
+              if (nearest <= request->max_range) {
+                ranges.push_back(nearest);
+                rows.insert(row);
+                columns.insert(column);
+              }
+            }
+          }
+          response->smoke_wall_samples = ranges.size();
+          if (ranges.size() >= 3 && rows.size() >= 2 && columns.size() >= 2) {
+            double sum = 0.0;
+            for (const double range : ranges) {sum += range;}
+            const double mean = sum / ranges.size();
+            double variance = 0.0;
+            for (const double range : ranges) {variance += (range - mean) * (range - mean);}
+            response->smoke_wall_range = mean;
+            response->smoke_wall_nearest_range = *std::min_element(ranges.begin(), ranges.end());
+            response->smoke_wall_uncertainty = voxel_uncertainty +
+              std::sqrt(variance / ranges.size());
+            response->smoke_wall_valid = true;
+          }
+        }
         octomap::point3d hit;
         if (latest.tree->castRay(ray_origin, ray_direction, hit, false, request->max_range)) {
           response->surface_valid = true;

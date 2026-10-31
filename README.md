@@ -340,14 +340,28 @@ CENTER_FIRE   -> center -> bounded guarded fire approach -> fire_found report
 blocked recovery -> wait in LOITER for newer fresh maps -> bounded retry or explicit abort
 ```
 
-After confirming fire, Verify takes up to `verify_fire_approach_max_steps`
-short terrain-checked legs (three by default), requiring fresh thermal guidance
-after each stop. Translated views can establish thermal multi-view coordinates.
-A reliable localized fire sets a horizontal `verify_fire_standoff` (10 m plus
-localization uncertainty), enforced by the native planner and path validators.
-Without metric range, the bounded legs follow the fresh bearing without inventing
-a distance. A blocked approach records the visible fire from the held viewpoint.
-Set the step limit to zero for centering/reporting without an additional approach.
+In `CENTER_FIRE`, distance is measured to the observed smoke wall, never to
+an estimated fire position. An opt-in geometry query samples 25 parallel rays
+across a 3 m by 3 m patch in front of the camera. Occupied/free changes in recent
+map history identify a suspected flickering wall; static or unknown cells alone
+do not. The mean range is logged, while the nearest sampled range, measurement
+uncertainty and tracking margin limit approach to `verify_smoke_standoff` (10 m).
+A missing wall estimate causes a hold and observation retry, not an assumed range.
+
+Fire centering attempts one bounded yaw correction; terrain planning selects
+climbing height. A short fire-approach maneuver retains its selected heading
+through detector gaps or tracking-ID changes. Each actual planned route is limited
+to `verify_fire_leg_max_length` (12 m), with `verify_fire_leg_timeout` (60 s)
+starting after OFFBOARD preparation. Terrain, wall clearance, vehicle health and
+operator cancellation remain authoritative during motion. The original observed
+wall boundary remains enforced through flicker, and newer closer returns tighten
+it. The five-second detector wait starts after stopping and cannot cut a climb.
+A new movement or successful arrival report requires fresh post-stop fire guidance.
+The approach is bounded by 64 legs and the existing inspection deadline; a blocked
+approach may still record visible fire from its held viewpoint without claiming
+arrival at the wall. Set the step limit to zero for observation-only reporting.
+Fire coordinates, when independently available, remain optional report metadata.
+These movement changes apply only to `CENTER_FIRE`.
 A confirmed fire can interrupt the first smoke leg. The controller stops in
 LOITER and requires new post-stop thermal images before further corrections.
 
@@ -434,13 +448,8 @@ Pausing and resuming simulation does not erase observations still within their
 source-age window.
 History expires with the existing freshness window and is capped at eight maps.
 
-`CENTER_FIRE` alternates bounded horizontal yaw and vertical altitude attempts.
-A downward correction is clamped to the observed terrain floor and cannot turn
-into a climb merely to satisfy the request. A rejected correction does not
-require perfect alignment: fresh confirmed fire still inside the thermal image
-is sufficient for a positive report after the bounded approach attempt.
-Brief losses wait for new post-stop images;
-cached guidance cannot authorize another correction or a report. Cancellation,
+`CENTER_FIRE` uses the bounded movement and smoke-wall policy described above.
+Cached images cannot authorize another movement or a report. Cancellation,
 battery Return/Abort requests, invalid telemetry and flight-control failures
 remain authoritative.
 

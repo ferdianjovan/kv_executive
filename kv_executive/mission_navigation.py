@@ -67,7 +67,8 @@ class VerifyNavigationMixin:
             self._check_running()
             if guard:
                 guard()
-        except VerificationObservationLost:
+        except VerificationObservationLost as error:
+            self._report(f'Verify: movement interrupted: {error}')
             self._motion_guard = None
             with self._goal_lock:
                 was_recovering = self._recovering
@@ -122,7 +123,8 @@ class VerifyNavigationMixin:
 
     def _verify_plan_to(self, target_local_pose, guard=None, speed=None,
                         allow_plan_failure=False, look_at_point=None, path_validator=None,
-                        planning_client=None, request_builder=None, heading_provider=None):
+                        planning_client=None, request_builder=None, heading_provider=None,
+                        maximum_path_length=None, motion_timeout=None):
         """Fly a validated plan; optionally decline an unavailable candidate."""
         from kv_executive.mission_executive import MissionError
         from kv_executive.srv import PlanToPose
@@ -208,6 +210,13 @@ class VerifyNavigationMixin:
                 raise MissionError(f'Invalid Verify path: {error}') from error
             if _distance(vertices[-1], target) > 1e-3:
                 raise MissionError('Verify planner did not reach the requested endpoint')
+            if maximum_path_length is not None:
+                length = sum(_distance(a, b) for a, b in zip(vertices, vertices[1:]))
+                if not math.isfinite(maximum_path_length) or maximum_path_length <= 0.0:
+                    raise MissionError('Invalid committed movement length limit')
+                if length > maximum_path_length:
+                    self._report('Verify/CENTER_FIRE: planned detour exceeds short movement limit')
+                    return False
             if any(pose.position.z < self.config['verify_minimum_altitude'] for pose in vertices):
                 raise MissionError('Verify path drops below the configured minimum altitude')
             _, current = self._verify_control_pose()
@@ -226,6 +235,20 @@ class VerifyNavigationMixin:
                 return False
             self.latest_path = deepcopy(path)
             current = self._verify_offboard()
+            if motion_timeout is not None:
+                if not math.isfinite(motion_timeout) or motion_timeout <= 0.0:
+                    raise MissionError('Invalid committed movement timeout')
+                deadline = time.monotonic() + motion_timeout
+                previous_guard = self._motion_guard
+
+                def bounded_guard():
+                    if previous_guard:
+                        previous_guard()
+                    if time.monotonic() >= deadline:
+                        raise VerificationObservationLost('CENTER_FIRE movement time limit exceeded')
+
+                self._motion_guard = bounded_guard
+                self._report('Verify/CENTER_FIRE: starting committed short movement')
             if _distance(planned_start, current) > self.config['position_tolerance']:
                 raise MissionError('Vehicle moved from Verify planned start during warmup')
             if not validated([current, *vertices]):

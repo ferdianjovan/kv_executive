@@ -1,4 +1,4 @@
-"""Repeat smoke approach and two-axis fire centering in an isolated process.
+"""Repeat smoke approach and bounded fire yaw centering in an isolated process.
 
 KV_VERIFY_PROCESS_PYTHON selects a compatible Python executable or launcher.
 Only a private simulated FCU is used; every MAVROS endpoint is remapped.
@@ -183,7 +183,7 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
             with sensors.lock:
                 sensors.source = 'smoke_fire'
             alive_wait(lambda: len(sensors.inspection_reports) > first_report,
-                       25.0, 'two-axis centering followed by visible-fire inspection result')
+                       25.0, 'bounded yaw centering followed by visible-fire inspection result')
             with sensors.lock:
                 sensors.source = None
                 report = deepcopy(sensors.inspection_reports[first_report])
@@ -193,9 +193,8 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
                 targets = deepcopy(recovery_targets[first_target:])
                 statuses = list(fcu.statuses[first_status:])
             assert report.fire_found and report.source_count == 2
-            assert len(targets) >= 2
-            assert any(abs(target.pose.position.z - source['z']) < 0.03
-                       for target in targets)
+            assert targets  # Terrain-checked smoke translation still precedes yaw centering.
+            assert any('one bounded fire-heading correction' in text for _, text in statuses)
             with fcu.lock:
                 strict = deepcopy(fcu.inspection_planning_requests)
             assert strict and all(request.terrain_envelope and request.minimum_radius == 0.0

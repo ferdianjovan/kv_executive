@@ -1021,8 +1021,8 @@ def test_smoke_then_fire_is_approached_before_recording_the_same_mission_goal(
     assert math.dist(_point_position(recorded), _point_position(before_fire)) > 0.05
     assert math.dist(_point_position(recorded), _point_position(fire_point)) < math.dist(
         _point_position(before_fire), _point_position(fire_point))
-    assert len(_assert_terrain_planning(mission, fire_standoff=True)) > plans_before_fire
-    wait_for(lambda: any('fire approach leg complete' in text for _, text in fcu.statuses),
+    assert len(_assert_terrain_planning(mission)) > plans_before_fire
+    wait_for(lambda: any('movement completed' in text for _, text in fcu.statuses),
              3.0, 'completed fire approach status delivery')
     _assert_same_goal_phases(sensors, goal)
     assert not goal.get_result_async().done()
@@ -1069,7 +1069,7 @@ def test_blocked_fire_approach_records_the_held_view_without_flying_into_obstacl
 
 
 @pytest.mark.parametrize('vertical_direction', [-1.0, 1.0])
-def test_visible_fire_attempts_both_axes_with_safe_altitude_correction(
+def test_visible_fire_centers_yaw_once_without_chasing_vertical_image_error(
     mission, monitoring_sensors, vertical_direction,
 ):
     sensors, fcu = monitoring_sensors, mission.fcu
@@ -1099,17 +1099,14 @@ def test_visible_fire_attempts_both_axes_with_safe_altitude_correction(
         sensors.source = None
     report = sensors.inspection_snapshot()[0]
     assert report.fire_found and not report.fire_location_valid
-    requests = _assert_terrain_planning(mission)
-    assert any(request.target.pose.position.z == pytest.approx(desired_z)
-               for request in requests)
+    with fcu.lock:
+        assert not fcu.inspection_planning_requests
+        assert fcu.pose.position.z == pytest.approx(initial.position.z, abs=0.03)
     with fcu.lock:
         before_report = [message.pose for stamp, mode, message in fcu.setpoints
                          if stamp < sensors.inspection_report_times[0] and mode == 'OFFBOARD']
     assert any(abs(angular_distance(yaw_from_quaternion(pose.orientation), desired_yaw)) < 0.09
                for pose in before_report)
-    assert all(math.hypot(request.target.pose.position.x - initial.position.x,
-                          request.target.pose.position.y - initial.position.y) < 0.03
-               for request in requests)
     cancel_goal(goal)
     _assert_airborne_safety(mission)
 
@@ -1138,7 +1135,7 @@ def test_visible_fire_survives_blocked_vertical_centering_and_reports(
              'still-visible off-center fire to remain reportable')
     with sensors.lock:
         sensors.source = None
-    assert rejected and sensors.inspection_snapshot()[0].fire_found
+    assert not rejected and sensors.inspection_snapshot()[0].fire_found
     assert not sensors.inspection_snapshot()[0].fire_location_valid
     with fcu.lock:
         verify_at = next(stamp for stamp, text in fcu.statuses if text == 'Verify: entered')
@@ -1197,9 +1194,8 @@ def test_fire_post_motion_miss_requires_fresh_guidance_before_reporting(
         initial_z = fcu.pose.position.z
     with sensors.lock:
         sensors.trusted_source = False
-        sensors.fire_guidance = lambda: (
-            0.0, 0.2 if fcu.pose.position.z < initial_z + 0.4 else 0.0)
-    original = mission.executive._verify_recovery_plan_to
+        sensors.fire_guidance = lambda: (0.2, 0.0)
+    original = mission.executive._verify_rotate
     stopped = []
 
     def move_then_miss(*args, **kwargs):
@@ -1214,7 +1210,7 @@ def test_fire_post_motion_miss_requires_fresh_guidance_before_reporting(
                 sensors.fire_suppressed_until = time.monotonic() + 0.2
         return moved
 
-    mission.executive._verify_recovery_plan_to = move_then_miss
+    mission.executive._verify_rotate = move_then_miss
     goal = _start_visible_fire(mission, sensors)
     wait_for(lambda: bool(sensors.inspection_snapshot()), 20.0,
              'a fresh post-stop detection to complete the fire report')
@@ -1357,3 +1353,81 @@ def test_nonalert_battery_estimate_does_not_interrupt_exploration(
     time.sleep(0.2)
     assert not result.done()
     cancel_goal(goal)
+
+
+def test_center_fire_climbing_move_survives_detector_flicker_and_reconfirms_at_stop(
+    mission, monitoring_sensors,
+):
+    sensors, fcu = monitoring_sensors, mission.fcu
+    for settings in (mission.executive.config, mission.executive._verify.config):
+        settings.update(verify_fire_approach_max_steps=1,
+                        verify_reacquire_observation_timeout=10.0,
+                        verify_motion_speed=0.5)
+    with fcu.lock:
+        initial = deepcopy(fcu.pose.position)
+        fcu.inspection_terrain_z = initial.z - 4.5
+    original = fcu.plan_inspection_path
+    selected = []
+
+    def plan_then_flicker(request, response):
+        response = original(request, response)
+        if response.success and not selected:
+            selected.append(deepcopy(request.target.pose.position))
+            with sensors.lock:
+                sensors.fire_suppressed_until = time.monotonic() + 12.0
+        return response
+
+    fcu.inspection_planning_service.callback = plan_then_flicker
+    goal = _start_visible_fire(mission, sensors)
+    wait_for(lambda: bool(sensors.inspection_snapshot()), 40.0,
+             'committed climb through fire loss followed by a fresh stopped observation')
+    with sensors.lock:
+        sensors.source = None
+    report = sensors.inspection_snapshot()[0]
+    assert report.fire_found and selected
+    assert report.observer_local_pose.pose.position.z > initial.z + 2.0
+    with fcu.lock:
+        messages = [text for _, text in fcu.statuses]
+        assert any('movement completed' in text for text in messages)
+        assert not any('Tracked fire observation lost' in text for text in messages)
+        assert any(request.smoke_wall_width == 3.0 for request in fcu.geometry_requests)
+        assert not any(request.minimum_radius > 0.0 for request in fcu.inspection_planning_requests)
+    cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
+def test_center_fire_arrives_at_smoke_wall_boundary_with_fresh_fire(mission, monitoring_sensors):
+    sensors, fcu = monitoring_sensors, mission.fcu
+    for settings in (mission.executive.config, mission.executive._verify.config):
+        settings['verify_fire_approach_max_steps'] = 8
+    original = fcu.query_inspection_geometry
+    wall_point = []
+
+    def wall_geometry(request, response):
+        response = original(request, response)
+        if request.smoke_wall_width:
+            if not wall_point:
+                origin, direction = response.ray_origin.point, response.ray_direction.vector
+                wall_point.append(Point(**{a: getattr(origin, a) + 11.5 * getattr(direction, a)
+                                           for a in 'xyz'}))
+            origin = response.ray_origin.point
+            distance = math.dist(_point_position(origin), _point_position(wall_point[0]))
+            response.smoke_wall_range = response.smoke_wall_nearest_range = distance
+        return response
+
+    fcu.geometry_service.callback = wall_geometry
+    goal = _start_visible_fire(mission, sensors)
+    wait_for(lambda: bool(sensors.inspection_snapshot()), 60.0,
+             'safe smoke-wall arrival with confirmed fire still visible')
+    with sensors.lock:
+        sensors.source = None
+    report = sensors.inspection_snapshot()[0]
+    assert report.fire_found
+    distance = math.dist(_point_position(report.observer_local_pose.pose.position),
+                         _point_position(wall_point[0]))
+    assert 10.0 <= distance <= 11.0
+    with fcu.lock:
+        assert any('smoke-wall standoff reached with fresh fire visible' in text
+                   for _, text in fcu.statuses)
+    cancel_goal(goal)
+    _assert_airborne_safety(mission)

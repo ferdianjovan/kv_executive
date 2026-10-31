@@ -1669,3 +1669,72 @@ def test_fire_loss_after_legacy_report_prevents_new_target_report(executive):
         executive._verify_report_inspection(target_geometry(), original_fire)
     assert any(event[0] == 'legacy_report' for event in executive.events)
     assert not any(event[0] == 'report' for event in executive.events)
+
+
+def test_center_fire_wall_queries_physical_camera_aperture_and_preserves_mean(executive):
+    def wall(request, response):
+        assert request.smoke_wall_width == 3.0
+        assert request.direction.vector.x == 1.0
+        assert request.origin.header.frame_id == 'thermal_camera'
+        assert request.origin.header.stamp.sec == 0
+        response.smoke_wall_valid = True
+        response.smoke_wall_range = 15.0
+        response.smoke_wall_nearest_range = 14.0
+        response.smoke_wall_uncertainty = 0.2
+        response.smoke_wall_samples = 25
+    executive.on_query = wall
+    measured = executive._verify_center_fire_wall('thermal_camera')
+    assert measured['mean'] == 15.0 and measured['nearest'] == 14.0
+    assert measured['origin'] == Point(z=20.0)
+    assert math.hypot(*measured['axis']) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize('reason', ['missing', 'few_samples', 'uncertain', 'nan'])
+def test_center_fire_wall_rejects_unverified_distance(executive, reason):
+    def wall(request, response):
+        response.smoke_wall_valid = reason != 'missing'
+        response.smoke_wall_range = 15.0
+        response.smoke_wall_nearest_range = math.nan if reason == 'nan' else 14.0
+        response.smoke_wall_uncertainty = 3.0 if reason == 'uncertain' else 0.2
+        response.smoke_wall_samples = 1 if reason == 'few_samples' else 25
+    executive.on_query = wall
+    assert executive._verify_center_fire_wall('thermal_camera') is None
+
+
+@pytest.mark.parametrize('live_distance', [None, 12.0, 25.0])
+def test_center_fire_wall_path_keeps_old_bound_and_tightens_for_closer_wall(executive, live_distance):
+    wall = dict(origin=Point(z=20.0), axis=(1.0, 0.0, 0.0), mean=15.0,
+                nearest=15.0, uncertainty=0.2, camera_frame='thermal_camera')
+    live = None if live_distance is None else {**wall, 'nearest': live_distance}
+    executive._verify_center_fire_wall = lambda frame: live
+    geometry = {'center_fire_wall': wall}
+    def path(x):
+        return Path(poses=[PoseStamped(pose=Pose(position=Point(x=x, z=23.0)))])
+    assert executive._verify_center_fire_wall_path(path(1.0), geometry)
+    assert not executive._verify_center_fire_wall_path(path(5.0), geometry)
+    assert executive._verify_center_fire_wall_path(path(3.0), geometry) == (live_distance != 12.0)
+    assert executive._verify_center_fire_wall_path(path(-1.0), geometry)
+
+
+def test_center_fire_recovery_passes_fixed_scalar_heading_and_movement_limits(executive):
+    wall = dict(origin=Point(z=20.0), axis=(1.0, 0.0, 0.0), mean=20.0,
+                nearest=20.0, uncertainty=0.2, camera_frame='thermal_camera')
+    executive._verify_center_fire_wall = lambda frame: None
+    geometry = dict(center_fire_wall=wall, center_fire_max_path_length=12.0,
+                    center_fire_motion_timeout=60.0)
+    target = Pose(position=Point(x=1.0, z=20.0), orientation=quaternion_from_yaw(0.2))
+    assert executive._verify_recovery_plan_to(target, geometry=geometry)
+    options = next(e[2] for e in executive.events if e[0] == 'plan')
+    assert options['heading_provider'](target) == pytest.approx(0.2)
+    assert options['maximum_path_length'] == 12.0
+    assert options['motion_timeout'] == 60.0
+
+
+def test_center_fire_can_take_a_short_final_wall_limited_step(executive):
+    executive._verify_center_fire_wall = lambda frame: None
+    wall = dict(origin=Point(z=20.0), axis=(1.0, 0.0, 0.0), mean=11.0,
+                nearest=11.0, uncertainty=0.2, camera_frame='thermal_camera')
+    geometry = dict(center_fire_wall=wall, center_fire_max_path_length=12.0,
+                    center_fire_motion_timeout=60.0)
+    assert executive._verify_navigation_viewpoint(0.0, geometry=geometry, maximum_forward=0.5)
+    assert executive.odometry.pose.pose.position.x == pytest.approx(0.5)

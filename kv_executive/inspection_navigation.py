@@ -554,6 +554,9 @@ class InspectionNavigationMixin:
                 raise MissionError('Fire standoff requires a valid localized source and radius')
 
         def validate(path):
+            if geometry and geometry.get('center_fire_wall') is not None:
+                if not self._verify_center_fire_wall_path(path, geometry):
+                    return False
             if terrain is None and any(
                     vertex.pose.position.z < floor - self.config.get('position_tolerance', 0.3)
                     for vertex in path.poses):
@@ -568,7 +571,9 @@ class InspectionNavigationMixin:
                 terrain_envelope=True, allow_terrain_escape=True, escape_state=escape_state)
 
         fallback = yaw_from_quaternion(target.orientation)
-        heading = self._verify_live_source_heading(fallback)
+        center_fire = bool(geometry and geometry.get('center_fire_wall') is not None)
+        heading = ((lambda _pose: fallback) if center_fire
+                   else self._verify_live_source_heading(fallback))
         if math.dist(tuple(getattr(current.position, axis) for axis in 'xyz'),
                      tuple(getattr(target.position, axis) for axis in 'xyz')) < 1e-6:
             corridor = Path()
@@ -587,7 +592,69 @@ class InspectionNavigationMixin:
                 point=keepout_point, minimum_radius=keepout_radius,
                 minimum_agl=minimum_agl, allow_initial_climb=True,
                 terrain_envelope=True, allow_terrain_escape=True),
+            **(dict(maximum_path_length=geometry['center_fire_max_path_length'],
+                    motion_timeout=geometry['center_fire_motion_timeout']) if center_fire else {}),
         )
+
+    def _verify_center_fire_wall(self, camera_frame):
+        """Measure a 3 x 3 m flickering smoke-wall aperture; never estimate fire range."""
+        from kv_executive.srv import QueryInspectionGeometry
+        request = QueryInspectionGeometry.Request()
+        request.origin.header.frame_id = request.direction.header.frame_id = camera_frame
+        # Latest camera TF: this is a current map measurement, not an old image ray.
+        request.direction.vector.x = 1.0
+        request.max_range = self.config.get('verify_inspection_max_range', 40.0)
+        request.smoke_wall_width = 3.0
+        response = self._inspection_query(request, require_map=True)
+        if not response.smoke_wall_valid:
+            return None
+        mean, nearest, uncertainty = (response.smoke_wall_range,
+                                     response.smoke_wall_nearest_range,
+                                     response.smoke_wall_uncertainty)
+        if (response.smoke_wall_samples < 3
+                or not all(math.isfinite(v) for v in (mean, nearest, uncertainty))
+                or not 0.0 < nearest <= mean <= request.max_range
+                or not 0.0 <= uncertainty <= self.config['verify_inspection_max_uncertainty']):
+            return None
+        conversion = self._path_frame_transform(self.config['verify_planning_frame'])
+        origin = response.ray_origin.point
+        direction = response.ray_direction.vector
+        if (response.ray_origin.header.frame_id != self.config['verify_planning_frame']
+                or response.ray_direction.header.frame_id != self.config['verify_planning_frame']
+                or not _finite_point(origin) or not _finite_point(direction)):
+            return None
+        local = transform_pose(Pose(position=deepcopy(origin),
+                                    orientation=quaternion_from_yaw(0.0)), conversion).position
+        end = transform_pose(Pose(position=Point(**{
+            a: getattr(origin, a) + getattr(direction, a) for a in 'xyz'}),
+            orientation=quaternion_from_yaw(0.0)), conversion).position
+        axis = tuple(getattr(end, a) - getattr(local, a) for a in 'xyz')
+        norm = math.hypot(*axis)
+        if norm < 1e-6:
+            return None
+        return dict(origin=local, axis=tuple(v / norm for v in axis), mean=mean,
+                    nearest=nearest, uncertainty=uncertainty, camera_frame=camera_frame)
+
+    def _verify_center_fire_wall_path(self, path, geometry):
+        """Protect the observed wall plane through a short maneuver and map flicker."""
+        wall = geometry['center_fire_wall']
+        live = self._verify_center_fire_wall(wall['camera_frame'])
+        # The original observed plane remains a bound if the live wall flickers
+        # away. A fresh closer wall can tighten that bound, never loosen it.
+        for measured in (wall, live):
+            if measured is None:
+                continue
+            allowed = (measured['nearest'] - measured['uncertainty']
+                       - self.config.get('verify_smoke_standoff', 10.0)
+                       - self.config.get('position_tolerance', 0.3))
+            allowed = max(0.0, allowed)
+            for vertex in path.poses:
+                advance = sum((getattr(vertex.pose.position, a) - getattr(measured['origin'], a))
+                              * measured['axis'][i] for i, a in enumerate('xyz'))
+                if advance > allowed + 1e-6:
+                    self._report('Verify/CENTER_FIRE: path would cross the 10 m smoke-wall boundary')
+                    return False
+        return True
 
     def _verify_localization_viewpoint(
         self, geometry=None, index=0, guard=None, origin=None, bearing=None,
@@ -689,6 +756,9 @@ class InspectionNavigationMixin:
             raise MissionError(
                 'Invalid terrain navigation step, clearance band or candidate limit')
         minimum_step = max(0.1, 2.0 * self.config.get('position_tolerance', 0.3))
+        if geometry and geometry.get('center_fire_wall') is not None:
+            # The last wall-limited advance may be shorter than a survey leg.
+            minimum_step = min(minimum_step, step)
         sign = 1.0 if index % 2 == 0 else -1.0
         # Both oblique sides precede a short direct step. Each successful move
         # starts the next fan at actual odometry, never at an old lateral anchor.
