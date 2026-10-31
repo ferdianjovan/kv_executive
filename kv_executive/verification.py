@@ -1131,7 +1131,8 @@ class VerifyController:
     def _navigation_start_unavailable(self, blackboard, error, resume='reacquire'):
         """Hold for a newer valid map within one bounded recovery episode."""
         deadline = time.monotonic() + self.config['verify_navigation_map_timeout']
-        if not isinstance(error, VerificationMapUnavailable):
+        map_unavailable = isinstance(error, VerificationMapUnavailable)
+        if not map_unavailable:
             # Persistent clearance failures share a budget until the aircraft
             # moves. A map outage ends when fresh data returns; healthy planning
             # and OFFBOARD handoff must not consume the next outage's budget.
@@ -1156,7 +1157,7 @@ class VerifyController:
         ros_now_ns = self._now_ns()
         if after_ns > ros_now_ns + int(self.config['verify_future_tolerance'] * 1e9):
             after_ns = 0
-        kind = ('map unavailable' if isinstance(error, VerificationMapUnavailable)
+        kind = ('map unavailable' if map_unavailable
                 else 'clearance recovery unavailable' if isinstance(
                     error, VerificationRecoveryUnavailable)
                 else 'current clearance unavailable')
@@ -1166,7 +1167,9 @@ class VerifyController:
             f'recovery budget {max(0.0, deadline - time.monotonic()):.1f} s')
         while time.monotonic() < deadline:
             self._check()
-            if self.stable_fire() is not None:
+            # Fire cannot end a map outage: CENTER_FIRE would encounter the
+            # same stale map and restart this deadline on every transition.
+            if not map_unavailable and self.stable_fire() is not None:
                 return self._route_fire(blackboard)
             # Finish the mode handoff and poll from LOITER instead of
             # repeating camera centering before new map evidence arrives.
@@ -1176,7 +1179,7 @@ class VerifyController:
             self.executive._verify_hold(
                 min(0.25, remaining), guard=self._check)
             self._check()
-            if self.stable_fire() is not None:
+            if not map_unavailable and self.stable_fire() is not None:
                 return self._route_fire(blackboard)
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
@@ -1191,6 +1194,8 @@ class VerifyController:
                 blackboard['verify_reference_pose'] = self._pose()
                 self.executive._report(
                     'Verify: newer fresh OctoMap observed; retrying clearance checks')
+                if self.stable_fire() is not None:
+                    return self._route_fire(blackboard)
                 return resume
         self._check()
         last_map_status = getattr(self.executive, '_verify_map_unavailable_reason', '')

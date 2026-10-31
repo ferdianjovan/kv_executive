@@ -1040,8 +1040,12 @@ def test_fire_found_during_map_refresh_does_not_get_abandoned(system, error_type
     assert any(e[0] == 'inspection_report' for e in executive.events)
 
 
-def test_map_recovery_waits_for_a_new_source_stamp_without_recentering(system):
+@pytest.mark.parametrize('confirmed_fire', [False, True])
+def test_map_recovery_waits_for_a_new_source_stamp_without_recentering(system, confirmed_fire):
     executive, controller = system
+    if confirmed_fire:
+        _qualified_fire(executive, controller)
+        assert controller.stable_fire() is not None
     baseline = executive._verify_last_geometry_stamp_ns
     stamps = iter([baseline, 0, baseline, baseline + 500_000_000])
 
@@ -1053,7 +1057,8 @@ def test_map_recovery_waits_for_a_new_source_stamp_without_recentering(system):
     executive._verify_fresh_map_stamp = poll
     board = Blackboard()
     error = verification.VerificationMapUnavailable('source age exceeds limit', baseline)
-    assert controller._navigation_start_unavailable(board, error, resume='approach') == 'approach'
+    expected = 'fire' if confirmed_fire else 'approach'
+    assert controller._navigation_start_unavailable(board, error, resume='approach') == expected
     assert len([event for event in executive.events if event[0] == 'map_poll']) == 4
     assert board['verify_navigation_refresh_stamp_ns'] == baseline + 500_000_000
     assert not any(event[0] in {'rotate', 'plan', 'navigation', 'recovery_plan'}
@@ -1061,8 +1066,18 @@ def test_map_recovery_waits_for_a_new_source_stamp_without_recentering(system):
 
 
 @pytest.mark.parametrize('available', [False, True])
-def test_missing_or_replayed_maps_exhaust_one_bounded_recovery_budget(system, available):
+@pytest.mark.parametrize('fire_timing', ['none', 'before', 'during'])
+def test_missing_or_replayed_maps_exhaust_one_bounded_recovery_budget(
+        system, available, fire_timing):
     executive, controller = system
+    if fire_timing == 'before':
+        _qualified_fire(executive, controller)
+        assert controller.stable_fire() is not None
+    elif fire_timing == 'during':
+        def detect_fire_once():
+            _qualified_fire(executive, controller)
+            executive.on_wait = lambda: None
+        executive.on_wait = detect_fire_once
     controller.config['verify_navigation_map_timeout'] = 1.0
     executive.map_available = available
     executive.map_stamp_ns = executive._verify_last_geometry_stamp_ns
@@ -1071,6 +1086,8 @@ def test_missing_or_replayed_maps_exhaust_one_bounded_recovery_budget(system, av
         controller._navigation_start_unavailable(
             Blackboard(), verification.VerificationMapUnavailable('stale source'))
     assert executive.now == pytest.approx(started + 1.0)
+    if fire_timing != 'none':
+        assert controller.stable_fire() is not None
     assert not any(event[0] in {'rotate', 'plan', 'navigation'} for event in executive.events)
 
 
