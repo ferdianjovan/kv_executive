@@ -394,29 +394,40 @@ the next approach/inspection movement. A confirmed fire below the image centre
 requests descent; one above requests climb. Committed paths still finish through
 detector gaps rather than changing their position targets during execution.
 Vertical guidance activates outside 7 degrees and releases inside 5 degrees by
-default (`verify_vertical_tolerance` plus `verify_vertical_hysteresis`). A fire
-more than `verify_vertical_edge_threshold` (15 degrees) from the image centre
-requests a bounded vertical-only correction before another forward advance.
+default (`verify_vertical_tolerance` plus `verify_vertical_hysteresis`). During
+approach, upward and downward guidance use the same selection order: first try a
+combined forward/height leg, shortening forward travel for a large vertical image
+error; if no such route is available, try one height-only correction of up to
+0.5 m; if that is also unavailable, try a checked terrain-following forward leg.
+One height-only attempt is permitted from each horizontal viewpoint. A successful
+height-only correction must be followed by a fresh approach decision before any
+further correction, and useful forward progress renews the height-only allowance.
+Fire or smoke must provide fresh heading guidance before any forward translation.
+The opportunistic wall probe remains part of approach decisions even while fire
+height guidance is active; missing range alone does not prevent approach.
 At the wall standoff, up to `verify_vertical_max_corrections` (3) corrections are
 best effort: perfect image centering is not an additional report requirement.
 Vertical corrections consume the existing fire-leg and inspection-time budgets.
-Missing terrain evidence or insufficient clearance prevents descent. When an
-observed terrain floor prevents a useful downward correction, that optional
-correction is skipped and logged. With fresh post-stop smoke or confirmed fire
-guidance, the aircraft may instead select one short forward leg at its current
-altitude, climbing only as required by terrain clearance. The blocked downward
-preference is suppressed until that forward leg makes useful progress; height
-guidance is reconsidered from the new viewpoint, including where terrain drops
-away. This applies to remembered corrections, visible edge-priority corrections,
-and combined forward/downward approach goals. A blocked correction never relaxes
+Missing terrain evidence or insufficient clearance prevents descent. A useful
+partial correction is allowed when the full request cannot fit above the terrain
+floor. Requests smaller than `verify_vertical_minimum_change` (0.10 m) are skipped
+before flight. Height-guided goals additionally converge within
+`verify_vertical_position_tolerance` (0.05 m), independently of the ordinary
+0.30 m position tolerance, with corridor checks continuing during convergence.
+The terrain-following fallback retains altitude where possible and climbs as
+terrain clearance requires. Height guidance is reconsidered after useful forward
+progress, including where terrain drops away. A blocked correction never relaxes
 the smoke-wall boundary or authorizes forward travel at the protected standoff.
 Each completed correction requires another post-stop observation before another
 correction; completed reporting additionally requires fresh wall evidence.
 
-A confirmed fire seen during motion can supply one remembered height-recovery
-correction after arrival if it disappears above or below the image centre.
-The normal 7-degree activation threshold applies; the image need not already
-show the fire beyond the 15-degree edge-priority threshold.
+A confirmed fire seen during motion can supply one remembered height preference
+after arrival if it disappears above or below the image centre. With fresh smoke
+heading guidance, the same combined-first selection order applies. Without fresh
+heading guidance, a remembered hint can supply only a bounded height-only search.
+The normal 7-degree activation threshold applies. Forward travel shortens as
+the vertical image error grows; the final-centering edge threshold does not
+force height-only movement during approach.
 `verify_vertical_memory_timeout` defaults to 15 source/ROS seconds. A short leg
 lasting 30–150 wall seconds in slow simulation can therefore retain usable
 direction. This timeout is independent of the post-arrival detector wait.
@@ -431,10 +442,9 @@ hint logs its exact reason, source/wall ages, angle, travel, rotation and clock
 silence. Temporary ineligibility does not consume the hint. Selecting the single
 checked correction consumes it, even if terrain or planning blocks execution;
 the result distinguishes selection, rejection, and actual height movement.
-An observed terrain-floor veto permits ordinary reacquisition and the checked
-forward fallback above; missing terrain, other planning failures, and an executed
-correction with no useful height change retain their existing recovery/error
-handling. The fallback does not restart inspection or blocked-route budgets.
+Unavailable optional candidates permit the next checked alternative above;
+map, vehicle, cancellation and actual execution failures retain their existing
+recovery/error handling. The fallback does not restart inspection or blocked-route budgets.
 Another correction needs new confirmation. Remembered direction never qualifies
 as fresh fire for reporting. Detector diagnostics separately retain raw producer
 confirmation progress, including `CONFIRMING` messages that cannot steer.
@@ -443,12 +453,16 @@ Slow-clock regressions use real 0.1× and 0.2× ROS clocks and verify actual 0.5
 descent and climb after fire disappears during a long approach leg.
 The 0.2× terrain-floor regression also verifies a refused remembered descent,
 a completed level forward fallback, and a newly permitted 0.5 m descent after
-crossing a terrain drop, all within the same mission goal.
+crossing a terrain drop, all within the same mission goal. Symmetrical fallback
+cases check combined movement, one height-only attempt, then terrain-following
+forward movement, including persistent fire near the image edge.
 Deterministic cases additionally cover 30-, 60-, and 150-wall-second legs,
 frozen/rewound clocks, discarded hints, and blocked/no-op descent attempts.
 The executive checkpoint immediately before this timing fix is `b2e8d58`.
 The baseline before terrain-limited descent fallback is tagged
 `checkpoint-before-height-fallback-20261101` in each `kv_` package repository.
+The baseline before symmetrical combined-first selection is tagged
+`checkpoint-before-symmetric-fire-guidance` in each `kv_` package repository.
 
 A short fire-approach maneuver retains its selected heading
 through detector gaps or tracking-ID changes. Each actual planned route is limited

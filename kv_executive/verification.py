@@ -36,6 +36,8 @@ VERIFY_DEFAULTS = {
     'verify_yaw_tolerance': math.radians(5.0),
     'verify_yaw_step': math.radians(30.0),
     'verify_vertical_step': 0.5,
+    'verify_vertical_position_tolerance': 0.05,
+    'verify_vertical_minimum_change': 0.10,
     'verify_vertical_tolerance': math.radians(5.0),
     'verify_vertical_hysteresis': math.radians(2.0),
     'verify_vertical_edge_threshold': math.radians(15.0),
@@ -759,8 +761,8 @@ class VerifyController:
                 'Verify: inspection time budget exhausted; inspection incomplete; '
                 'holding for operator') from error
 
-    def _recover_fire_height(self, blackboard):
-        """Use confirmed height direction once at the end of its short movement."""
+    def _remembered_height_fire(self, blackboard):
+        """Return one eligible height hint without authorizing horizontal movement."""
         clock_running, clock_silence = self._height_clock_progress()
         self._capture_height_hint(blackboard)
         if self.stable_fire() is not None:
@@ -771,11 +773,6 @@ class VerifyController:
         fire, pose, received = hint
         stamp = self._stamp_ns(fire)
         if stamp <= _bb_get(blackboard, 'verify_height_hint_consumed', 0):
-            return False
-        if (fire.vertical_correction_rad < 0.0
-                and _bb_get(blackboard, 'verify_descent_deferred', False)
-                and not _bb_get(blackboard, 'verify_smoke_boundary_reached', False)):
-            blackboard['verify_height_hint_consumed'] = stamp
             return False
         current = self._pose()
         distance = math.dist(tuple(getattr(current.position, a) for a in 'xyz'),
@@ -811,35 +808,78 @@ class VerifyController:
                 f'travel={distance:.2f} m, yaw_change={math.degrees(turn):.1f} deg, '
                 f'clock_silence={clock_silence:.2f} s, track={getattr(fire, "track_id", 0)}')
             return False
-        blackboard['verify_height_hint_consumed'] = stamp
-        self._inspection_begin(blackboard)
-        blackboard['verify_fire_observed'] = True
-        vertical = math.copysign(self.config['verify_vertical_step'], fire.vertical_correction_rad)
-        target = deepcopy(current)
+        return fire
+
+    def _height_forward_limit(self, vertical, angle):
+        """Shorten a combined leg when forward motion would overwhelm its height change."""
+        if not vertical:
+            return None
+        slope = math.tan(abs(angle))
+        if not math.isfinite(slope) or slope <= 0.0:
+            return self.config['verify_navigation_step']
+        return min(self.config['verify_navigation_step'], 0.8 * abs(vertical) / slope)
+
+    def _attempt_approach_height(self, blackboard, vertical, *, remembered=False):
+        """Try one optional height-only correction from this horizontal viewpoint."""
+        if _bb_get(blackboard, 'verify_height_only_attempted', False):
+            self.executive._report(
+                'Verify: height-only correction already attempted from this viewpoint; '
+                'requiring forward progress before another')
+            return False
+        if _bb_get(blackboard, 'verify_fire_approach_steps', 0) >= self.config[
+                'verify_fire_approach_max_steps']:
+            raise self.error_type(
+                'Verify: fire approach step limit reached before smoke-wall standoff; '
+                'inspection incomplete; holding for operator')
+        blackboard['verify_height_only_attempted'] = True
+        before = self._pose()
+        target = deepcopy(before)
         target.position.z += vertical
         self.executive._report(
-            f'Verify: remembered fire-height reacquisition {vertical:+.2f} m; '
-            'one checked correction before another forward leg')
+            f'Verify: {"remembered " if remembered else ""}height-only fire correction '
+            f'{vertical:+.2f} m; one attempt from this viewpoint')
         self.executive._verify_height_rejection = ''
         moved = self.executive._verify_recovery_plan_to(
             target, geometry=self._wall_geometry(blackboard),
             guard=lambda: self._movement_guard(blackboard), preserve_requested_altitude=True)
-        actual_change = self._pose().position.z - current.position.z
-        if moved is False and self._height_floor_rejected(vertical):
-            self._defer_descent(blackboard)
-            return False
-        if moved is False or actual_change * math.copysign(1.0, vertical) <= 0.01:
-            reason = ('terrain or planning validation rejected it' if moved is False
-                      else 'no useful movement in the requested height direction')
-            raise self.error_type(
-                'Verify: selected fire-height reacquisition was not executed: '
-                + reason + f'; actual height change={actual_change:+.2f} m; holding for operator')
+        actual = self._pose().position.z - before.position.z
+        minimum = self.config['verify_vertical_minimum_change'] - self.config[
+            'verify_vertical_position_tolerance']
+        useful = moved is not False and actual * math.copysign(1.0, vertical) >= minimum - 1e-6
         self.executive._report(
-            f'Verify: fire-height reacquisition completed; '
-            f'actual height change={actual_change:+.2f} m')
+            f'Verify: height-only correction {"completed" if useful else "unavailable"}; '
+            f'requested={vertical:+.2f} m, actual height change={actual:+.2f} m; '
+            f'reason={getattr(self.executive, "_verify_height_rejection", "") or "path/progress"}')
+        if not useful:
+            if self._height_floor_rejected(vertical):
+                self._defer_descent(blackboard)
+            return False
+        blackboard['verify_fire_approach_steps'] = _bb_get(
+            blackboard, 'verify_fire_approach_steps', 0) + 1
         blackboard['verify_inspection_after_ns'] = self._now_ns()
         self._inspection_wait_fire(blackboard)
         return True
+
+    def _recover_fire_height(self, blackboard):
+        """Use remembered height alone only when no fresh bearing permits a combined leg."""
+        fire = self._remembered_height_fire(blackboard)
+        if fire is None or fire is False:
+            return False
+        after_ns = max(_bb_get(blackboard, 'verify_arrival_after_ns', 0),
+                       _bb_get(blackboard, 'verify_inspection_after_ns', 0))
+        smoke = self._smoke_guidance(after_ns=after_ns)
+        if smoke is not None or self.stable_fire() is not None:
+            return False
+        fire = self._remembered_height_fire(blackboard)
+        if not fire:
+            return False
+        if _bb_get(blackboard, 'verify_height_only_attempted', False):
+            return False
+        blackboard['verify_height_hint_consumed'] = self._stamp_ns(fire)
+        self._inspection_begin(blackboard)
+        blackboard['verify_fire_observed'] = True
+        vertical = math.copysign(self.config['verify_vertical_step'], fire.vertical_correction_rad)
+        return self._attempt_approach_height(blackboard, vertical, remembered=True)
 
     def _approach_observation(self, blackboard, after_ns=0):
         fire = self.stable_fire()
@@ -856,29 +896,6 @@ class VerifyController:
             return self._remember_smoke_bearing(blackboard, message, geometry)
         bearing = yaw_from_quaternion(self._pose().orientation) + message.yaw_correction_rad
         return bearing, {**geometry, 'navigation_bearing': bearing}
-
-    def _correct_edge_height_first(self, blackboard, fire):
-        if fire is None or abs(fire.vertical_correction_rad) < self.config[
-                'verify_vertical_edge_threshold']:
-            return False
-        if _bb_get(blackboard, 'verify_fire_approach_steps', 0) >= self.config[
-                'verify_fire_approach_max_steps']:
-            return False
-        if (_bb_get(blackboard, 'verify_smoke_boundary_reached', False)
-                and _bb_get(blackboard, 'verify_vertical_attempts', 0) >= self.config[
-                    'verify_vertical_max_corrections']):
-            return False
-        vertical = self._fire_vertical_preference(blackboard, fire)
-        if not vertical:
-            return False
-        moved = self._move_visible_fire_height(blackboard, vertical)
-        if moved is False:
-            if self._height_floor_rejected(vertical):
-                return False
-            if _bb_get(blackboard, 'verify_smoke_boundary_reached', False):
-                return False
-            self._search_blocked(blackboard, 'fire height correction blocked')
-        return True
 
     def approach_smoke(self, blackboard):
         """Follow source guidance until two fresh observations qualify as near."""
@@ -897,11 +914,10 @@ class VerifyController:
                 _bb_get(blackboard, 'verify_arrival_after_ns', 0),
                 _bb_get(blackboard, 'verify_inspection_after_ns', 0)))
             if observation is None:
+                self._recover_fire_height(blackboard)
                 return 'reacquire'
             if source == 'fire':
                 self._inspection_begin(blackboard)
-                if self._correct_edge_height_first(blackboard, observation):
-                    return 'reacquire'
             geometry = self._inspection_geometry(blackboard, observation, source=source)
             if self._stamp_issue(observation):
                 self.executive._report('Verify: image aged during geometry query; reacquiring')
@@ -919,30 +935,89 @@ class VerifyController:
             geometry = self._wall_geometry(blackboard, geometry)
             self._check_approach_limit(blackboard)
             fire = self.stable_fire()
+            remembered = self._remembered_height_fire(blackboard) if fire is None else None
+            height_fire = fire if fire is not None else remembered
             vertical = (self._fire_vertical_preference(blackboard, fire)
-                        if fire is not None else 0.0)
-            if vertical and abs(fire.vertical_correction_rad) >= self.config[
-                    'verify_vertical_edge_threshold']:
-                result = self._move_visible_fire_height(blackboard, vertical)
-                if result is False:
-                    if self._height_floor_rejected(vertical):
-                        vertical = 0.0
-                    else:
-                        return self._search_blocked(blackboard, 'fire height correction blocked')
-                else:
-                    return 'reacquire'
+                        if fire is not None else math.copysign(
+                            self.config['verify_vertical_step'],
+                            remembered.vertical_correction_rad)
+                        if remembered else 0.0)
             if vertical:
-                blackboard['verify_height_hint_consumed'] = self._stamp_ns(fire)
-            self.executive._report(
-                'Verify: source visible; following a short terrain-aware approach leg')
-            if fire is None:
+                if _bb_get(blackboard, 'verify_fire_approach_steps', 0) >= self.config[
+                        'verify_fire_approach_max_steps']:
+                    raise self.error_type(
+                        'Verify: fire approach step limit reached before smoke-wall standoff; '
+                        'inspection incomplete; holding for operator')
+                blackboard['verify_height_hint_consumed'] = self._stamp_ns(height_fire)
+                blackboard['verify_fire_observed'] = True
+                self._inspection_begin(blackboard)
+            elif fire is None:
                 self.executive._report(
                     'Verify: fire-height guidance unavailable; '
                     + self.observation_diagnostics('fire'))
             self._begin_forward_leg(blackboard)
-            moved = self.executive._verify_navigation_viewpoint(
-                bearing, geometry=geometry, guard=lambda: self._movement_guard(blackboard),
-                forward_only=True, vertical_offset=vertical)
+
+            def guard():
+                self._movement_guard(blackboard)
+            if vertical:
+                forward_limit = self._height_forward_limit(
+                    vertical, height_fire.vertical_correction_rad)
+                self.executive._report(
+                    'Verify: trying combined fire-guided leg; '
+                    f'forward limit={forward_limit:.2f} m, '
+                    f'requested height change={vertical:+.2f} m')
+                moved = self.executive._verify_navigation_viewpoint(
+                    bearing, geometry=geometry, guard=guard, forward_only=True,
+                    maximum_forward=forward_limit, vertical_offset=vertical)
+                if moved is not False:
+                    actual_height = self._pose().position.z - before.position.z
+                    self.executive._report(
+                        f'Verify: combined fire-guided leg completed; '
+                        f'requested height change={vertical:+.2f} m, '
+                        f'actual height change={actual_height:+.2f} m')
+                    if actual_height * math.copysign(1.0, vertical) >= (
+                            self.config['verify_vertical_minimum_change']
+                            - self.config['verify_vertical_position_tolerance'] - 1e-6):
+                        blackboard['verify_fire_approach_steps'] = _bb_get(
+                            blackboard, 'verify_fire_approach_steps', 0) + 1
+                if moved is False:
+                    self.executive._report(
+                        'Verify: combined fire-guided leg unavailable; '
+                        'trying one height-only correction')
+                    if self._attempt_approach_height(
+                            blackboard, vertical, remembered=remembered is not None):
+                        return 'reacquire'
+                    self.executive._report(
+                        'Verify: height-only correction unavailable; '
+                        'trying terrain-following forward fallback')
+                    observation, source = self._approach_observation(blackboard, after_ns=max(
+                        _bb_get(blackboard, 'verify_arrival_after_ns', 0),
+                        _bb_get(blackboard, 'verify_inspection_after_ns', 0)))
+                    if observation is None:
+                        return 'reacquire'
+                    geometry = self._inspection_geometry(blackboard, observation, source=source)
+                    if self._stamp_issue(observation):
+                        return 'reacquire'
+                    bearing, geometry = self._approach_bearing(
+                        blackboard, observation, source, geometry)
+                    self._probe_smoke_wall(blackboard, observation, bearing)
+                    self._check_inspection_deadline(blackboard)
+                    action = self._wall_action(blackboard)
+                    if action == 'ready':
+                        return (self._route_fire(blackboard)
+                                if self.stable_fire() is not None else 'search')
+                    if action == 'reacquire':
+                        return action
+                    geometry = self._wall_geometry(blackboard, geometry)
+                    moved = self.executive._verify_navigation_viewpoint(
+                        bearing, geometry=geometry, guard=guard, forward_only=True,
+                        vertical_offset=0.0)
+            else:
+                self.executive._report(
+                    'Verify: source visible; following a short terrain-aware approach leg')
+                moved = self.executive._verify_navigation_viewpoint(
+                    bearing, geometry=geometry, guard=guard, forward_only=True,
+                    vertical_offset=0.0)
             if moved is False:
                 reason = getattr(self.executive, '_verify_navigation_failure_reason',
                                  'no validated forward smoke path')
@@ -1055,6 +1130,10 @@ class VerifyController:
         started = _bb_get(blackboard, 'verify_inspection_started', None)
         if started is not None and time.monotonic() - started >= self.config[
                 'verify_inspection_timeout']:
+            elapsed = time.monotonic() - started
+            self.executive._report(
+                f'Verify: inspection deadline exceeded; elapsed={elapsed:.1f} s, '
+                f'budget={self.config["verify_inspection_timeout"]:.1f} s')
             raise _InspectionTimeout('Inspection deadline exceeded')
         if interrupt_fire and (self._inspection_fire(blackboard) is not None
                                or self._inspection_fire_event(blackboard)):
@@ -1064,6 +1143,9 @@ class VerifyController:
         if _bb_get(blackboard, 'verify_inspection_started', None) is None:
             blackboard['verify_inspection_started'] = time.monotonic()
             blackboard['verify_inspection_attempts'] = 0
+            self.executive._report(
+                f'Verify: inspection clock started; '
+                f'budget={self.config["verify_inspection_timeout"]:.1f} wall seconds')
 
     def _inspection_fire(self, blackboard):
         fire = self.stable_fire()
@@ -1277,9 +1359,6 @@ class VerifyController:
             threshold = tolerance if previous == sign else tolerance + hysteresis
             if abs(error) > threshold:
                 direction = sign
-        if (direction < 0 and _bb_get(blackboard, 'verify_descent_deferred', False)
-                and not _bb_get(blackboard, 'verify_smoke_boundary_reached', False)):
-            direction = 0
         blackboard['verify_vertical_direction'] = direction
         self.executive._report(
             f'Verify: fire vertical angle={math.degrees(error):+.1f} deg; '
@@ -1453,7 +1532,8 @@ class VerifyController:
             raise self.error_type(
                 'Verify: fire approach step limit reached before smoke-wall standoff; '
                 'inspection incomplete; holding for operator')
-        target = self._pose()
+        before = self._pose()
+        target = deepcopy(before)
         target.position.z += vertical
         if _bb_get(blackboard, 'verify_smoke_boundary_reached', False):
             blackboard['verify_vertical_attempts'] = _bb_get(
@@ -1472,6 +1552,14 @@ class VerifyController:
             if self._height_floor_rejected(vertical):
                 self._defer_descent(blackboard)
             return False
+        actual = self._pose().position.z - before.position.z
+        minimum = self.config['verify_vertical_minimum_change'] - self.config[
+            'verify_vertical_position_tolerance']
+        self.executive._report(
+            f'Verify: height-only fire correction measured height change={actual:+.2f} m')
+        if actual * math.copysign(1.0, vertical) < minimum - 1e-6:
+            self.executive._report('Verify: height-only correction made no useful height progress')
+            return False
         blackboard['verify_fire_approach_steps'] = _bb_get(
             blackboard, 'verify_fire_approach_steps', 0) + 1
         blackboard['verify_inspection_after_ns'] = self._now_ns()
@@ -1485,8 +1573,6 @@ class VerifyController:
             observation, source = self._approach_observation(blackboard)
             if observation is None:
                 return self._wait_for_wall(blackboard)
-            if source == 'fire' and self._correct_edge_height_first(blackboard, observation):
-                return 'reacquire'
             geometry = self._inspection_geometry(blackboard, observation, source=source)
             bearing, geometry = self._approach_bearing(
                 blackboard, observation, source, geometry)
@@ -1691,6 +1777,7 @@ class VerifyController:
         useful = moved is not False and not repeat and forward > tolerance
         if useful:
             blackboard['verify_search_failures'] = 0
+            blackboard['verify_height_only_attempted'] = False
             if _bb_get(blackboard, 'verify_descent_deferred', False):
                 blackboard['verify_descent_deferred'] = False
                 self.executive._report(

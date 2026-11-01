@@ -846,6 +846,39 @@ def test_cancel_during_sweep_dwell_prevents_the_next_rotation(motion_harness):
     assert heading == pytest.approx(math.tau / 6)
 
 
+@pytest.mark.parametrize('direction', [-1.0, 1.0])
+def test_height_convergence_waits_for_actual_motion_inside_ordinary_arrival_radius(
+        motion_harness, direction):
+    node = motion_harness
+    node.state.mode = 'OFFBOARD'
+    target = make_pose(z=6.0 + direction * 0.5)
+    node.odometry.pose.pose = deepcopy(target)
+    node.odometry.pose.pose.position.z -= direction * 0.2
+
+    def catch_up():
+        if node._stop.clock.now >= 1.0:
+            node.odometry.pose.pose.position.z = target.position.z - direction * 0.02
+
+    node._stop.on_wait = catch_up
+    node._wait_at_pose(target, height_tolerance=0.05)
+
+    assert node._stop.clock.now >= 1.5
+    assert abs(node.odometry.pose.pose.position.z - target.position.z) < 0.05
+
+
+def test_height_convergence_cannot_succeed_without_actual_height_progress(motion_harness):
+    node = motion_harness
+    node.state.mode = 'OFFBOARD'
+    node.config['waypoint_timeout'] = 0.5
+    target = make_pose(z=5.5)
+    node.odometry.pose.pose = make_pose(z=5.7)
+
+    with pytest.raises(executive_module.MissionTimeout, match='target convergence'):
+        node._wait_at_pose(target, height_tolerance=0.05)
+
+    assert node.odometry.pose.pose.position.z == 5.7
+
+
 def planned_corner_path():
     path = Path(header=Header(frame_id='map'))
     path.poses = [
@@ -1695,6 +1728,7 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     blackboard['verify_height_hint'] = 'old target'
     blackboard['verify_height_hint_consumed'] = 42
     blackboard['verify_descent_deferred'] = True
+    blackboard['verify_height_only_attempted'] = True
 
     harness._exploration_parent_entry(blackboard)
     harness._takeoff(blackboard)
@@ -1716,6 +1750,7 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     assert blackboard['verify_height_hint'] is None
     assert blackboard['verify_height_hint_consumed'] == 0
     assert not blackboard['verify_descent_deferred']
+    assert not blackboard['verify_height_only_attempted']
     assert harness._verify_retry_after == 0.0
     phase = next(event[1] for event in harness.events if event[0] == 'phase')
     assert phase.state == 'Exploration'

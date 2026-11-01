@@ -124,13 +124,17 @@ class VerifyNavigationMixin:
     def _verify_plan_to(self, target_local_pose, guard=None, speed=None,
                         allow_plan_failure=False, look_at_point=None, path_validator=None,
                         planning_client=None, request_builder=None, heading_provider=None,
-                        maximum_path_length=None, motion_timeout=None):
+                        maximum_path_length=None, motion_timeout=None, height_tolerance=None):
         """Fly a validated plan; optionally decline an unavailable candidate."""
         from kv_executive.mission_executive import MissionError
         from kv_executive.srv import PlanToPose
         speed = self.config['verify_motion_speed'] if speed is None else speed
         if not math.isfinite(speed) or speed <= 0.0:
             raise MissionError('Verify motion speed must be finite and positive')
+        if height_tolerance is not None and (
+                isinstance(height_tolerance, bool)
+                or not math.isfinite(height_tolerance) or height_tolerance <= 0.0):
+            raise MissionError('Height convergence tolerance must be finite and positive')
         target = interpolate_pose(target_local_pose, target_local_pose, 0.0)
         target.orientation = quaternion_from_yaw(yaw_from_quaternion(target.orientation))
         if target.position.z < self.config['verify_minimum_altitude']:
@@ -293,6 +297,26 @@ class VerifyNavigationMixin:
                     self._ramp(current, next_pose, _distance(current, next_pose) / speed,
                                hold_duration=0.0 if index < pieces else None)
                     current = next_pose
+            if height_tolerance is not None:
+                # A floor-clipped height goal can be inside the ordinary 30 cm
+                # arrival radius. Keep its setpoint active until its own height
+                # tolerance is met, while rechecking the remaining corridor.
+                height_target = deepcopy(current)
+                height_validated_at = None
+
+                def validate_height_arrival(actual):
+                    nonlocal height_validated_at
+                    now = time.monotonic()
+                    if (height_validated_at is None
+                            or now - height_validated_at >= 1.0):
+                        if not validated([actual, height_target]):
+                            raise VerificationObservationLost(
+                                'Height convergence corridor is no longer safe')
+                        height_validated_at = time.monotonic()
+
+                self._wait_at_pose(
+                    height_target, height_tolerance=height_tolerance,
+                    pose_validator=validate_height_arrival)
             if path_validator is not None:
                 _, actual = self._verify_control_pose()
                 if not validated([actual]):

@@ -88,11 +88,14 @@ mission_executive:
     verify_yaw_tolerance: 0.08726646259971647  # Radians: 5 degrees.
     verify_yaw_step: 0.5235987755982988  # Radians: at most 30 degrees per correction.
     verify_vertical_step: 0.5
+    # Height goals must converge separately from the ordinary 0.3 m arrival radius.
+    verify_vertical_position_tolerance: 0.05
+    verify_vertical_minimum_change: 0.10
     # Fire-guided altitude goals are chosen between committed legs. The target
     # may descend only when observed terrain and the full corridor permit it.
     verify_vertical_tolerance: 0.08726646259971647  # Stop correcting inside 5 degrees.
     verify_vertical_hysteresis: 0.03490658503988659  # Start outside 7 degrees.
-    verify_vertical_edge_threshold: 0.2617993877991494  # 15 degrees: correct height first.
+    verify_vertical_edge_threshold: 0.2617993877991494  # 15 degrees: final centering edge threshold.
     verify_vertical_max_corrections: 3  # Best-effort vertical attempts at the standoff.
     # One remembered correction outside the normal 7-degree activation threshold,
     # within the same short movement / 15 degrees of yaw. Slow simulation is allowed.

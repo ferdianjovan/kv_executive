@@ -133,11 +133,13 @@ class Harness(VerifyNavigationMixin):
     def _set_target(self, target):
         self.events.append(('target', deepcopy(target)))
 
-    def _wait_at_pose(self, target, hold_duration=None):
+    def _wait_at_pose(self, target, hold_duration=None, **kwargs):
         self.events.append(('hold', hold_duration))
         self.on_motion()
         if self._motion_guard:
             self._motion_guard()
+        if kwargs.get('pose_validator') is not None:
+            kwargs['pose_validator'](self.odometry.pose.pose)
 
     def _loiter(self):
         assert self.state.mode == 'OFFBOARD'
@@ -186,6 +188,70 @@ def test_target_converts_between_map_and_px4_and_retains_planned_corner(executiv
     assert executive.odometry.pose.pose.position.y == pytest.approx(25.0)
     assert executive.state.mode == 'AUTO.LOITER'
     assert executive._motion_guard is None
+
+
+@pytest.mark.parametrize('direction', [-1.0, 1.0])
+def test_height_guided_path_checks_height_convergence_before_loiter(executive, direction):
+    target = pose(1.0, z=6.0 + direction * 0.5)
+    executive.path_vertices = [pose(), deepcopy(target)]
+    original_wait = executive._wait_at_pose
+
+    def wait_height(target_pose, **kwargs):
+        assert executive.state.mode == 'OFFBOARD'
+        assert kwargs['height_tolerance'] == 0.05
+        executive.events.append(('height_convergence', deepcopy(target_pose)))
+        original_wait(target_pose, **kwargs)
+
+    executive._wait_at_pose = wait_height
+    assert executive._verify_plan_to(target, height_tolerance=0.05)
+    events = [event[0] for event in executive.events]
+    assert events.index('height_convergence') < events.index('loiter')
+
+
+def test_height_convergence_rechecks_corridor_and_recovers_if_it_becomes_unsafe(executive):
+    target = pose(1.0, z=5.5)
+    executive.path_vertices = [pose(), deepcopy(target)]
+    waiting = [False]
+    original_wait = executive._wait_at_pose
+
+    def wait_height(target_pose, **kwargs):
+        waiting[0] = True
+        original_wait(target_pose, **kwargs)
+
+    executive._wait_at_pose = wait_height
+    with pytest.raises(VerificationObservationLost, match='Height convergence corridor'):
+        executive._verify_plan_to(
+            target, height_tolerance=0.05, path_validator=lambda path: not waiting[0])
+    assert executive.state.mode == 'AUTO.LOITER'
+    assert any(event[0] == 'recovery' for event in executive.events)
+
+
+def test_height_convergence_retains_the_live_heading_selected_during_flight(executive):
+    target = pose(1.0, z=5.5)
+    executive.path_vertices = [pose(), deepcopy(target)]
+    heading = [0.0]
+    original_wait = executive._wait_at_pose
+
+    def fire_moves_in_image():
+        heading[0] = 0.4
+
+    def wait_height(target_pose, **kwargs):
+        assert yaw_from_quaternion(target_pose.orientation) == pytest.approx(0.4)
+        assert yaw_from_quaternion(executive.odometry.pose.pose.orientation) == pytest.approx(0.4)
+        original_wait(target_pose, **kwargs)
+
+    executive.on_motion = fire_moves_in_image
+    executive._wait_at_pose = wait_height
+    assert executive._verify_plan_to(
+        target, height_tolerance=0.05, heading_provider=lambda current: heading[0])
+
+
+@pytest.mark.parametrize('tolerance', [0.0, -0.1, math.inf, math.nan, True])
+def test_invalid_height_convergence_setting_never_starts_flight(executive, tolerance):
+    from kv_executive.mission_executive import MissionError
+    with pytest.raises(MissionError, match='Height convergence tolerance'):
+        executive._verify_plan_to(pose(1.0), height_tolerance=tolerance)
+    assert not any(event[0] in {'request', 'offboard'} for event in executive.events)
 
 
 def test_inspection_planner_hook_preserves_transform_and_flight_validation(executive):

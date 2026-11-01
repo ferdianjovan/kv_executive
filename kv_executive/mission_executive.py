@@ -266,6 +266,11 @@ class MissionExecutive(
                 <= self.config['verify_navigation_preferred_agl']
                 <= self.config['verify_navigation_max_agl']):
             raise ValueError('Navigation clearance must satisfy minimum <= preferred <= maximum')
+        if not (self.config['verify_vertical_position_tolerance']
+                < self.config['verify_vertical_minimum_change']
+                <= self.config['verify_vertical_step']):
+            raise ValueError(
+                'Vertical guidance must satisfy position tolerance < minimum change <= step')
 
         self._callbacks = ReentrantCallbackGroup()
         self._data_lock = threading.Lock()
@@ -614,6 +619,7 @@ class MissionExecutive(
         blackboard['verify_height_hint_consumed'] = 0
         blackboard['verify_height_hint_epoch'] = 0
         blackboard['verify_descent_deferred'] = False
+        blackboard['verify_height_only_attempted'] = False
         blackboard['verify_vertical_track'] = None
         blackboard['verify_vertical_stamp'] = 0
         blackboard['verify_vertical_direction'] = 0
@@ -923,8 +929,13 @@ class MissionExecutive(
         check_source_mode()
         self._change_mode('OFFBOARD')
 
-    def _wait_at_pose(self, target, hold_duration=None):
+    def _wait_at_pose(self, target, hold_duration=None, *, height_tolerance=None,
+                      pose_validator=None):
         """Require continuous measured stability for the requested dwell time."""
+        if height_tolerance is not None and (
+                isinstance(height_tolerance, bool)
+                or not math.isfinite(height_tolerance) or height_tolerance <= 0.0):
+            raise MissionError('Height convergence tolerance must be finite and positive')
         if hold_duration is None:
             hold_duration = self.config['hold_duration']
         stable_since = None
@@ -933,6 +944,8 @@ class MissionExecutive(
             nonlocal stable_since
             _, odometry = self._snapshot('OFFBOARD', require_armed=True)
             current = odometry.pose.pose
+            if pose_validator is not None:
+                pose_validator(current)
             distance = math.dist(
                 (current.position.x, current.position.y, current.position.z),
                 (target.position.x, target.position.y, target.position.z),
@@ -944,6 +957,8 @@ class MissionExecutive(
             if (
                 distance > self.config['position_tolerance']
                 or yaw_error > self.config['yaw_tolerance']
+                or (height_tolerance is not None
+                    and abs(current.position.z - target.position.z) > height_tolerance)
             ):
                 stable_since = None
                 return False

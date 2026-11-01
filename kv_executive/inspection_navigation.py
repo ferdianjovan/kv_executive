@@ -530,6 +530,12 @@ class InspectionNavigationMixin:
         target = deepcopy(target)
         minimum_agl = self.config.get('verify_inspection_altitude', 5.0)
         _, current = self._verify_control_pose()
+        requested_height = target.position.z - current.position.z
+        minimum_height = self.config.get('verify_vertical_minimum_change', 0.1)
+        height_tolerance = self.config.get('verify_vertical_position_tolerance', 0.05)
+        if (not all(math.isfinite(value) and value > 0.0 for value in (
+                minimum_height, height_tolerance)) or height_tolerance >= minimum_height):
+            raise MissionError('Invalid useful height movement or vertical position tolerance')
         if math.hypot(target.position.x - current.position.x,
                       target.position.y - current.position.y) > 10.0 + 1e-6:
             self._report('Verify: recovery destination exceeds the bounded observation leg')
@@ -539,7 +545,7 @@ class InspectionNavigationMixin:
             'verify_navigation_max_agl', 10.0)
         if terrain is None:
             terrain = self._inspection_ground(probe, terrain_envelope=True, require_map=True)
-        requested_descent = target.position.z < current.position.z - 0.01
+        requested_descent = requested_height < -1e-9
         floor = self.config['verify_minimum_altitude']
         if terrain is None:
             if preserve_requested_altitude and requested_descent:
@@ -554,11 +560,24 @@ class InspectionNavigationMixin:
             floor = max(floor, terrain[0] + minimum_agl + terrain[1]
                         + self.config.get('position_tolerance', 0.3))
         target.position.z = max(target.position.z, floor)
-        if (preserve_requested_altitude and requested_descent
-                and target.position.z >= current.position.z - 0.01):
-            self._verify_height_rejection = 'terrain_floor'
-            self._report('Verify: terrain clearance floor prevents downward image centering')
-            return False
+        if preserve_requested_altitude and abs(requested_height) > 1e-9:
+            available_height = target.position.z - current.position.z
+            signed_height = available_height * math.copysign(1.0, requested_height)
+            self._report(
+                f'Verify: height request={requested_height:+.2f} m, '
+                f'terrain-adjusted change={available_height:+.2f} m, '
+                f'current altitude={current.position.z:.2f} m, '
+                f'target altitude={target.position.z:.2f} m, terrain floor={floor:.2f} m')
+            if (signed_height < minimum_height - 1e-9
+                    or signed_height > abs(requested_height) + 1e-9):
+                self._verify_height_rejection = (
+                    'terrain_floor' if requested_descent else 'height_limit')
+                self._report(
+                    'Verify: terrain clearance floor prevents downward image centering; '
+                    'remaining descent is not useful'
+                    if requested_descent else
+                    'Verify: terrain clearance floor prevents the bounded upward correction')
+                return False
         if not preserve_requested_altitude:
             target.position.z = max(target.position.z, current.position.z)
         escape_state = {'origin': deepcopy(current.position), 'complete': False}
@@ -613,6 +632,8 @@ class InspectionNavigationMixin:
                 point=keepout_point, minimum_radius=keepout_radius,
                 minimum_agl=minimum_agl, allow_initial_climb=True,
                 terrain_envelope=True, allow_terrain_escape=True),
+            **({'height_tolerance': height_tolerance}
+               if preserve_requested_altitude and abs(requested_height) > 1e-9 else {}),
             **({'maximum_path_length': geometry['center_fire_max_path_length'],
                 'motion_timeout': geometry['center_fire_motion_timeout']} if center_fire else {}),
         )
@@ -982,13 +1003,16 @@ class InspectionNavigationMixin:
         terrain_cache = {}
         attempted = set()
         missing_terrain = set()
-        floor_limited = set()
+        height_limited = set()
+        minimum_height = self.config.get('verify_vertical_minimum_change', 0.1)
+        if not math.isfinite(minimum_height) or minimum_height <= 0.0:
+            raise MissionError('Invalid useful height movement')
         attempts = 0
         range_status = 'image-bearing guidance; terrain clearance verified separately'
         reserved = min(5, limit // 3)
         forward_limit = limit - reserved
 
-        def candidates(offsets, clearances, vertical_bias, require_terrain=False):
+        def candidates(offsets, clearances, vertical_bias):
             for forward, lateral in offsets:
                 if guard:
                     guard()
@@ -1005,8 +1029,6 @@ class InspectionNavigationMixin:
                 terrain = terrain_cache[key]
                 if terrain is None:
                     missing_terrain.add(key)
-                    if require_terrain:
-                        continue
                 for clearance in clearances if terrain is not None else (None,):
                     requested_agl = minimum_agl if clearance is None else clearance
                     target.position.z = max(current.position.z + vertical_bias,
@@ -1017,13 +1039,22 @@ class InspectionNavigationMixin:
                             target.position.z, ground_z + requested_agl + uncertainty,
                             ground_z + minimum_agl + uncertainty
                             + self.config.get('position_tolerance', 0.3))
-                    if vertical_bias < 0.0 and (
-                            terrain is None or target.position.z >= current.position.z - 0.01):
-                        if terrain is not None:
-                            floor_limited.add(key)
-                        # A blocked descent remains a refusal. Any forward
-                        # alternative is selected explicitly in a separate pass.
-                        continue
+                    if vertical_bias:
+                        signed_height = ((target.position.z - current.position.z)
+                                         * math.copysign(1.0, vertical_bias))
+                        if ((vertical_bias < 0.0 and terrain is None)
+                                or signed_height < minimum_height - 1e-9
+                                or signed_height > abs(vertical_bias) + 1e-9):
+                            height_limited.add(key)
+                            # The controller tries one height-only correction
+                            # before selecting an independent forward fallback.
+                            continue
+                        if (maximum_forward is not None and forward > maximum_forward
+                                * signed_height / abs(vertical_bias) + 1e-9):
+                            # The image-angle limit used the requested height
+                            # change. A terrain-clipped correction can support
+                            # proportionally less forward travel.
+                            continue
                     displacement = math.dist(
                         tuple(getattr(current.position, axis) for axis in 'xyz'),
                         tuple(getattr(target.position, axis) for axis in 'xyz'))
@@ -1055,10 +1086,10 @@ class InspectionNavigationMixin:
                 (forward_offsets, (preferred_agl, minimum_agl, maximum_agl), forward_limit),
                 (fallback_offsets, (minimum_agl,), limit))
 
-        def try_candidates(offsets, clearances, budget, vertical_bias, require_terrain=False):
+        def try_candidates(offsets, clearances, budget, vertical_bias):
             nonlocal attempts
             for target, terrain, forward, lateral, clearance in candidates(
-                    offsets, clearances, vertical_bias, require_terrain):
+                    offsets, clearances, vertical_bias):
                 if attempts >= budget:
                     break
                 self._check_running()
@@ -1085,17 +1116,6 @@ class InspectionNavigationMixin:
         for offsets, clearances, budget in batches:
             if try_candidates(offsets, clearances, budget, vertical_offset):
                 return True
-        if vertical_offset < 0.0 and attempts == 0 and floor_limited:
-            # No downward route was submitted: known terrain floors removed
-            # the height preference before planning. Select a distinct straight
-            # forward leg, with no extra survey-height preference. The same
-            # bounded budget, observed terrain, walls and corridor checks apply.
-            self._report(
-                'Verify: downward fire-height preference limited by terrain; '
-                'trying a checked forward leg at current altitude or the required terrain floor')
-            straight = [(step, 0.0), (step * 0.5, 0.0), (step * 0.25, 0.0)]
-            if try_candidates(straight, (None,), limit, 0.0, require_terrain=True):
-                return True
         mode = 'forward' if forward_only else 'terrain navigation'
         if attempts:
             reason = (f'{attempts} {mode} candidates rejected by planning or clearance checks; '
@@ -1103,6 +1123,9 @@ class InspectionNavigationMixin:
         elif missing_terrain:
             reason = (f'No observed terrain envelope at {len(missing_terrain)} sampled '
                       f'{mode} destinations')
+        elif height_limited:
+            reason = ('No combined movement candidate permits a useful bounded height change; '
+                      'a height-only correction must be considered before forward fallback')
         else:
             reason = f'No {mode} candidate satisfies the bounded movement constraints'
         self._verify_navigation_failure_reason = reason
