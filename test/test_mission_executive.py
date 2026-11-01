@@ -1688,6 +1688,10 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     blackboard['verify_viewpoint_required'] = True
     blackboard['verify_smoke_walls'] = [{'nearest': 20.0}]
     blackboard['verify_smoke_wall_probe'] = {'nearest': 20.0}
+    blackboard['verify_wall_latest'] = {'nearest': 20.0}
+    blackboard['verify_wall_last_stamp_ns'] = 42
+    blackboard['verify_wall_near_count'] = 2
+    blackboard['verify_wall_recheck_deadline'] = 123.0
     blackboard['verify_height_hint'] = 'old target'
     blackboard['verify_height_hint_consumed'] = 42
 
@@ -1704,6 +1708,10 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     assert not blackboard['verify_viewpoint_required']
     assert blackboard['verify_smoke_walls'] == []
     assert blackboard['verify_smoke_wall_probe'] is None
+    assert blackboard['verify_wall_latest'] is None
+    assert blackboard['verify_wall_last_stamp_ns'] == 0
+    assert blackboard['verify_wall_near_count'] == 0
+    assert blackboard['verify_wall_recheck_deadline'] is None
     assert blackboard['verify_height_hint'] is None
     assert blackboard['verify_height_hint_consumed'] == 0
     assert harness._verify_retry_after == 0.0

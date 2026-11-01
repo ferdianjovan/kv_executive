@@ -243,6 +243,11 @@ def monitoring_sensors(mission):
             distance = (sensors.approach_wall_range
                         if request.origin.header.frame_id == 'test_rgb_camera'
                         else sensors.smoke_wall_range)
+            if (request.origin.header.frame_id == 'test_rgb_camera'
+                    and distance is None and sensors.source in {'fire', 'smoke_fire'}):
+                # A near wall accompanying confirmed fire must also be visible
+                # to the approach probes that now confirm inspection arrival.
+                distance = sensors.smoke_wall_range
         if request.smoke_wall_width:
             # Most smoke-flight cases start outside ranging coverage. A near
             # thermal wall must not silently become smoke-arrival evidence.
@@ -339,7 +344,8 @@ def _start_airborne_exploration(mission):
     assert goal.accepted
     wait_for(
         lambda: received_state(mission, mode='OFFBOARD'),
-        10.0, 'Exploration survey OFFBOARD',
+        max(10.0, mission.executive.config['mode_timeout'] + 2.0),
+        'Exploration survey OFFBOARD',
     )
     return goal
 
@@ -984,16 +990,19 @@ def test_fire_lost_at_smoke_arrival_gets_one_vertical_reacquisition_before_advan
     _assert_airborne_safety(mission)
 
 
-@pytest.mark.parametrize('mission', [{'clock_rate': 0.2}], indirect=True, ids=['slow_clock'])
-@pytest.mark.parametrize('vertical_direction', [-1.0, 1.0])
+@pytest.mark.parametrize('mission,vertical_direction', [
+    pytest.param({'clock_rate': 0.2}, -1.0, id='down_clock_0_2'),
+    pytest.param({'clock_rate': 0.1}, 1.0, id='up_clock_0_1'),
+], indirect=['mission'])
 def test_slow_smoke_leg_retains_nonedge_fire_height_until_checked_recovery(
-    mission, monitoring_sensors, vertical_direction,
+    mission, monitoring_sensors, vertical_direction, request,
 ):
     """Real slow /clock preserves one height search after a long committed leg."""
     sensors, fcu = monitoring_sensors, mission.fcu
     executive = mission.executive
+    clock_rate = float(request.node.callspec.params['mission']['clock_rate'])
     for config in (executive.config, executive._verify.config):
-        config.update(verify_motion_speed=1.0, mode_timeout=8.0, waypoint_timeout=8.0,
+        config.update(verify_motion_speed=1.0, mode_timeout=20.0, waypoint_timeout=8.0,
                       verify_navigation_step=3.0, verify_reacquire_observation_timeout=5.0)
     with fcu.lock:
         fcu.inspection_terrain_z = fcu.pose.position.z - 7.0
@@ -1044,15 +1053,17 @@ def test_slow_smoke_leg_retains_nonedge_fire_height_until_checked_recovery(
             sensors.source = 'smoke'
         wait_for(lambda: executive._verify.stable_fire() is None,
                  3.0, 'detector loss while the committed smoke leg continues')
-        wait_for(lambda: len(fcu.target_requests) >= 2, 65.0,
+        wait_for(lambda: len(fcu.target_requests) >= 2, 120.0,
                  'vertical recovery goal after the long completed smoke leg')
         recovery_wall = time.monotonic()
         recovery_ros = executive.get_clock().now().nanoseconds
         elapsed_wall = recovery_wall - lost_wall
         elapsed_ros = (recovery_ros - lost_ros) / 1e9
         assert elapsed_wall > 15.0
-        assert 0.1 < elapsed_ros / elapsed_wall < 0.3
+        assert clock_rate * 0.5 < elapsed_ros / elapsed_wall < clock_rate * 1.5
         assert 0.0 < elapsed_ros < executive._verify.config['verify_vertical_memory_timeout']
+        print(f'slow-height recovery: clock_rate={clock_rate:g}, '
+              f'wall_age={elapsed_wall:.2f}s, source_age={elapsed_ros:.2f}s')
         with fcu.lock:
             correction = deepcopy(fcu.target_requests[1].pose)
         _assert_arrival_before_reacquire(mission, target, after=selected_at)
@@ -1062,7 +1073,7 @@ def test_slow_smoke_leg_retains_nonedge_fire_height_until_checked_recovery(
                           correction.position.y - target.position.y) < 0.03
         wait_for(lambda: abs(fcu.pose.position.z - correction.position.z) < 0.03
                  and received_state(mission, mode='AUTO.LOITER'),
-                 18.0, 'checked height correction to execute and finish in LOITER')
+                 25.0, 'checked height correction to execute and finish in LOITER')
         assert not sensors.inspection_snapshot()
         assert executive._verify.had_fire_confirmation()
         _assert_terrain_planning(mission)
@@ -1604,6 +1615,23 @@ def test_opportunistic_wall_arrival_searches_and_reports_without_broad_smoke(
     sensors, fcu = monitoring_sensors, mission.fcu
     for config in (mission.executive.config, mission.executive._verify.config):
         config['verify_viewpoint_lateral_step'] = 0.4
+        config['mode_timeout'] = 8.0
+    probes = []
+    original_geometry = fcu.geometry_service.callback
+    standoff = mission.executive.config['verify_smoke_standoff']
+
+    def moving_near_wall(request, response):
+        response = original_geometry(request, response)
+        if request.smoke_wall_width and request.origin.header.frame_id == 'test_rgb_camera':
+            probes.append(deepcopy(response.map_header.stamp))
+            # Both observations are near, but the plume moves independently
+            # rather than agreeing with any static-plane motion prediction.
+            distance = standoff + (0.15 if len(probes) == 1 else 0.12)
+            response.smoke_wall_valid = True
+            response.smoke_wall_range = response.smoke_wall_nearest_range = distance
+        return response
+
+    fcu.geometry_service.callback = moving_near_wall
     goal = _start_airborne_exploration(mission)
     with sensors.lock:
         sensors.smoke_regions = [1]
@@ -1612,7 +1640,7 @@ def test_opportunistic_wall_arrival_searches_and_reports_without_broad_smoke(
                                        + 0.1 + mission.executive.config['position_tolerance'])
         sensors.source = 'smoke'
     try:
-        wait_for(lambda: bool(sensors.inspection_snapshot()), 35.0,
+        wait_for(lambda: bool(sensors.inspection_snapshot()), 60.0,
                  'measured wall plus completed search to produce a negative inspection')
         with sensors.lock:
             sensors.source = None
@@ -1622,17 +1650,209 @@ def test_opportunistic_wall_arrival_searches_and_reports_without_broad_smoke(
         assert not report.fire_location_valid and not report.smoke_location_valid
         with fcu.lock:
             statuses = [text for _, text in fcu.statuses]
-            probes = [request for request in fcu.geometry_requests
-                      if request.smoke_wall_width == 3.0
-                      and request.origin.header.frame_id == 'test_rgb_camera']
+            requests = [request for request in fcu.geometry_requests
+                        if request.smoke_wall_width == 3.0
+                        and request.origin.header.frame_id == 'test_rgb_camera']
         for state in ('APPROACH_SMOKE', 'REACQUIRE', 'SEARCH_FIRE', 'CENTER_FIRE'):
             assert f'Verify/{state}: started' in statuses
-        assert len(probes) >= 2  # Arrival evidence is measured again before publishing.
+        assert len(requests) >= 2
+        assert len({(stamp.sec, stamp.nanosec) for stamp in probes}) >= 2
         wait_for(lambda: _states(sensors)[-1] == 'Exploration', 5.0,
                  'the same action to resume exploration after completed inspection')
         _assert_same_goal_phases(sensors, goal)
     finally:
         cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
+def test_single_far_wall_candidate_cannot_latch_arrival_after_later_missing_returns(
+    mission, monitoring_sensors,
+):
+    """One short-lived range estimate must not become arrival several legs later."""
+    sensors, fcu = monitoring_sensors, mission.fcu
+    for config in (mission.executive.config, mission.executive._verify.config):
+        config['mode_timeout'] = 8.0
+    original_geometry = fcu.geometry_service.callback
+    probes = []
+    standoff = mission.executive.config['verify_smoke_standoff']
+
+    def isolated_wall(request, response):
+        response = original_geometry(request, response)
+        if request.smoke_wall_width and request.origin.header.frame_id == 'test_rgb_camera':
+            probes.append(time.monotonic())
+            response.smoke_wall_valid = len(probes) == 1
+            response.smoke_wall_range = response.smoke_wall_nearest_range = standoff + 3.0
+        return response
+
+    fcu.geometry_service.callback = isolated_wall
+    goal = _start_airborne_exploration(mission)
+    with fcu.lock:
+        initial = deepcopy(fcu.pose.position)
+    with sensors.lock:
+        sensors.source = 'smoke'
+    try:
+        wait_for(lambda: len(fcu.target_requests) >= 6, 120.0,
+                 'continued checked approach beyond a single old wall candidate')
+        with fcu.lock:
+            targets = deepcopy(fcu.target_requests)
+            statuses = [text for _, text in fcu.statuses]
+        assert len(probes) >= 6
+        assert math.dist(_point_position(initial),
+                         _point_position(targets[-1].pose.position)) > 3.0
+        assert 'Verify/SEARCH_FIRE: started' not in statuses
+        assert 'Verify/CENTER_FIRE: started' not in statuses
+        assert not sensors.inspection_snapshot()
+        assert not goal.get_result_async().done()
+        _assert_terrain_planning(mission)
+    finally:
+        cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
+def test_replayed_near_wall_map_cannot_confirm_arrival(mission, monitoring_sensors):
+    """A second RPC reply from the same map is not a second observation."""
+    sensors, fcu = monitoring_sensors, mission.fcu
+    for config in (mission.executive.config, mission.executive._verify.config):
+        config['mode_timeout'] = 8.0
+    original_geometry = fcu.geometry_service.callback
+    first_observation = []
+    replay = threading.Event()
+    replay.set()
+    probes = []
+    standoff = mission.executive.config['verify_smoke_standoff']
+
+    def repeated_observation(request, response):
+        response = original_geometry(request, response)
+        if request.smoke_wall_width and request.origin.header.frame_id == 'test_rgb_camera':
+            if not first_observation:
+                first_observation.append(deepcopy(response.map_header.stamp))
+            if replay.is_set():
+                response.map_header.stamp = deepcopy(first_observation[0])
+            probes.append(time.monotonic())
+            response.smoke_wall_valid = True
+            response.smoke_wall_range = response.smoke_wall_nearest_range = standoff + 0.12
+        return response
+
+    fcu.geometry_service.callback = repeated_observation
+    goal = _start_airborne_exploration(mission)
+    with sensors.lock:
+        sensors.smoke_regions = [1]
+        sensors.source = 'smoke'
+    try:
+        wait_for(lambda: len(probes) >= 2, 8.0, 'repeated near-wall query of one observation')
+        with fcu.lock:
+            statuses = [text for _, text in fcu.statuses]
+        assert 'Verify/SEARCH_FIRE: started' not in statuses
+        assert 'Verify/CENTER_FIRE: started' not in statuses
+        assert not sensors.inspection_snapshot()
+        replay.clear()
+        wait_for(lambda: any(text == 'Verify/SEARCH_FIRE: started' for _, text in fcu.statuses),
+                 8.0, 'a genuinely newer near-wall observation to confirm inspection arrival')
+    finally:
+        cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
+@pytest.mark.parametrize('near_observations', [1, 2])
+def test_near_wall_then_farther_observation_resumes_checked_approach(
+    mission, monitoring_sensors, near_observations,
+):
+    """Wind-driven farther returns reset near confirmation without trapping inspection."""
+    sensors, fcu = monitoring_sensors, mission.fcu
+    for config in (mission.executive.config, mission.executive._verify.config):
+        config['mode_timeout'] = 8.0
+    original_geometry = fcu.geometry_service.callback
+    probes = []
+    standoff = mission.executive.config['verify_smoke_standoff']
+
+    def moving_wall(request, response):
+        response = original_geometry(request, response)
+        if request.smoke_wall_width and request.origin.header.frame_id == 'test_rgb_camera':
+            probes.append(time.monotonic())
+            distance = standoff + (0.12 if len(probes) <= near_observations else 8.0)
+            response.smoke_wall_valid = True
+            response.smoke_wall_range = response.smoke_wall_nearest_range = distance
+        return response
+
+    fcu.geometry_service.callback = moving_wall
+    goal = _start_airborne_exploration(mission)
+    with sensors.lock:
+        sensors.source = 'smoke'
+    try:
+        wait_for(lambda: len(fcu.target_requests) >= 2, 45.0,
+                 'a farther fresh wall observation to resume normal approach')
+        with fcu.lock:
+            statuses = [text for _, text in fcu.statuses]
+        assert len(probes) >= 3
+        if near_observations == 1:
+            assert 'Verify/SEARCH_FIRE: started' not in statuses
+            assert 'Verify/CENTER_FIRE: started' not in statuses
+        else:
+            assert 'Verify/SEARCH_FIRE: started' in statuses
+            first_search = statuses.index('Verify/SEARCH_FIRE: started')
+            assert 'Verify/APPROACH_SMOKE: started' in statuses[first_search + 1:]
+        assert not sensors.inspection_snapshot()
+        _assert_terrain_planning(mission)
+    finally:
+        cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
+def test_missing_smoke_at_confirmed_wall_uses_bounded_reacquisition_without_state_spin(
+    mission, monitoring_sensors,
+):
+    """A smoke gap at arrival cannot bounce immediately between SEARCH and CENTER."""
+    sensors, fcu = monitoring_sensors, mission.fcu
+    for config in (mission.executive.config, mission.executive._verify.config):
+        config['mode_timeout'] = 8.0
+    original_geometry = fcu.geometry_service.callback
+    probes = []
+    hidden = threading.Event()
+    hidden_at = []
+    standoff = mission.executive.config['verify_smoke_standoff']
+
+    def wall_then_smoke_gap(request, response):
+        response = original_geometry(request, response)
+        if request.smoke_wall_width and request.origin.header.frame_id == 'test_rgb_camera':
+            probes.append(time.monotonic())
+            response.smoke_wall_valid = True
+            response.smoke_wall_range = response.smoke_wall_nearest_range = standoff + 0.12
+        return response
+
+    fcu.geometry_service.callback = wall_then_smoke_gap
+    original_report = mission.executive._report
+
+    def lose_smoke_on_center_entry(message, error=False):
+        if message == 'Verify/CENTER_FIRE: started' and not hidden.is_set():
+            with sensors.lock:
+                sensors.smoke_suppressed_until = math.inf
+            wait_for(lambda: mission.executive._verify.fresh_smoke() is None,
+                     2.0, 'a negative smoke frame before CENTER_FIRE evaluates its input')
+            hidden_at.append(time.monotonic())
+            hidden.set()
+        original_report(message, error=error)
+
+    mission.executive._report = lose_smoke_on_center_entry
+    goal = _start_airborne_exploration(mission)
+    with sensors.lock:
+        sensors.source = 'smoke'
+    try:
+        wait_for(hidden.is_set, 12.0, 'near-wall inspection followed by smoke loss')
+        wait_for(lambda: any(text == 'Verify/REACQUIRE: started' and stamp > hidden_at[0]
+                             for stamp, text in fcu.statuses),
+                 8.0, 'missing smoke at the confirmed boundary to enter reacquisition')
+        wait_for(lambda: time.monotonic() >= hidden_at[0] + 0.8, 1.5,
+                 'the smoke gap to exercise routing without immediate state cycling')
+        with fcu.lock:
+            immediate = [text for stamp, text in fcu.statuses
+                         if hidden_at[0] <= stamp <= hidden_at[0] + 0.8]
+        assert immediate.count('Verify/SEARCH_FIRE: started') <= 2
+        assert immediate.count('Verify/CENTER_FIRE: started') <= 2
+        assert not sensors.inspection_snapshot()
+        assert not goal.get_result_async().done()
+    finally:
+        cancel_goal(goal)
+        mission.executive._report = original_report
     _assert_airborne_safety(mission)
 
 
@@ -1649,7 +1869,9 @@ def test_observed_smoke_boundary_stops_advance_and_bounds_negative_inspection(
     if initial_approach:
         _complete_initial_smoke_approach(mission, sensors)
     with sensors.lock:
-        sensors.smoke_boundary_range = 8.0
+        sensors.smoke_boundary_range = None
+        sensors.approach_wall_range = (mission.executive.config['verify_smoke_standoff']
+                                       + 0.1 + mission.executive.config['position_tolerance'])
         sensors.smoke_coverage = 0.3
         sensors.source = 'smoke'
     wait_for(lambda: bool(sensors.inspection_snapshot()), 35.0,
@@ -1856,7 +2078,7 @@ def test_center_fire_arrives_at_smoke_wall_boundary_with_fresh_fire(mission, mon
 
 
 @pytest.mark.parametrize('wall_source', ['plume', 'aperture_once'])
-def test_smoke_final_leg_is_clipped_to_the_twenty_metre_measured_boundary(
+def test_smoke_final_leg_is_clipped_to_the_configured_measured_boundary(
     mission, monitoring_sensors, wall_source,
 ):
     sensors, fcu = monitoring_sensors, mission.fcu

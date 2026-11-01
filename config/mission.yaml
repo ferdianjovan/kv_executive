@@ -99,6 +99,7 @@ mission_executive:
     verify_vertical_memory_timeout: 15.0  # Source/ROS seconds since the confirmed image.
     verify_vertical_clock_timeout: 5.0  # Wall seconds without simulated-clock progress.
     verify_wall_probe_timeout: 0.5  # One opportunistic query; missing range allows approach.
+    verify_wall_recheck_timeout: 20.0  # Bounded revalidation of a suspected nearby wall.
     verify_minimum_altitude: 2.0  # Local z floor; planner home limits also apply.
     # Legacy coverage-to-step parameters remain accepted for compatibility.
     # Active smoke acquisition uses verify_navigation_step with measured terrain
@@ -127,7 +128,7 @@ mission_executive:
     verify_navigation_map_timeout: 20.0
     verify_navigation_no_progress_max: 2
     # Proximity to a fresh observed plume/smoke-wall proxy, never fire distance.
-    verify_smoke_standoff: 20.0
+    verify_smoke_standoff: 15.0
     # Clearance above a validated observed support surface; unknown means no descent.
     verify_inspection_altitude: 5.0
     verify_inspection_lateral_step: 5.0

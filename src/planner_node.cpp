@@ -1137,30 +1137,29 @@ private:
               const auto sample = ray_origin + lateral *
                 (column * request->smoke_wall_width / 4.0) +
                 vertical * (row * request->smoke_wall_width / 4.0);
-              double nearest = request->max_range + 1.0;
-              for (const auto & map : history) {
-                octomap::point3d wall_hit;
-                if (!map.tree->castRay(sample, ray_direction, wall_hit, true, request->max_range)) {
-                  continue;
-                }
-                uint32_t occupied = 0, free = 0;
-                occupancyEvidence(history, wall_hit, occupied, free);
-                const double depth = (wall_hit - sample).dot(ray_direction);
-                if (occupied > 0 && free > 0 && depth > 0.0 && depth < nearest) {
-                  nearest = depth;
-                  voxel_uncertainty = std::max(voxel_uncertainty,
-                    std::sqrt(3.0) * leafSizeAt(*map.tree, wall_hit) * 0.5);
-                }
+              // History supplies the flicker cue, never a substitute for a
+              // current occupied return. A newer free map must not replay an
+              // older wall as another independent proximity observation.
+              octomap::point3d wall_hit;
+              if (!latest.tree->castRay(
+                  sample, ray_direction, wall_hit, true, request->max_range))
+              {
+                continue;
               }
-              if (nearest <= request->max_range) {
-                ranges.push_back(nearest);
+              uint32_t occupied = 0, free = 0;
+              occupancyEvidence(history, wall_hit, occupied, free);
+              const double depth = (wall_hit - sample).dot(ray_direction);
+              if (occupied > 0 && free > 0 && depth > 0.0 && depth <= request->max_range) {
+                ranges.push_back(depth);
                 rows.insert(row);
                 columns.insert(column);
+                voxel_uncertainty = std::max(voxel_uncertainty,
+                  std::sqrt(3.0) * leafSizeAt(*latest.tree, wall_hit) * 0.5);
               }
             }
           }
           response->smoke_wall_samples = ranges.size();
-          if (ranges.size() >= 3 && rows.size() >= 2 && columns.size() >= 2) {
+          if (ranges.size() >= 6 && rows.size() >= 3 && columns.size() >= 3) {
             double sum = 0.0;
             for (const double range : ranges) {sum += range;}
             const double mean = sum / ranges.size();

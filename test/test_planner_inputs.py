@@ -481,6 +481,8 @@ def _inspection_scene(wall=True, rotate=False):
                             blocked = blocked and -2 <= y <= 2 and z <= 16
                         elif wall == 'lateral':
                             blocked = y >= 2
+                        elif isinstance(wall, tuple):
+                            blocked = blocked and (y, z) in wall
                         node[child] = 2 if z == -1 or blocked else 1
 
     def compress(node):
@@ -1637,7 +1639,7 @@ def test_terrain_actual_clearance_proof_survives_rejection_of_a_later_segment(pl
 
 
 @pytest.mark.parametrize('latest_wall', [True, False])
-def test_center_fire_wall_aperture_uses_flicker_history_even_on_free_frame(
+def test_center_fire_wall_aperture_requires_current_occupied_support(
         planner_factory, latest_wall):
     planner = planner_factory()
     _publish_inspection_map(planner, wall=False)
@@ -1648,11 +1650,12 @@ def test_center_fire_wall_aperture_uses_flicker_history_even_on_free_frame(
     request.smoke_wall_width = 3.0
     response = planner.query_geometry(request)
     assert response.success, response.message
-    assert response.smoke_wall_valid
-    assert response.smoke_wall_samples == 25
-    assert response.smoke_wall_range == pytest.approx(3.0, abs=0.25)
-    assert response.smoke_wall_nearest_range <= response.smoke_wall_range
-    assert 0.0 < response.smoke_wall_uncertainty < 0.3
+    assert response.smoke_wall_valid is latest_wall
+    assert response.smoke_wall_samples == (25 if latest_wall else 0)
+    if latest_wall:
+        assert response.smoke_wall_range == pytest.approx(3.0, abs=0.25)
+        assert response.smoke_wall_nearest_range <= response.smoke_wall_range
+        assert 0.0 < response.smoke_wall_uncertainty < 0.3
 
 
 @pytest.mark.parametrize('wall', [True, False, 'unknown_wall'])
@@ -1709,3 +1712,48 @@ def test_wall_aperture_remains_transverse_for_navigation_along_map_y(planner_fac
     # of sampling across the wall, creating an artificial spread in range.
     assert response.smoke_wall_nearest_range == pytest.approx(response.smoke_wall_range)
     assert 0.0 < response.smoke_wall_uncertainty < 0.3
+
+
+@pytest.mark.parametrize('samples, accepted', [
+    (((-1, -1), (-1, 0), (0, 0), (0, 1), (1, 1)), False),
+    (((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 0), (0, 1)), False),
+    (((-1, -1), (-1, 0), (0, -1), (0, 0), (1, -1), (1, 0)), False),
+    (((-1, -1), (-1, 0), (0, 0), (0, 1), (1, 1), (1, -1)), True),
+])
+def test_wall_aperture_requires_six_returns_across_three_rows_and_columns(
+        planner_factory, samples, accepted):
+    planner = planner_factory()
+    _publish_inspection_map(planner, wall=False)
+    # At 0.25 m resolution, the 0.75 m grid spacing spans three voxel keys.
+    cells = tuple((3 * column, 8 + 3 * row) for row, column in samples)
+    _publish_inspection_map(planner, wall=cells)
+    request = _inspection_request()
+    request.smoke_wall_width = 3.0
+
+    response = planner.query_geometry(request)
+
+    assert response.success, response.message
+    assert response.smoke_wall_samples == len(samples)
+    assert response.smoke_wall_valid is accepted
+
+
+def test_wall_aperture_observation_identity_tracks_new_current_support(planner_factory):
+    planner = planner_factory()
+    request = _inspection_request()
+    request.smoke_wall_width = 3.0
+    _publish_inspection_map(planner, wall=False)
+    first_map = _publish_inspection_map(planner, wall=True)
+    first = planner.query_geometry(request)
+    replay = planner.query_geometry(request)
+    assert first.smoke_wall_valid and replay.smoke_wall_valid
+    assert first.map_header.stamp == replay.map_header.stamp == first_map.header.stamp
+
+    free_map = _publish_inspection_map(planner, wall=False)
+    missing = planner.query_geometry(request)
+    assert missing.map_header.stamp == free_map.header.stamp
+    assert not missing.smoke_wall_valid and missing.smoke_wall_samples == 0
+
+    second_map = _publish_inspection_map(planner, wall=True)
+    second = planner.query_geometry(request)
+    assert second.smoke_wall_valid
+    assert second.map_header.stamp == second_map.header.stamp != first.map_header.stamp

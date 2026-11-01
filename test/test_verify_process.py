@@ -106,7 +106,10 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
         def near_smoke_wall(request, response):
             response = original_geometry(request, response)
             if request.smoke_wall_width:
-                response.smoke_wall_valid = request.origin.header.frame_id == 'test_thermal_camera'
+                with sensors.lock:
+                    near_fire = sensors.source in {'fire', 'smoke_fire'}
+                response.smoke_wall_valid = (
+                    request.origin.header.frame_id == 'test_thermal_camera' or near_fire)
                 response.smoke_wall_range = response.smoke_wall_nearest_range = (
                     VERIFY_DEFAULTS['verify_smoke_standoff'] + 0.4)
             return response

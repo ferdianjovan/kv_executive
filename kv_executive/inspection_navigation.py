@@ -666,7 +666,7 @@ class InspectionNavigationMixin:
         mean, nearest, uncertainty = (
             response.smoke_wall_range, response.smoke_wall_nearest_range,
             response.smoke_wall_uncertainty)
-        if (response.smoke_wall_samples < 3
+        if (response.smoke_wall_samples < 6
                 or not all(math.isfinite(v) for v in (mean, nearest, uncertainty))
                 or not 0.0 < nearest <= mean <= request.max_range
                 or not 0.0 <= uncertainty <= self.config['verify_inspection_max_uncertainty']):
@@ -749,7 +749,7 @@ class InspectionNavigationMixin:
 
     def _verify_wall_plane_path(self, path, wall):
         """Keep every path vertex behind the same measured smoke-wall plane."""
-        standoff = self.config.get('verify_smoke_standoff', 20.0)
+        standoff = self.config.get('verify_smoke_standoff', 15.0)
         allowed = max(0.0, wall['nearest'] - wall['uncertainty'] - standoff
                       - self.config.get('position_tolerance', 0.3))
         _, current = self._verify_control_pose()
@@ -777,6 +777,8 @@ class InspectionNavigationMixin:
             # An accepted plane remains a limit through image/map flicker.
             # It cannot independently authorize a completed inspection report.
             return deepcopy(committed)
+        if (geometry or {}).get('wall_probe_only', False):
+            return None
         if (not geometry or geometry.get('source') != 'smoke'
                 or not geometry.get('plume_candidate', False)
                 or geometry.get('occupied_samples', 0) < 2
@@ -933,7 +935,7 @@ class InspectionNavigationMixin:
                         'smoke_navigation_wall': smoke_walls[-1]}
         for smoke_wall in smoke_walls:
             remaining = (smoke_wall['nearest'] - smoke_wall['uncertainty']
-                         - self.config.get('verify_smoke_standoff', 20.0)
+                         - self.config.get('verify_smoke_standoff', 15.0)
                          - self.config.get('position_tolerance', 0.3)
                          - sum((getattr(current.position, a) - getattr(smoke_wall['origin'], a))
                                * smoke_wall['axis'][i] for i, a in enumerate('xyz')))
@@ -1149,7 +1151,7 @@ class InspectionNavigationMixin:
         # Match the outer arrival band so a final smoke leg need not be smaller
         # than the controller's position tolerance. Positive reports separately
         # enforce the conservative range's strict lower standoff bound.
-        limit = (self.config.get('verify_smoke_standoff', 20.0) + uncertainty
+        limit = (self.config.get('verify_smoke_standoff', 15.0) + uncertainty
                  + 2.0 * self.config.get('position_tolerance', 0.3))
         return max(distance, current_distance) <= limit + 1e-9
 
@@ -1244,13 +1246,21 @@ class InspectionNavigationMixin:
             raise VerificationObservationLost('No-fire inspection attempts are incomplete')
 
         def no_fire_boundary_valid():
+            smoke = self._verify.fresh_smoke()
+            if not self._inspection_detection_valid(smoke, 'smoke'):
+                return False
             if wall is None:
-                return self._verify_smoke_boundary_reached(smoke_geometry)
-            frame, bearing = wall.get('camera_frame'), wall.get('bearing')
+                _, current = self._verify_control_pose()
+                frame = smoke.header.frame_id
+                bearing = yaw_from_quaternion(current.orientation) + smoke.yaw_correction_rad
+            else:
+                frame, bearing = wall.get('camera_frame'), wall.get('bearing')
+                if frame != smoke.header.frame_id:
+                    return False
             if not frame or bearing is None or not math.isfinite(bearing):
                 return False
-            # Cached approach evidence only chooses the direction to measure.
-            # Every negative publication requires current range evidence.
+            # A legacy single ray or cached plane only chooses where to look.
+            # Every negative publication needs a newly qualified aperture.
             measured = self._verify_opportunistic_wall(frame, bearing)
             return self._verify_smoke_wall_at_standoff(measured)
 
@@ -1360,10 +1370,10 @@ class InspectionNavigationMixin:
                     'Smoke-wall standoff evidence became unavailable before publishing')
         # Decide classification after the last potentially blocking query too.
         self._check_running()
-        latest = self._verify.stable_fire()
         if not report.fire_found and not no_fire_boundary_valid():
             raise VerificationObservationLost(
                 'Smoke boundary evidence became unavailable before publishing')
+        latest = self._verify.stable_fire()
         if report.fire_found:
             if (not self._inspection_detection_valid(latest, 'fire')
                     or latest.header.frame_id != fire_message.header.frame_id

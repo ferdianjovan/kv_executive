@@ -606,6 +606,10 @@ class MissionExecutive(
         blackboard['verify_smoke_boundary_reached'] = False
         blackboard['verify_smoke_walls'] = []
         blackboard['verify_smoke_wall_probe'] = None
+        blackboard['verify_wall_latest'] = None
+        blackboard['verify_wall_last_stamp_ns'] = 0
+        blackboard['verify_wall_near_count'] = 0
+        blackboard['verify_wall_recheck_deadline'] = None
         blackboard['verify_height_hint'] = None
         blackboard['verify_height_hint_consumed'] = 0
         blackboard['verify_height_hint_epoch'] = 0

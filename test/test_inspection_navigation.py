@@ -312,6 +312,8 @@ def test_near_tree_or_flickering_surface_never_becomes_the_smoke_target(executiv
 
 
 def test_fresh_history_associated_smoke_wall_records_an_explicit_proxy_position(executive):
+    executive.smoke_wall_valid = True
+
     def observed_plume(request, response):
         response.surface.point = Point(x=8.0, z=20.0)
         response.surface_range = 8.0
@@ -1366,6 +1368,7 @@ def test_smoke_boundary_rejects_stale_or_inconsistent_proximity(executive, failu
 
 
 def test_no_fire_report_accepts_observed_smoke_boundary_without_fire_localization(executive):
+    executive.smoke_wall_valid = True
     _trust_smoke_for_commit(executive)
 
     report = executive._verify_report_inspection({}, attempts=3)
@@ -2268,3 +2271,72 @@ def test_fresh_plume_hit_tightens_an_older_retained_aperture_plane(executive):
     executive.now += 10.0  # The accepted nearer plane survives image ageing during this leg.
     crossing = Path(poses=[PoseStamped(pose=Pose(position=Point(x=0.6, z=20.0)))])
     assert not validate(crossing)
+
+
+@pytest.mark.parametrize('samples, accepted', [(5, False), (6, True)])
+def test_wall_probe_python_guard_requires_at_least_six_samples(executive, samples, accepted):
+    executive.smoke_wall_valid = True
+    executive.on_query = lambda request, response: setattr(response, 'smoke_wall_samples', samples)
+    wall = executive._verify_opportunistic_wall('rgb_camera', 0.0)
+    assert (wall is not None) is accepted
+
+
+def test_legacy_single_ray_cannot_authorize_a_negative_report_without_aperture(executive):
+    from kv_executive.verification import VerificationObservationLost
+    _trust_smoke_for_commit(executive)
+    assert executive._verify_smoke_boundary_reached(smoke_boundary_geometry())
+    assert not executive.smoke_wall_valid
+    with pytest.raises(VerificationObservationLost, match='fresh observed smoke boundary'):
+        executive._verify_report_inspection({}, attempts=3)
+    assert not any(event[0] == 'report' for event in executive.events)
+
+
+def test_negative_report_remeasures_fifteen_meter_wall_without_legacy_geometry(executive):
+    executive.config['verify_smoke_standoff'] = 15.0
+    executive.smoke_wall_valid = True
+    executive.smoke_wall_nearest = 15.5
+    report = executive._verify_report_inspection({}, attempts=3)
+    assert not report.fire_found
+    assert report.status == 'fire_not_found'
+    wall_requests = [event[1] for event in executive.events
+                     if event[0] == 'query' and event[1].smoke_wall_width]
+    assert len(wall_requests) == 2
+    assert all(request.origin.header.frame_id == executive.smoke.header.frame_id
+               for request in wall_requests)
+
+
+def test_fire_appearing_during_final_negative_wall_probe_prevents_publication(executive):
+    from kv_executive.verification import VerificationObservationLost
+    executive.smoke_wall_valid = True
+    probes = []
+
+    def fire_arrives(request, response):
+        if request.smoke_wall_width:
+            probes.append(request)
+            if len(probes) == 2:
+                executive.fire = _persistent_fire(executive.now)
+
+    executive.on_query = fire_arrives
+    with pytest.raises(VerificationObservationLost, match='Smoke or no-fire evidence changed'):
+        executive._verify_report_inspection({}, attempts=3)
+    assert len(probes) == 2
+    assert not any(event[0] == 'report' for event in executive.events)
+
+
+def test_default_wall_movement_limit_is_fifteen_meters(executive):
+    executive.config.pop('verify_smoke_standoff')
+    wall = _measured_navigation_wall(executive, nearest=16.0)
+    inside = Path(poses=[PoseStamped(pose=Pose(position=Point(x=0.5, z=20.0)))])
+    crossing = Path(poses=[PoseStamped(pose=Pose(position=Point(x=0.6, z=20.0)))])
+    assert executive._verify_wall_plane_path(inside, wall)
+    assert not executive._verify_wall_plane_path(crossing, wall)
+
+
+@pytest.mark.parametrize('aperture', [False, True])
+def test_probe_only_navigation_never_promotes_a_legacy_ray_to_a_wall(executive, aperture):
+    geometry = {**navigation_smoke_wall(standoff=10.0), 'wall_probe_only': True}
+    if aperture:
+        geometry['smoke_navigation_wall'] = _measured_navigation_wall(executive, nearest=11.0)
+    assert executive._verify_navigation_viewpoint(0.0, geometry=geometry, forward_only=True)
+    expected = 0.5 if aperture else 3.0
+    assert executive.odometry.pose.pose.position.x == pytest.approx(expected)
