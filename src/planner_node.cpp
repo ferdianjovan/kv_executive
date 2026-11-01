@@ -705,8 +705,8 @@ private:
     // This is a lower bound within the checked vertical range, not a measured
     // ground height. Strict mode still requires observed support below the path.
     return terrain_envelope && !inspection_require_observed_free_space_ ?
-      std::max(0.0, inspection_max_range_ - latest.tree->getResolution() * 0.5) :
-      std::numeric_limits<double>::quiet_NaN();
+           std::max(0.0, inspection_max_range_ - latest.tree->getResolution() * 0.5) :
+           std::numeric_limits<double>::quiet_NaN();
   }
 
   bool inspectionBodyFree(
@@ -949,7 +949,7 @@ private:
       std::chrono::steady_clock::now() < deadline)
     {
       const auto selected = std::min_element(frontier.begin(), frontier.end(),
-        [&](std::size_t a, std::size_t b) {return score(a) < score(b);});
+          [&](std::size_t a, std::size_t b) {return score(a) < score(b);});
       const std::size_t parent = *selected;
       frontier.erase(selected);
       const auto current = vertices[parent];
@@ -1015,7 +1015,7 @@ private:
             }
             best_cost[cell] = cost;
             vertices.push_back({cell, point, point.z - terrain.point.z - terrain.uncertainty,
-              cost, parent});
+                cost, parent});
             frontier.push_back(vertices.size() - 1);
           }
         }
@@ -1117,14 +1117,25 @@ private:
           camera_y.vector.y = camera_z.vector.z = 1.0;
           tf_buffer_->transform(camera_y, side, frame, tf2::durationFromSec(transform_timeout_));
           tf_buffer_->transform(camera_z, up, frame, tf2::durationFromSec(transform_timeout_));
-          const octomap::point3d lateral(side.vector.x, side.vector.y, side.vector.z);
-          const octomap::point3d vertical(up.vector.x, up.vector.y, up.vector.z);
+          const octomap::point3d reference_up(up.vector.x, up.vector.y, up.vector.z);
+          octomap::point3d lateral = reference_up.cross(ray_direction);
+          if (lateral.norm() < 1e-6) {
+            const octomap::point3d reference_side(side.vector.x, side.vector.y, side.vector.z);
+            lateral = reference_side - ray_direction * reference_side.dot(ray_direction);
+          }
+          if (lateral.norm() < 1e-6) {
+            throw std::invalid_argument("Smoke wall aperture has no transverse axis");
+          }
+          lateral.normalize();
+          octomap::point3d vertical = ray_direction.cross(lateral);
+          vertical.normalize();
           std::vector<double> ranges;
           std::set<int> rows, columns;
           double voxel_uncertainty = 0.0;
           for (int row = -2; row <= 2; ++row) {
             for (int column = -2; column <= 2; ++column) {
-              const auto sample = ray_origin + lateral * (column * request->smoke_wall_width / 4.0) +
+              const auto sample = ray_origin + lateral *
+                (column * request->smoke_wall_width / 4.0) +
                 vertical * (row * request->smoke_wall_width / 4.0);
               double nearest = request->max_range + 1.0;
               for (const auto & map : history) {

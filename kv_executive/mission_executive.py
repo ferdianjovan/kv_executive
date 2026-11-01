@@ -604,6 +604,14 @@ class MissionExecutive(
         blackboard['verify_navigation_visited'] = None
         blackboard['verify_navigation_legs'] = 0
         blackboard['verify_smoke_boundary_reached'] = False
+        blackboard['verify_smoke_walls'] = []
+        blackboard['verify_smoke_wall_probe'] = None
+        blackboard['verify_height_hint'] = None
+        blackboard['verify_height_hint_consumed'] = 0
+        blackboard['verify_vertical_track'] = None
+        blackboard['verify_vertical_stamp'] = 0
+        blackboard['verify_vertical_direction'] = 0
+        blackboard['verify_vertical_attempts'] = 0
         blackboard['verify_fire_pending'] = False
         blackboard['verify_fire_observed'] = False
         blackboard['verify_fire_seen_ns'] = 0

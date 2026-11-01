@@ -330,30 +330,52 @@ The default terrain floor is 5 m; navigation prefers 7.5 m and considers up to
 planning and in-flight corridor revalidation; terrain heights are never invented.
 
 ```text
-APPROACH_SMOKE -> short terrain-aware smoke leg -> REACQUIRE
+APPROACH_SMOKE -> optional wall probe -> short terrain-aware smoke leg -> REACQUIRE
 REACQUIRE     -> fresh smoke -> APPROACH_SMOKE or SEARCH_FIRE
 SEARCH_FIRE   -> smoke-boundary observation / short terrain-aware leg
               -> boundary viewpoint inspections in CENTER_FIRE
 between smoke legs -> confirmed visible fire -> CENTER_FIRE
 CENTER_FIRE   -> center -> measured smoke-wall standoff -> fire_found report
+              -> completed near-wall search without fire -> fire_not_found report
               -> completed report -> Exploration
 blocked recovery -> wait in LOITER for newer fresh maps -> bounded retry or explicit abort
 ```
 
-In `CENTER_FIRE`, distance is measured to the observed smoke wall, never to
-an estimated fire position. An opt-in geometry query samples 25 parallel rays
-across a 3 m by 3 m patch in front of the camera. Occupied/free changes in recent
+Distance is measured to the observed smoke wall, never to an estimated fire
+position. An opt-in geometry query samples 25 parallel rays across a 3 m by 3 m
+patch perpendicular to the measurement direction. Occupied/free changes in recent
 map history identify a suspected flickering wall; static or unknown cells alone
 do not. The mean range is logged, while the nearest sampled range, measurement
 uncertainty and tracking margin limit approach to `verify_smoke_standoff` (20 m).
 A positive report's conservative distance (nearest range minus uncertainty) must
 be at least the configured standoff and no more than twice the position tolerance
 beyond it. With the default 0.3 m tolerance, this is 20.0–20.6 m.
-A missing wall estimate causes a hold and observation retry, not an assumed range.
+
+`APPROACH_SMOKE` and smoke-guided `SEARCH_FIRE` make one opportunistic wall probe
+along the next approach bearing. `verify_wall_probe_timeout` limits the service
+request to 0.5 seconds by default. Missing returns, insufficient samples and a
+probe timeout leave the ordinary checked forward approach available, including
+when smoke lies beyond the 40 m measurement range. They do not increment a
+range-failure counter or start the inspection clock. Explicit stale-map errors
+still invoke map recovery, and ordinary terrain/corridor checks remain mandatory.
+In `CENTER_FIRE`, missing wall evidence still prevents distance-based completion;
+it does not prevent a separately validated height correction.
+
+A valid probe can shorten the next leg or establish arrival at the measured
+standoff. Accepted wall planes remain movement limits through later missing
+returns, including independent planes measured in different directions. A closer
+measurement tightens the limit. If the aircraft is already inside a measured
+boundary, a checked retreat may reduce the violation; no path may deepen it.
+Retained planes never serve as fresh report evidence: publication remeasures
+the wall at the current viewpoint.
 
 Fire centering attempts one bounded yaw correction. Fresh confirmed thermal
 guidance also biases the next goal upward or downward by at most
 `verify_vertical_step` (0.5 m), with observed terrain clearance taking priority.
+The height decision is independent of wall ranging and is used when selecting
+the next approach/inspection movement. A confirmed fire below the image centre
+requests descent; one above requests climb. Committed paths still finish through
+detector gaps rather than changing their position targets during execution.
 Vertical guidance activates outside 7 degrees and releases inside 5 degrees by
 default (`verify_vertical_tolerance` plus `verify_vertical_hysteresis`). A fire
 more than `verify_vertical_edge_threshold` (15 degrees) from the image centre
@@ -363,7 +385,18 @@ best effort: perfect image centering is not an additional report requirement.
 Vertical corrections consume the existing fire-leg and inspection-time budgets.
 Missing terrain evidence or insufficient clearance prevents descent; a blocked
 vertical correction cannot authorize closer forward travel toward an edge-of-view
-fire. Each completed correction requires a fresh post-stop image and wall query.
+fire. Each completed correction requires another post-stop observation before
+another correction; completed reporting additionally requires fresh wall evidence.
+
+A confirmed fire seen during motion can supply one remembered edge-recovery
+correction after arrival if it disappears through either the top or bottom of the
+image. `verify_vertical_memory_timeout` defaults to 15 wall seconds; the image
+must also be no older than `verify_reacquire_observation_timeout` (5 ROS seconds),
+movement since capture must be at most one smoke step plus position tolerance
+(3.3 m by default), and yaw change must be at most 15 degrees. Track changes or
+an expired hint reject the correction. The hint is consumed once, followed by
+a wait for new confirmation; it is never treated as fresh fire for reporting.
+
 A short fire-approach maneuver retains its selected heading
 through detector gaps or tracking-ID changes. Each actual planned route is limited
 to `verify_fire_leg_max_length` (12 m), with `verify_fire_leg_timeout` (60 s)
@@ -371,22 +404,24 @@ starting after OFFBOARD preparation. Terrain, wall clearance, vehicle health and
 operator cancellation remain authoritative during motion. The original observed
 wall boundary remains enforced through flicker, and newer closer returns tighten
 it. The five-second detector wait starts after stopping and cannot cut a climb.
-A new movement or successful arrival report requires fresh post-stop fire guidance.
+Ordinary fire-guided legs and successful arrival reports require fresh post-stop
+fire guidance; the one-shot edge-recovery search is the bounded exception above.
 The approach is bounded by 64 legs and a 300-second real-time inspection deadline.
 A positive report requires fresh confirmed fire and a fresh wall measurement at
 the configured standoff, checked again before publication. Blocked movement,
 step exhaustion and timeout do not authorize success. A zero step limit permits
 reporting only when already at the measured standoff. Fire coordinates, when
 independently available, remain optional report metadata. The inspection timer
-starts with confirmed-fire inspection or the first accepted measured smoke boundary,
-including a boundary accepted in `APPROACH_SMOKE`; broad image coverage alone
-does not start it.
+starts with confirmed-fire inspection or the first accepted arrival at a measured
+smoke boundary, including arrival in `APPROACH_SMOKE`. A far-away wall measurement
+or broad image coverage alone does not start it.
 
 `APPROACH_SMOKE` remembers a smoothed smoke bearing and follows it in short
 terrain-aware forward steps (`verify_navigation_step`, 3 m by default). It tries
 straight 3 m, 1.5 m and 0.75 m candidates, preferring level motion before a
 terrain-required climb. An upper-image smoke cue does not command a separate
-altitude correction. There are no lateral/retreating fallbacks for smoke pursuit.
+altitude correction. There are no lateral/retreating fallbacks for ordinary smoke
+pursuit; the separate checked retreat applies only inside a measured boundary.
 Each new Verify episode starts with the current smoke bearing; it does not
 average a new site's direction with the previous site's bearing. Once a smoke leg
 is selected, fire appearing or disappearing and broad smoke coverage do not cancel
@@ -395,9 +430,10 @@ corrections, then fresh smoke; gaps retain the last heading. The planned positio
 path remains unchanged. Terrain, obstacle, map, telemetry and mission-interrupt
 checks remain active. Arrival enters `REACQUIRE` and requires new post-stop images;
 already-confirmed fire before selecting a leg still routes directly to `CENTER_FIRE`.
-Fire seen during a smoke leg therefore affects the altitude of a subsequent
-`CENTER_FIRE` goal, never the XYZ path currently being executed. `SEARCH_FIRE`
-retains its existing transition to `CENTER_FIRE` on confirmed fire.
+Fire seen during a smoke leg therefore affects a subsequent movement decision,
+including the one-shot edge reacquisition described above, never the XYZ path
+currently being executed. `SEARCH_FIRE` retains its transition to `CENTER_FIRE`
+on confirmed fire.
 
 After each stop, smoke loss holds the current position and heading until
 `verify_smoke_loss_grace` (5 wall-clock seconds by default) has elapsed since the
@@ -417,9 +453,10 @@ four image regions is observation information: it neither stops smoke navigation
 nor independently starts timed inspection. A static first-hit obstacle alone
 cannot prove a smoke boundary. A stale, unknown or non-plume
 surface cannot establish a negative inspection result.
-When reliable plume geometry is available outside the boundary, the remaining
-measured clearance limits the next smoke leg and its validated path. Without
-that geometry, a short smoke-guided leg cannot guarantee a precise wall distance.
+When reliable plume geometry or an opportunistic aperture measurement is
+available outside the boundary, the remaining measured clearance limits the next
+smoke leg and its validated path. Without either kind of evidence, a short
+smoke-guided leg cannot guarantee a precise wall distance.
 
 `SEARCH_FIRE` holds for fresh thermal confirmation, then reassesses smoke and
 terrain before selecting another short forward smoke leg. Collision-checked
@@ -461,9 +498,10 @@ and holds for the operator.
 Geometry-service polls during recovery are bounded to 0.5 seconds; temporary
 service timeouts remain recoverable within that budget, while telemetry and
 flight-control faults still propagate.
-Fresh fire evidence, cancellation and battery alerts retain priority throughout
-recovery. Map source freshness remains 5 ROS seconds. With real time, accepted-map
-reception silence is also limited to 5 wall seconds. With simulation time, a
+Cancellation and battery alerts retain priority throughout recovery. Confirmed
+fire resumes handling only after a newer fresh map ends a map outage; fire cannot
+restart the 20-second wait. Map source freshness remains 5 ROS seconds. With real
+time, accepted-map reception silence is also limited to 5 wall seconds. With simulation time, a
 progressing slow clock does not expire a source-fresh map merely because wall
 time runs faster; a frozen simulation clock still blocks inspection after
 5 wall seconds. These checks do not change OctoMap production or publication.
@@ -478,17 +516,23 @@ source-age window.
 History expires with the existing freshness window and is capped at eight maps.
 
 `CENTER_FIRE` uses the bounded movement and smoke-wall policy described above.
-Cached images cannot authorize another movement or a report. Cancellation,
+Cached images cannot authorize ordinary pursuit or a report; only the explicitly
+bounded edge-recovery search may consume remembered direction. Cancellation,
 battery Return/Abort requests, invalid telemetry and flight-control failures
 remain authoritative.
 
 Without visible fire, measured smoke-boundary proximity permits up to three observation
 windows, with safe lateral viewpoint changes between them. Rejected or
 unfinished viewpoint movements do not count as completed negative inspections.
-A negative report requires current broad smoke, fresh smoke-boundary evidence
-and no confirmed fire during the inspection. Otherwise the result is
-inconclusive. Previously confirmed fire cannot become a negative report during
-a detector gap. Exhausted blocked recovery retains an explicit hold outcome.
+A negative report requires all configured observation attempts to finish,
+current confirmed smoke, fresh measured boundary/standoff evidence, and no
+confirmed fire during the inspection. Smoke need not cover all quadrants.
+For an opportunistically measured boundary, the publisher probes again before
+and after other report preparation; a cached plane cannot authorize the result.
+Otherwise the result is inconclusive. Previously confirmed fire cannot become
+a negative report during a detector gap: bounded reacquisition either recovers
+fresh fire or finishes as an incomplete, aborted mission holding `AUTO.LOITER`,
+without a no-fire report or completed-site marker.
 
 The controller checks source timestamps, receive age, camera/track identity and
 confirmation persistence. Producer confirmation metadata can establish fire

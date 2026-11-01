@@ -51,6 +51,7 @@ class MonitoringSensors(Node):
         self.trusted_source = True
         self.smoke_boundary_range = None
         self.smoke_wall_range = None
+        self.approach_wall_range = None
         self.detection_latency = 0.0
         self.closed = False
         self.phases = []
@@ -236,10 +237,21 @@ def monitoring_sensors(mission):
 
     def measured_smoke_wall(request, response):
         response = original_geometry(request, response)
+        if response.surface_valid and response.surface_range > request.max_range:
+            response.surface_valid = False
         with sensors.lock:
-            distance = sensors.smoke_wall_range
-        if request.smoke_wall_width and distance is not None:
-            response.smoke_wall_range = response.smoke_wall_nearest_range = distance
+            distance = (sensors.approach_wall_range
+                        if request.origin.header.frame_id == 'test_rgb_camera'
+                        else sensors.smoke_wall_range)
+        if request.smoke_wall_width:
+            # Most smoke-flight cases start outside ranging coverage. A near
+            # thermal wall must not silently become smoke-arrival evidence.
+            if request.direction.header.frame_id == response.map_header.frame_id:
+                response.ray_direction.vector = deepcopy(request.direction.vector)
+            response.smoke_wall_valid = (
+                distance is not None and 0.0 < distance <= request.max_range)
+            if response.smoke_wall_valid:
+                response.smoke_wall_range = response.smoke_wall_nearest_range = distance
         return response
 
     fcu.geometry_service.callback = measured_smoke_wall
@@ -477,6 +489,7 @@ def _use_fixed_smoke_wall(fcu, initial_distance):
             distance = sum((getattr(point, a) - getattr(origin, a)) * getattr(axis, a)
                            for a in 'xyz')
             response.ray_direction.vector = deepcopy(axis)
+            response.smoke_wall_valid = 0.0 < distance <= request.max_range
             response.smoke_wall_range = response.smoke_wall_nearest_range = distance
         return response
 
@@ -869,21 +882,104 @@ def test_smoke_dropout_completes_short_terrain_detour_before_reacquiring(
 def test_broad_smoke_alone_keeps_approaching_without_entering_timed_inspection(
     mission, monitoring_sensors,
 ):
+    """Smoke beyond lidar range still permits successive checked forward legs."""
     sensors, fcu = monitoring_sensors, mission.fcu
+    for config in (mission.executive.config, mission.executive._verify.config):
+        config['mode_timeout'] = 5.0
     goal = _start_airborne_exploration(mission)
+    with fcu.lock:
+        yaw = yaw_from_quaternion(fcu.pose.orientation)
+        fcu.inspection_target = Point(
+            x=fcu.pose.position.x + 150.0 * math.cos(yaw),
+            y=fcu.pose.position.y + 150.0 * math.sin(yaw), z=fcu.pose.position.z)
     with sensors.lock:
         sensors.smoke_coverage = 0.4
+        sensors.approach_wall_range = 150.0
         sensors.source = 'smoke'
     try:
-        wait_for(lambda: len(fcu.target_requests) >= 2, 20.0,
+        wait_for(lambda: len(fcu.target_requests) >= 2, 35.0,
                  'broad smoke to authorize initial and post-arrival smoke legs')
         with fcu.lock:
             statuses = [text for _, text in fcu.statuses]
+            probes = [request for request in fcu.geometry_requests
+                      if request.smoke_wall_width == 3.0
+                      and request.origin.header.frame_id == 'test_rgb_camera']
+        assert len(probes) >= 2
         assert 'Verify: approach destination reached; reacquiring smoke or fire' in statuses
         assert not any(text in {'Verify/SEARCH_FIRE: started', 'Verify/CENTER_FIRE: started'}
                        for text in statuses)
         assert not sensors.inspection_snapshot()
     finally:
+        cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
+@pytest.mark.parametrize('vertical_direction', [-1.0, 1.0])
+def test_fire_lost_at_smoke_arrival_gets_one_vertical_reacquisition_before_advancing(
+    mission, monitoring_sensors, vertical_direction,
+):
+    """A confirmed edge glimpse guides the next height search, never the active leg."""
+    sensors, fcu = monitoring_sensors, mission.fcu
+    for config in (mission.executive.config, mission.executive._verify.config):
+        config.update(verify_motion_speed=1.0, mode_timeout=5.0,
+                      verify_reacquire_observation_timeout=5.0)
+    with fcu.lock:
+        fcu.inspection_terrain_z = fcu.pose.position.z - 7.0
+    started, release, hidden = threading.Event(), threading.Event(), threading.Event()
+    planned = []
+    original_plan, original_mode = fcu.plan_to_pose, fcu.set_mode
+
+    def selected_leg(request, response):
+        response = original_plan(request, response)
+        if not planned:
+            planned.append((time.monotonic(), deepcopy(request.target.pose)))
+            started.set()
+            assert release.wait(5.0)
+        return response
+
+    def hide_at_arrival(request, response):
+        response = original_mode(request, response)
+        with fcu.lock:
+            moved = bool(fcu.target_requests)
+        if request.custom_mode == 'AUTO.LOITER' and moved and not hidden.is_set():
+            with sensors.lock:
+                sensors.source = 'smoke'
+            hidden.set()
+        return response
+
+    fcu.fake_services[-1].callback = selected_leg
+    fcu.fake_services[0].callback = hide_at_arrival
+    goal = _start_airborne_exploration(mission)
+    with sensors.lock:
+        sensors.source = 'smoke'
+    try:
+        wait_for(started.is_set, 15.0, 'first smoke leg selected')
+        selected_at, target = planned[0]
+        with sensors.lock:
+            sensors.smoke_wall_range = None
+            sensors.fire_guidance = lambda: (0.0, vertical_direction * 0.3)
+            sensors.source = 'smoke_fire'
+        wait_for(lambda: mission.executive._verify.stable_fire() is not None,
+                 2.0, 'confirmed fire near the upper or lower image edge')
+        release.set()
+        wait_for(hidden.is_set, 20.0, 'fire disappears at the completed smoke leg')
+        wait_for(lambda: len(fcu.target_requests) >= 2, 15.0,
+                 'bounded vertical reacquisition before another forward smoke leg')
+        with fcu.lock:
+            correction = deepcopy(fcu.target_requests[1].pose)
+            statuses = list(fcu.statuses)
+        _assert_arrival_before_reacquire(mission, target, after=selected_at)
+        assert correction.position.z == pytest.approx(
+            target.position.z + vertical_direction * 0.5, abs=0.03)
+        assert math.hypot(correction.position.x - target.position.x,
+                          correction.position.y - target.position.y) < 0.03
+        assert any('height' in text.lower() or 'vertical' in text.lower()
+                   for stamp, text in statuses if stamp > selected_at)
+        assert not sensors.inspection_snapshot()
+        assert mission.executive._verify.had_fire_confirmation()
+        _assert_terrain_planning(mission)
+    finally:
+        release.set()
         cancel_goal(goal)
     _assert_airborne_safety(mission)
 
@@ -1413,6 +1509,45 @@ def test_fire_post_motion_miss_requires_fresh_guidance_before_reporting(
     _assert_airborne_safety(mission)
 
 
+def test_opportunistic_wall_arrival_searches_and_reports_without_broad_smoke(
+    mission, monitoring_sensors,
+):
+    """A fresh aperture measurement permits bounded inspection of a small plume."""
+    sensors, fcu = monitoring_sensors, mission.fcu
+    for config in (mission.executive.config, mission.executive._verify.config):
+        config['verify_viewpoint_lateral_step'] = 0.4
+    goal = _start_airborne_exploration(mission)
+    with sensors.lock:
+        sensors.smoke_regions = [1]
+        sensors.smoke_coverage = 0.02
+        sensors.approach_wall_range = (mission.executive.config['verify_smoke_standoff']
+                                       + 0.1 + mission.executive.config['position_tolerance'])
+        sensors.source = 'smoke'
+    try:
+        wait_for(lambda: bool(sensors.inspection_snapshot()), 35.0,
+                 'measured wall plus completed search to produce a negative inspection')
+        with sensors.lock:
+            sensors.source = None
+        report = sensors.inspection_snapshot()[0]
+        assert not report.fire_found and report.status == 'fire_not_found'
+        assert report.inspection_attempts == 3
+        assert not report.fire_location_valid and not report.smoke_location_valid
+        with fcu.lock:
+            statuses = [text for _, text in fcu.statuses]
+            probes = [request for request in fcu.geometry_requests
+                      if request.smoke_wall_width == 3.0
+                      and request.origin.header.frame_id == 'test_rgb_camera']
+        for state in ('APPROACH_SMOKE', 'REACQUIRE', 'SEARCH_FIRE', 'CENTER_FIRE'):
+            assert f'Verify/{state}: started' in statuses
+        assert len(probes) >= 2  # Arrival evidence is measured again before publishing.
+        wait_for(lambda: _states(sensors)[-1] == 'Exploration', 5.0,
+                 'the same action to resume exploration after completed inspection')
+        _assert_same_goal_phases(sensors, goal)
+    finally:
+        cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
 @pytest.mark.parametrize('initial_approach', [False, True])
 def test_observed_smoke_boundary_stops_advance_and_bounds_negative_inspection(
     mission, monitoring_sensors, initial_approach,
@@ -1632,8 +1767,9 @@ def test_center_fire_arrives_at_smoke_wall_boundary_with_fresh_fire(mission, mon
     _assert_airborne_safety(mission)
 
 
+@pytest.mark.parametrize('wall_source', ['plume', 'aperture_once'])
 def test_smoke_final_leg_is_clipped_to_the_twenty_metre_measured_boundary(
-    mission, monitoring_sensors,
+    mission, monitoring_sensors, wall_source,
 ):
     sensors, fcu = monitoring_sensors, mission.fcu
     for config in (mission.executive.config, mission.executive._verify.config):
@@ -1654,13 +1790,27 @@ def test_smoke_final_leg_is_clipped_to_the_twenty_metre_measured_boundary(
         with fcu.lock:
             pose = deepcopy(fcu.pose)
         # The fixed observed wall gets closer as the simulated aircraft moves.
-        sensors.smoke_boundary_range = math.dist(
-            _point_position(pose.position), _point_position(wall_point))
+        if wall_source == 'plume':
+            sensors.smoke_boundary_range = math.dist(
+                _point_position(pose.position), _point_position(wall_point))
         yaw = math.atan2(wall_point.y - pose.position.y, wall_point.x - pose.position.x)
         return angular_distance(yaw, yaw_from_quaternion(pose.orientation)), 0.0
 
+    aperture_queries = []
+    original_geometry = fcu.geometry_service.callback
+
+    def one_aperture_measurement(request, response):
+        response = original_geometry(request, response)
+        if request.smoke_wall_width and request.origin.header.frame_id == 'test_rgb_camera':
+            aperture_queries.append(deepcopy(request))
+            response.smoke_wall_valid = len(aperture_queries) == 1
+            response.smoke_wall_range = response.smoke_wall_nearest_range = standoff + 0.8
+        return response
+
+    if wall_source == 'aperture_once':
+        fcu.geometry_service.callback = one_aperture_measurement
     with sensors.lock:
-        sensors.smoke_boundary_range = standoff + 0.8
+        sensors.smoke_boundary_range = standoff + 0.8 if wall_source == 'plume' else None
         sensors.smoke_guidance = smoke_guidance
         sensors.source = 'smoke'
     arrived = 'Verify: approach destination reached; reacquiring smoke or fire'
@@ -1676,6 +1826,8 @@ def test_smoke_final_leg_is_clipped_to_the_twenty_metre_measured_boundary(
     assert advance == pytest.approx(0.4, abs=0.03)
     assert target.position.z == pytest.approx(initial.position.z, abs=0.03)
     assert math.dist(_point_position(target.position), _point_position(wall_point)) >= standoff
+    if wall_source == 'aperture_once':
+        assert aperture_queries
     _assert_arrival_before_reacquire(mission, target)
     _assert_terrain_planning(mission)
     cancel_goal(goal)

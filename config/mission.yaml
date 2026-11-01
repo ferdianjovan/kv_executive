@@ -94,6 +94,10 @@ mission_executive:
     verify_vertical_hysteresis: 0.03490658503988659  # Start outside 7 degrees.
     verify_vertical_edge_threshold: 0.2617993877991494  # 15 degrees: correct height first.
     verify_vertical_max_corrections: 3  # Best-effort vertical attempts at the standoff.
+    # One remembered edge correction, within one 3 m leg / 15 degrees of yaw.
+    # Also limited by verify_reacquire_observation_timeout in source-image time.
+    verify_vertical_memory_timeout: 15.0  # Wall seconds since guidance was received.
+    verify_wall_probe_timeout: 0.5  # One opportunistic query; missing range allows approach.
     verify_minimum_altitude: 2.0  # Local z floor; planner home limits also apply.
     # Legacy coverage-to-step parameters remain accepted for compatibility.
     # Active smoke acquisition uses verify_navigation_step with measured terrain
@@ -101,7 +105,7 @@ mission_executive:
     # fresh fire adjusts yaw and receives priority after arrival.
     verify_step_min: 5.0
     verify_step_max: 20.0
-    # Broad-smoke evidence for negative inspection reports, not a navigation stop.
+    # Legacy broad-smoke threshold; measured proximity gates inspection reports.
     verify_full_coverage: 0.25
     verify_motion_speed: 0.5
     # Keep the aircraft level; these position setpoints cannot safely request tilt.

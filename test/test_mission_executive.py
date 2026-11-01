@@ -1686,6 +1686,10 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     blackboard['verify_smoke_bearing'] = 0.7
     blackboard['verify_arrival_after_ns'] = 100_000_000_000
     blackboard['verify_viewpoint_required'] = True
+    blackboard['verify_smoke_walls'] = [{'nearest': 20.0}]
+    blackboard['verify_smoke_wall_probe'] = {'nearest': 20.0}
+    blackboard['verify_height_hint'] = 'old target'
+    blackboard['verify_height_hint_consumed'] = 42
 
     harness._exploration_parent_entry(blackboard)
     harness._takeoff(blackboard)
@@ -1698,6 +1702,10 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     assert blackboard['verify_smoke_bearing'] is None
     assert blackboard['verify_arrival_after_ns'] == 0
     assert not blackboard['verify_viewpoint_required']
+    assert blackboard['verify_smoke_walls'] == []
+    assert blackboard['verify_smoke_wall_probe'] is None
+    assert blackboard['verify_height_hint'] is None
+    assert blackboard['verify_height_hint_consumed'] == 0
     assert harness._verify_retry_after == 0.0
     phase = next(event[1] for event in harness.events if event[0] == 'phase')
     assert phase.state == 'Exploration'

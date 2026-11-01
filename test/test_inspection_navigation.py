@@ -1753,7 +1753,7 @@ def test_wall_standoff_uses_conservative_range_without_accepting_inside_boundary
     assert inspection.smoke_wall_standoff_reached(wall, standoff, 0.3) is accepted
 
 
-@pytest.mark.parametrize('late_change', ['fire', 'partial_smoke'])
+@pytest.mark.parametrize('late_change', ['fire', 'smoke_lost'])
 def test_no_fire_evidence_is_rechecked_after_observer_transform(executive, late_change):
     from kv_executive.verification import VerificationObservationLost
     _trust_smoke_for_commit(executive)
@@ -1766,8 +1766,7 @@ def test_no_fire_evidence_is_rechecked_after_observer_transform(executive, late_
             if late_change == 'fire':
                 executive.fire = _persistent_fire()
             else:
-                executive.smoke.coverage = 0.1
-                executive.smoke.regions = [1]
+                executive.smoke = None
         return original_transform(frame)
 
     executive._path_frame_transform = delayed_transform
@@ -2108,3 +2107,164 @@ def test_vertical_fire_motion_preserves_measured_wall_plane(executive):
     assert not executive._verify_recovery_plan_to(
         target, geometry=geometry, preserve_requested_altitude=True)
     assert executive.odometry.pose.pose.position.z == 20.0
+
+
+@pytest.mark.parametrize('bearing', [0.0, math.pi / 2, -math.pi / 2])
+def test_opportunistic_wall_uses_camera_origin_and_rotated_navigation_bearing(executive, bearing):
+    executive.smoke_wall_valid = True
+    executive.conversion.rotation = quaternion_from_yaw(math.pi / 2)
+    executive.conversion.translation.x = 30.0
+    wall = executive._verify_opportunistic_wall('rgb_camera', bearing)
+    request = next(event[1] for event in executive.events if event[0] == 'query')
+    assert request.origin.header.frame_id == 'rgb_camera'
+    assert request.origin.point == Point()
+    assert request.direction.header.frame_id == 'map'
+    assert request.direction.vector.x == pytest.approx(math.cos(bearing - math.pi / 2))
+    assert request.direction.vector.y == pytest.approx(math.sin(bearing - math.pi / 2))
+    assert request.direction.vector.z == pytest.approx(0.0)
+    assert wall['bearing'] == bearing
+    assert wall['map_stamp_ns'] == int(executive.now * 1e9)
+
+
+def test_opportunistic_wall_timeout_does_not_block_ordinary_approach(executive):
+    from kv_executive.mission_executive import MissionTimeout
+    calls = []
+
+    def timeout(client, request, description, timeout=None):
+        calls.append(timeout)
+        raise MissionTimeout('probe deadline')
+
+    executive._call = timeout
+    assert executive._verify_opportunistic_wall('rgb_camera', 0.0) is None
+    assert calls == [0.5]
+
+
+@pytest.mark.parametrize('failure', [
+    'absent', 'few_samples', 'uncertain', 'stale_map', 'map_error'])
+def test_opportunistic_wall_distinguishes_no_range_from_bad_map(executive, failure):
+    from kv_executive.verification import VerificationMapUnavailable
+    executive.smoke_wall_valid = True
+
+    def unavailable(request, response):
+        if failure == 'absent':
+            response.smoke_wall_valid = False
+        elif failure == 'few_samples':
+            response.smoke_wall_samples = 1
+        elif failure == 'uncertain':
+            response.smoke_wall_uncertainty = 3.0
+        elif failure == 'stale_map':
+            response.map_header = header(executive.now - 6.0, 'map')
+        else:
+            response.success = False
+            response.error_code = 1
+            response.message = 'map unavailable'
+
+    executive.on_query = unavailable
+    if failure in ('stale_map', 'map_error'):
+        with pytest.raises(VerificationMapUnavailable):
+            executive._verify_opportunistic_wall('rgb_camera', 0.0)
+    else:
+        assert executive._verify_opportunistic_wall('rgb_camera', 0.0) is None
+
+
+def _measured_navigation_wall(executive, nearest=10.8, axis=(1.0, 0.0, 0.0)):
+    return {'origin': deepcopy(executive.odometry.pose.pose.position), 'axis': axis,
+            'nearest': nearest, 'mean': nearest, 'uncertainty': 0.2,
+            'camera_frame': 'rgb_camera', 'bearing': math.atan2(axis[1], axis[0]),
+            'map_header': header(executive.now, 'map')}
+
+
+def test_retained_wall_limits_forward_leg_without_fresh_smoke_geometry(executive):
+    wall = _measured_navigation_wall(executive)
+    wall['map_header'] = header(executive.now - 10.0, 'map')
+    geometry = {'source': 'smoke', 'smoke_navigation_wall': wall}
+    assert executive._verify_navigation_viewpoint(0.0, geometry=geometry, forward_only=True)
+    assert executive.odometry.pose.pose.position.x == pytest.approx(0.3)
+    assert not executive._verify_smoke_wall_at_standoff(wall)
+
+
+def test_all_retained_wall_planes_limit_a_new_approach_direction(executive):
+    xwall = _measured_navigation_wall(executive, nearest=11.5)
+    ywall = _measured_navigation_wall(executive, nearest=10.8, axis=(0.0, 1.0, 0.0))
+    geometry = {'smoke_navigation_wall': xwall, 'smoke_navigation_walls': [xwall, ywall]}
+    assert executive._verify_navigation_viewpoint(
+        math.pi / 4, geometry=geometry, forward_only=True)
+    position = executive.odometry.pose.pose.position
+    assert position.x == pytest.approx(0.3)
+    assert position.y == pytest.approx(0.3)
+
+
+def test_wall_violation_allows_monotonic_retreat_but_not_deeper_entry(executive):
+    wall = _measured_navigation_wall(executive, nearest=10.5)
+    executive.odometry.pose.pose.position.x = 1.0
+
+    def path(*positions):
+        return Path(poses=[PoseStamped(pose=Pose(position=Point(x=x, z=20.0)))
+                           for x in positions])
+
+    assert executive._verify_wall_plane_path(path(1.0, 0.5, 0.0), wall)
+    assert not executive._verify_wall_plane_path(path(1.0, 1.1, 0.0), wall)
+    assert not executive._verify_wall_plane_path(path(1.0, 0.5, 0.7, 0.0), wall)
+
+
+def test_no_fire_report_accepts_partial_smoke_with_remeasured_wall(executive):
+    executive.smoke.coverage = 0.05
+    executive.smoke.regions = [1]
+    executive.smoke_wall_valid = True
+    wall = _measured_navigation_wall(executive)
+    wall['map_header'] = header(executive.now - 20.0, 'map')
+    report = executive._verify_report_inspection({}, attempts=3, wall=wall)
+    assert report.status == 'fire_not_found' and not report.fire_found
+    probes = [event for event in executive.events if event[0] == 'query'
+              and event[1].smoke_wall_width]
+    assert len(probes) == 2
+
+
+@pytest.mark.parametrize('failure', ['unavailable', 'far', 'close', 'late_loss', 'prior_fire',
+                                     'unfinished_search'])
+def test_no_fire_report_needs_completed_search_and_current_wall(executive, failure):
+    from kv_executive.verification import VerificationObservationLost
+    executive.smoke_wall_valid = failure != 'unavailable'
+    executive.fire_confirmed = failure == 'prior_fire'
+    if failure == 'far':
+        executive.smoke_wall_nearest = 30.0
+    elif failure == 'close':
+        executive.smoke_wall_nearest = 8.0
+    probes = []
+
+    def late_loss(request, response):
+        if request.smoke_wall_width:
+            probes.append(request)
+            if failure == 'late_loss' and len(probes) == 2:
+                response.smoke_wall_valid = False
+
+    executive.on_query = late_loss
+    wall = _measured_navigation_wall(executive)
+    with pytest.raises(VerificationObservationLost):
+        executive._verify_report_inspection(
+            {}, attempts=2 if failure == 'unfinished_search' else 3, wall=wall)
+    assert not any(event[0] == 'report' for event in executive.events)
+
+
+def test_wall_arrival_requires_current_pose_proximity_and_fresh_map(executive):
+    wall = _measured_navigation_wall(executive, nearest=12.5)
+    assert not executive._verify_smoke_wall_at_standoff(wall)
+    executive.odometry.pose.pose.position.x = 2.0
+    assert executive._verify_smoke_wall_at_standoff(wall)
+    executive.odometry.pose.pose.position.x = 3.0
+    assert not executive._verify_smoke_wall_at_standoff(wall)
+    executive.odometry.pose.pose.position.x = 2.0
+    executive.now += 6.0
+    assert not executive._verify_smoke_wall_at_standoff(wall)
+
+
+def test_fresh_plume_hit_tightens_an_older_retained_aperture_plane(executive):
+    retained = _measured_navigation_wall(executive, nearest=30.0)
+    geometry = {**navigation_smoke_wall(standoff=10.0),
+                'smoke_navigation_wall': retained, 'smoke_navigation_walls': [retained]}
+    assert executive._verify_navigation_viewpoint(0.0, geometry=geometry, forward_only=True)
+    assert executive.odometry.pose.pose.position.x == pytest.approx(0.5)
+    validate = next(event[2]['path_validator'] for event in executive.events if event[0] == 'plan')
+    executive.now += 10.0  # The accepted nearer plane survives image ageing during this leg.
+    crossing = Path(poses=[PoseStamped(pose=Pose(position=Point(x=0.6, z=20.0)))])
+    assert not validate(crossing)

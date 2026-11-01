@@ -459,7 +459,7 @@ def test_exploration_endpoint_is_outside_partial_reported_region(planner_factory
 
 
 @lru_cache(maxsize=4)
-def _inspection_scene(wall=True):
+def _inspection_scene(wall=True, rotate=False):
     """Encode observed 0.25 m voxels, a floor, and an optional thin wall."""
     root = {}
     for x in range(-8, 24):
@@ -467,7 +467,8 @@ def _inspection_scene(wall=True):
             for z in range(-1, 32):
                 if wall == 'unknown_wall' and x == 12:
                     continue
-                keys = (x + 32768, y + 32768, z + 32768)
+                keys = ((y + 32768, x + 32768, z + 32768) if rotate
+                        else (x + 32768, y + 32768, z + 32768))
                 node = root
                 for bit in range(15, -1, -1):
                     child = sum(((key >> bit) & 1) << axis
@@ -523,7 +524,7 @@ def _inspection_request():
     return request
 
 
-def _publish_inspection_map(planner, *, wall=True, age=0.0):
+def _publish_inspection_map(planner, *, wall=True, age=0.0, rotate=False):
     message = Octomap()
     message.header.frame_id = 'planner_test_map'
     message.header.stamp = planner.node.get_clock().now().to_msg()
@@ -531,7 +532,7 @@ def _publish_inspection_map(planner, *, wall=True, age=0.0):
     message.binary = True
     message.id = 'OcTree'
     message.resolution = 0.25
-    message.data = _inspection_scene(wall)
+    message.data = _inspection_scene(wall, rotate)
     planner.map_publisher.publish(message)
     if age == 0.0:
         planner.wait_for(
@@ -1636,7 +1637,8 @@ def test_terrain_actual_clearance_proof_survives_rejection_of_a_later_segment(pl
 
 
 @pytest.mark.parametrize('latest_wall', [True, False])
-def test_center_fire_wall_aperture_uses_flicker_history_even_on_free_frame(planner_factory, latest_wall):
+def test_center_fire_wall_aperture_uses_flicker_history_even_on_free_frame(
+        planner_factory, latest_wall):
     planner = planner_factory()
     _publish_inspection_map(planner, wall=False)
     _publish_inspection_map(planner, wall=True)
@@ -1654,7 +1656,8 @@ def test_center_fire_wall_aperture_uses_flicker_history_even_on_free_frame(plann
 
 
 @pytest.mark.parametrize('wall', [True, False, 'unknown_wall'])
-def test_center_fire_wall_aperture_does_not_label_static_or_unknown_as_smoke(planner_factory, wall):
+def test_center_fire_wall_aperture_does_not_label_static_or_unknown_as_smoke(
+        planner_factory, wall):
     planner = planner_factory()
     _publish_inspection_map(planner, wall=wall)
     request = _inspection_request()
@@ -1686,3 +1689,23 @@ def test_wall_aperture_does_not_treat_unknown_to_occupied_as_flicker(planner_fac
     request.smoke_wall_width = 3.0
     response = planner.query_geometry(request)
     assert response.success and not response.smoke_wall_valid
+
+
+def test_wall_aperture_remains_transverse_for_navigation_along_map_y(planner_factory):
+    planner = planner_factory()
+    _publish_inspection_map(planner, wall=False, rotate=True)
+    _publish_inspection_map(planner, wall=True, rotate=True)
+    request = _inspection_request()
+    request.direction.vector.x = 0.0
+    request.direction.vector.y = 1.0
+    request.smoke_wall_width = 3.0
+
+    response = planner.query_geometry(request)
+
+    assert response.success, response.message
+    assert response.smoke_wall_valid and response.smoke_wall_samples == 25
+    assert response.smoke_wall_range == pytest.approx(3.0, abs=0.25)
+    # A wrongly map-Y-aligned 'lateral' axis changes ray start depths instead
+    # of sampling across the wall, creating an artificial spread in range.
+    assert response.smoke_wall_nearest_range == pytest.approx(response.smoke_wall_range)
+    assert 0.0 < response.smoke_wall_uncertainty < 0.3
