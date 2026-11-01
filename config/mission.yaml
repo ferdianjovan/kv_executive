@@ -94,9 +94,10 @@ mission_executive:
     verify_vertical_hysteresis: 0.03490658503988659  # Start outside 7 degrees.
     verify_vertical_edge_threshold: 0.2617993877991494  # 15 degrees: correct height first.
     verify_vertical_max_corrections: 3  # Best-effort vertical attempts at the standoff.
-    # One remembered edge correction, within one 3 m leg / 15 degrees of yaw.
-    # Also limited by verify_reacquire_observation_timeout in source-image time.
-    verify_vertical_memory_timeout: 15.0  # Wall seconds since guidance was received.
+    # One remembered correction outside the normal 7-degree activation threshold,
+    # within the same short movement / 15 degrees of yaw. Slow simulation is allowed.
+    verify_vertical_memory_timeout: 15.0  # Source/ROS seconds since the confirmed image.
+    verify_vertical_clock_timeout: 5.0  # Wall seconds without simulated-clock progress.
     verify_wall_probe_timeout: 0.5  # One opportunistic query; missing range allows approach.
     verify_minimum_altitude: 2.0  # Local z floor; planner home limits also apply.
     # Legacy coverage-to-step parameters remain accepted for compatibility.

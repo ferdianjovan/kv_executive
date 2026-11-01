@@ -41,6 +41,7 @@ VERIFY_DEFAULTS = {
     'verify_vertical_edge_threshold': math.radians(15.0),
     'verify_vertical_max_corrections': 3,
     'verify_vertical_memory_timeout': 15.0,
+    'verify_vertical_clock_timeout': 5.0,
     'verify_wall_probe_timeout': 0.5,
     'verify_minimum_altitude': 2.0,
     'verify_step_min': 5.0,
@@ -128,6 +129,9 @@ class VerifyController:
 
     def reset(self):
         """Discard observations at the beginning of a new action goal."""
+        self._height_clock_ns = self._now_ns()
+        self._height_clock_progress_at = time.monotonic()
+        self._height_clock_epoch = 0
         with self._lock:
             self._epoch_ns = self._now_ns()
             self._observations = {'smoke': None, 'fire': None}
@@ -141,6 +145,8 @@ class VerifyController:
             self._observation_info = {
                 source: {'received': 0, 'accepted': 0, 'received_at': None,
                          'stamp_ns': 0, 'status': None, 'detected': None,
+                         'detector_frames': 0, 'detector_persistence': 0.0,
+                         'detector_track': 0,
                          'reason': 'no messages received'}
                 for source in ('smoke', 'fire')
             }
@@ -253,6 +259,9 @@ class VerifyController:
                 received=info['received'] + 1, received_at=time.monotonic(),
                 stamp_ns=self._stamp_ns(message), status=message.status,
                 detected=bool(message.detected),
+                detector_frames=getattr(message, 'confirmation_frames', 0),
+                detector_persistence=getattr(message, 'persistence_sec', 0.0),
+                detector_track=getattr(message, 'track_id', 0),
             )
             source_ns = self._valid_stamp(message)
             if source_ns is None:
@@ -340,8 +349,9 @@ class VerifyController:
                     f'consumer_persistence={span:.2f}/'
                     f'{self.config["verify_fire_persistence"]:.2f}s, '
                     f'ready={ready}, detector_ready={producer_ready}, '
-                    f'detector_frames={getattr(message, "confirmation_frames", 0)}, '
-                    f'detector_persistence={getattr(message, "persistence_sec", 0.0):.2f}s, '
+                    f'detector_frames={info["detector_frames"]}, '
+                    f'detector_persistence={info["detector_persistence"]:.2f}s, '
+                    f'detector_track={info["detector_track"]}, '
                     f'reset={self._fire_reset_reason}')
         if info['received_at'] is None:
             return f'{source}: no messages received'
@@ -419,6 +429,7 @@ class VerifyController:
 
     def _check(self):
         self.executive._check_running()
+        self._height_clock_progress()
 
     def _pause(self):
         self._check()
@@ -608,8 +619,42 @@ class VerifyController:
                 return
             fire = event[0]
         hint = _bb_get(blackboard, 'verify_height_hint', None)
-        if hint is None or self._stamp_ns(fire) > self._stamp_ns(hint[0]):
-            blackboard['verify_height_hint'] = (fire, self._pose(), time.monotonic())
+        stamp = self._stamp_ns(fire)
+        if stamp <= _bb_get(blackboard, 'verify_height_hint_consumed', 0):
+            return
+        if hint is None or stamp > self._stamp_ns(hint[0]):
+            with self._lock:
+                observation = self._observations['fire']
+                event = self._fire_confirmation
+                received = (observation[2] if observation is not None and observation[1] == stamp
+                            else event[2] if event is not None and event[1] == stamp
+                            else time.monotonic())
+            blackboard['verify_height_hint'] = (fire, self._pose(), received)
+            blackboard['verify_height_hint_epoch'] = self._height_clock_epoch
+
+    def _height_clock_progress(self):
+        """Track source-clock progress independently of simulation's wall-time speed."""
+        now_ns = self._now_ns()
+        if now_ns != self._height_clock_ns:
+            if now_ns < self._height_clock_ns:
+                self._height_clock_epoch += 1
+            self._height_clock_ns = now_ns
+            self._height_clock_progress_at = time.monotonic()
+        silence = time.monotonic() - self._height_clock_progress_at
+        simulated = bool(getattr(self.executive.get_clock(), 'ros_time_is_active', False))
+        return (now_ns > 0 and (not simulated or silence <= self.config[
+            'verify_vertical_clock_timeout'])), silence
+
+    def _begin_forward_leg(self, blackboard):
+        """Discard unused arrival guidance before selecting another forward leg."""
+        hint = _bb_get(blackboard, 'verify_height_hint', None)
+        if hint is not None:
+            stamp = self._stamp_ns(hint[0])
+            blackboard['verify_height_hint_consumed'] = max(
+                stamp, _bb_get(blackboard, 'verify_height_hint_consumed', 0))
+            blackboard['verify_height_hint'] = None
+            self.executive._report(
+                'Verify: discarding unused fire-height hint before selecting another forward leg')
 
     def _movement_guard(self, blackboard):
         self._check_inspection_deadline(blackboard)
@@ -624,7 +669,8 @@ class VerifyController:
                 'holding for operator') from error
 
     def _recover_fire_height(self, blackboard):
-        """Use a lost edge observation once for bounded vertical reacquisition."""
+        """Use confirmed height direction once at the end of its short movement."""
+        clock_running, clock_silence = self._height_clock_progress()
         self._capture_height_hint(blackboard)
         if self.stable_fire() is not None:
             return False
@@ -633,28 +679,43 @@ class VerifyController:
             return False
         fire, pose, received = hint
         stamp = self._stamp_ns(fire)
-        if stamp <= max(_bb_get(blackboard, 'verify_height_hint_consumed', 0),
-                        _bb_get(blackboard, 'verify_vertical_stamp', 0)):
+        if stamp <= _bb_get(blackboard, 'verify_height_hint_consumed', 0):
             return False
-        blackboard['verify_height_hint_consumed'] = stamp
         current = self._pose()
         distance = math.dist(tuple(getattr(current.position, a) for a in 'xyz'),
                              tuple(getattr(pose.position, a) for a in 'xyz'))
         turn = yaw_from_quaternion(current.orientation) - yaw_from_quaternion(pose.orientation)
         age = (self._now_ns() - stamp) / 1e9
         live = self.fresh_fire()
-        valid = (
-            0.0 <= time.monotonic() - received <= self.config['verify_vertical_memory_timeout']
-            and 0.0 <= age <= self.config['verify_reacquire_observation_timeout']
-            and distance <= self.config['verify_navigation_step']
-            + self.config.get('position_tolerance', 0.3)
-            and abs(math.atan2(math.sin(turn), math.cos(turn))) <= math.radians(15.0)
-            and abs(fire.vertical_correction_rad) >= self.config['verify_vertical_edge_threshold']
-            and (live is None or self._same_fire(live, fire)))
-        if not valid:
+        turn = abs(math.atan2(math.sin(turn), math.cos(turn)))
+        reasons = []
+        if not clock_running:
+            reasons.append('source clock unavailable or frozen')
+        if _bb_get(blackboard, 'verify_height_hint_epoch', self._height_clock_epoch) != (
+                self._height_clock_epoch):
+            reasons.append('source clock rewound')
+        if not 0.0 <= age <= self.config['verify_vertical_memory_timeout']:
+            reasons.append('image age exceeds source-time limit')
+        if distance > self.config['verify_navigation_step'] + self.config.get(
+                'position_tolerance', 0.3):
+            reasons.append('movement exceeds one short leg')
+        if turn > math.radians(15.0):
+            reasons.append('yaw change exceeds 15 degrees')
+        threshold = self.config['verify_vertical_tolerance'] + self.config[
+            'verify_vertical_hysteresis']
+        if abs(fire.vertical_correction_rad) <= threshold:
+            reasons.append('height error inside activation threshold')
+        if live is not None and not self._same_fire(live, fire):
+            reasons.append('fire track or camera changed')
+        if reasons:
             self.executive._report(
-                'Verify: remembered fire-height guidance expired, changed, or was not at an edge')
+                'Verify: fire-height hint rejected: ' + '; '.join(reasons) + '; '
+                f'angle={math.degrees(fire.vertical_correction_rad):+.1f} deg, '
+                f'image_age={age:.2f} source s, wall_age={time.monotonic() - received:.2f} s, '
+                f'travel={distance:.2f} m, yaw_change={math.degrees(turn):.1f} deg, '
+                f'clock_silence={clock_silence:.2f} s, track={getattr(fire, "track_id", 0)}')
             return False
+        blackboard['verify_height_hint_consumed'] = stamp
         self._inspection_begin(blackboard)
         blackboard['verify_fire_observed'] = True
         vertical = math.copysign(self.config['verify_vertical_step'], fire.vertical_correction_rad)
@@ -666,9 +727,16 @@ class VerifyController:
         moved = self.executive._verify_recovery_plan_to(
             target, geometry=self._wall_geometry(blackboard),
             guard=lambda: self._movement_guard(blackboard), preserve_requested_altitude=True)
-        if moved is False:
+        actual_change = self._pose().position.z - current.position.z
+        if moved is False or actual_change * math.copysign(1.0, vertical) <= 0.01:
+            reason = ('terrain or planning validation rejected it' if moved is False
+                      else 'no useful movement in the requested height direction')
             raise self.error_type(
-                'Verify: fire-height reacquisition blocked; holding for operator')
+                'Verify: selected fire-height reacquisition was not executed: '
+                + reason + f'; actual height change={actual_change:+.2f} m; holding for operator')
+        self.executive._report(
+            f'Verify: fire-height reacquisition completed; '
+            f'actual height change={actual_change:+.2f} m')
         blackboard['verify_inspection_after_ns'] = self._now_ns()
         self._inspection_wait_fire(blackboard)
         return True
@@ -724,6 +792,7 @@ class VerifyController:
             # Finish the selected leg through fire detections and smoke coverage
             # changes. Live heading follows fire when available; the planner and
             # corridor validators still enforce obstacle and terrain clearance.
+            self._begin_forward_leg(blackboard)
             moved = self.executive._verify_navigation_viewpoint(
                 bearing, geometry=geometry, guard=lambda: self._movement_guard(blackboard),
                 forward_only=True)
@@ -1179,6 +1248,8 @@ class VerifyController:
                 self.executive._report(
                     f'Verify/CENTER_FIRE: vertical fire correction {vertical:+.2f} m '
                     'before further forward motion')
+                blackboard['verify_height_hint_consumed'] = _bb_get(
+                    blackboard, 'verify_vertical_stamp', 0)
                 moved = self.executive._verify_recovery_plan_to(
                     target, geometry=geometry, guard=lambda: self._movement_guard(blackboard),
                     preserve_requested_altitude=True)
@@ -1188,10 +1259,17 @@ class VerifyController:
                 target.position.x -= retreat * math.cos(bearing)
                 target.position.y -= retreat * math.sin(bearing)
                 target.position.z += vertical
+                if vertical:
+                    blackboard['verify_height_hint_consumed'] = _bb_get(
+                        blackboard, 'verify_vertical_stamp', 0)
                 moved = self.executive._verify_recovery_plan_to(
                     target, geometry=geometry, guard=lambda: self._movement_guard(blackboard),
                     preserve_requested_altitude=vertical != 0.0)
             else:
+                if vertical:
+                    blackboard['verify_height_hint_consumed'] = _bb_get(
+                        blackboard, 'verify_vertical_stamp', 0)
+                self._begin_forward_leg(blackboard)
                 moved = self.executive._verify_navigation_viewpoint(
                     bearing, geometry=geometry, guard=lambda: self._movement_guard(blackboard),
                     index=step,
@@ -1250,6 +1328,8 @@ class VerifyController:
         self.executive._report(
             f'Verify/CENTER_FIRE: vertical fire correction {vertical:+.2f} m '
             'before wall ranging or further forward motion')
+        blackboard['verify_height_hint_consumed'] = _bb_get(
+            blackboard, 'verify_vertical_stamp', 0)
         if self.executive._verify_recovery_plan_to(
                 target, geometry=self._wall_geometry(blackboard),
                 guard=lambda: self._movement_guard(blackboard),
@@ -1507,7 +1587,7 @@ class VerifyController:
         blackboard['verify_search_active'] = True
 
         def guard():
-            self._capture_height_hint(blackboard)
+            self._movement_guard(blackboard)
             self._inspection_guard(blackboard, interrupt_fire=True)
 
         try:
@@ -1551,6 +1631,7 @@ class VerifyController:
             if self._at_known_wall(blackboard):
                 return 'inspect'
             geometry = self._wall_geometry(blackboard, geometry)
+            self._begin_forward_leg(blackboard)
             moved = self.executive._verify_navigation_viewpoint(
                 bearing, geometry=geometry, guard=guard,
                 index=_bb_get(blackboard, 'verify_navigation_legs', 0), forward_only=True)

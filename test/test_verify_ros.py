@@ -984,6 +984,94 @@ def test_fire_lost_at_smoke_arrival_gets_one_vertical_reacquisition_before_advan
     _assert_airborne_safety(mission)
 
 
+@pytest.mark.parametrize('mission', [{'clock_rate': 0.2}], indirect=True, ids=['slow_clock'])
+@pytest.mark.parametrize('vertical_direction', [-1.0, 1.0])
+def test_slow_smoke_leg_retains_nonedge_fire_height_until_checked_recovery(
+    mission, monitoring_sensors, vertical_direction,
+):
+    """Real slow /clock preserves one height search after a long committed leg."""
+    sensors, fcu = monitoring_sensors, mission.fcu
+    executive = mission.executive
+    for config in (executive.config, executive._verify.config):
+        config.update(verify_motion_speed=1.0, mode_timeout=8.0, waypoint_timeout=8.0,
+                      verify_navigation_step=3.0, verify_reacquire_observation_timeout=5.0)
+    with fcu.lock:
+        fcu.inspection_terrain_z = fcu.pose.position.z - 7.0
+    started, release = threading.Event(), threading.Event()
+    planned = []
+    original_plan, original_mode = fcu.plan_to_pose, fcu.set_mode
+
+    def selected_leg(request, response):
+        response = original_plan(request, response)
+        if not planned:
+            planned.append((time.monotonic(), deepcopy(response.path.poses[0].pose),
+                            deepcopy(request.target.pose)))
+            started.set()
+            assert release.wait(5.0)
+        return response
+
+    def speed_up_after_arrival(request, response):
+        response = original_mode(request, response)
+        with fcu.lock:
+            moved = bool(fcu.target_requests)
+        if request.custom_mode == 'AUTO.LOITER' and moved:
+            for config in (executive.config, executive._verify.config):
+                config['verify_motion_speed'] = 3.0
+        return response
+
+    fcu.fake_services[-1].callback = selected_leg
+    fcu.fake_services[0].callback = speed_up_after_arrival
+    goal = _start_airborne_exploration(mission)
+    with sensors.lock:
+        sensors.source = 'smoke'
+    try:
+        wait_for(started.is_set, 20.0, 'first slow-clock smoke leg selected')
+        selected_at, origin, target = planned[0]
+        with sensors.lock:
+            sensors.smoke_wall_range = None
+            # Eleven degrees is outside ordinary centering tolerance but below
+            # the old 15-degree edge-only memory threshold.
+            sensors.fire_guidance = lambda: (0.0, vertical_direction * 0.2)
+            sensors.source = 'smoke_fire'
+        wait_for(lambda: executive._verify.stable_fire() is not None,
+                 3.0, 'confirmed upper/lower fire before the slow translation')
+        release.set()
+        wait_for(lambda: math.dist(_position(fcu.pose), _position(origin)) > 0.15,
+                 15.0, 'slow translation before fire disappears')
+        lost_wall = time.monotonic()
+        lost_ros = executive.get_clock().now().nanoseconds
+        with sensors.lock:
+            sensors.source = 'smoke'
+        wait_for(lambda: executive._verify.stable_fire() is None,
+                 3.0, 'detector loss while the committed smoke leg continues')
+        wait_for(lambda: len(fcu.target_requests) >= 2, 65.0,
+                 'vertical recovery goal after the long completed smoke leg')
+        recovery_wall = time.monotonic()
+        recovery_ros = executive.get_clock().now().nanoseconds
+        elapsed_wall = recovery_wall - lost_wall
+        elapsed_ros = (recovery_ros - lost_ros) / 1e9
+        assert elapsed_wall > 15.0
+        assert 0.1 < elapsed_ros / elapsed_wall < 0.3
+        assert 0.0 < elapsed_ros < executive._verify.config['verify_vertical_memory_timeout']
+        with fcu.lock:
+            correction = deepcopy(fcu.target_requests[1].pose)
+        _assert_arrival_before_reacquire(mission, target, after=selected_at)
+        assert correction.position.z == pytest.approx(
+            target.position.z + vertical_direction * 0.5, abs=0.03)
+        assert math.hypot(correction.position.x - target.position.x,
+                          correction.position.y - target.position.y) < 0.03
+        wait_for(lambda: abs(fcu.pose.position.z - correction.position.z) < 0.03
+                 and received_state(mission, mode='AUTO.LOITER'),
+                 18.0, 'checked height correction to execute and finish in LOITER')
+        assert not sensors.inspection_snapshot()
+        assert executive._verify.had_fire_confirmation()
+        _assert_terrain_planning(mission)
+    finally:
+        release.set()
+        cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
 @pytest.mark.parametrize('detection_during', ['planning', 'flight'])
 def test_smoke_leg_finishes_with_fire_heading_and_broad_smoke_before_reacquiring(
     mission, monitoring_sensors, detection_during,

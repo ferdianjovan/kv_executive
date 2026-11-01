@@ -422,7 +422,11 @@ def mission(monkeypatch, tmp_path, request):
     monkeypatch.setenv('ROS_LOG_DIR', os.environ.get(
         'ROS_LOG_DIR', str(tmp_path / 'ros_logs'),
     ))
-    use_sim_time = getattr(request, 'param', False)
+    clock_options = getattr(request, 'param', False)
+    use_sim_time = bool(clock_options)
+    clock_rate = float(clock_options.get('clock_rate', 1.0)) if isinstance(
+        clock_options, dict) else 1.0
+    assert clock_rate > 0.0
     parameters = {
         'use_sim_time': use_sim_time,
         'setpoint_rate': 30.0,
@@ -475,7 +479,8 @@ def mission(monkeypatch, tmp_path, request):
                 # ROS timers need clock messages before they can drive telemetry.
                 # A wall-clock thread also keeps publishing while callbacks wait.
                 while not stop_clock.is_set():
-                    nanoseconds = int((10.0 + time.monotonic() - clock_started) * 1e9)
+                    nanoseconds = int(
+                        (10.0 + (time.monotonic() - clock_started) * clock_rate) * 1e9)
                     message = Clock()
                     message.clock.sec, message.clock.nanosec = divmod(nanoseconds, 10**9)
                     clock_publisher.publish(message)

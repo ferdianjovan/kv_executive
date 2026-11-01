@@ -319,6 +319,55 @@ def test_negative_smoke_frame_immediately_clears_guidance_and_explains_its_statu
     assert 'detected=False' in details
 
 
+def test_unconfirmed_fire_diagnostics_retain_raw_detector_progress_without_guidance(system):
+    executive, controller = system
+    fire(executive, controller, detected=False, status=1,
+         confirmation_frames=4, persistence_sec=1.2, track_id=0)
+
+    details = controller.observation_diagnostics('fire')
+
+    assert 'status=1, detected=False' in details
+    assert 'accepted=0' in details
+    assert 'detector_frames=4' in details
+    assert 'detector_persistence=1.20s' in details
+    assert 'detector_track=0' in details
+    assert 'ready=False, detector_ready=False' in details
+    assert controller.fresh_fire() is None and controller.stable_fire() is None
+
+
+def test_fire_diagnostics_replace_old_confirmation_progress_after_a_candidate_reset(system):
+    executive, controller = system
+    _qualified_fire(executive, controller, confirmation_frames=8, persistence_sec=2.0)
+    assert controller.stable_fire() is not None
+    fire(executive, controller, detected=False, status=1,
+         confirmation_frames=2, persistence_sec=0.4, track_id=0)
+
+    details = controller.observation_diagnostics('fire')
+
+    assert 'accepted=1' in details
+    assert 'detector_frames=2' in details
+    assert 'detector_persistence=0.40s' in details
+    assert 'ready=False, detector_ready=False' in details
+    assert controller.stable_fire() is None
+
+
+def test_stale_fire_diagnostics_show_raw_progress_without_accepting_the_image(system):
+    executive, controller = system
+    executive.now += 4.0
+    fire(executive, controller, header=header(executive.now - 3.0, 'thermal'),
+         confirmation_frames=7, persistence_sec=2.1, track_id=9)
+
+    details = controller.observation_diagnostics('fire')
+
+    assert 'source image is too old' in details
+    assert 'accepted=0' in details
+    assert 'detector_frames=7' in details
+    assert 'detector_persistence=2.10s' in details
+    assert 'detector_track=9' in details
+    assert 'ready=False, detector_ready=False' in details
+    assert controller.stable_fire() is None
+
+
 def test_fire_needs_distinct_source_images_and_elapsed_persistence(system):
     executive, controller = system
     message = fire(executive, controller)
@@ -1568,18 +1617,22 @@ def test_fire_seen_during_leg_recovers_height_once_in_either_direction(system, a
     assert not any(event[0] == 'inspection_report' for event in executive.events)
 
 
-@pytest.mark.parametrize('invalid', ['wall_age', 'image_age', 'distance', 'yaw', 'track'])
-def test_expired_or_displaced_fire_hint_never_commands_height(system, invalid):
+@pytest.mark.parametrize('invalid', ['clock_frozen', 'image_age', 'distance', 'yaw', 'track'])
+def test_expired_or_displaced_fire_hint_never_commands_height(system, invalid, monkeypatch):
     executive, controller = system
     board = Blackboard()
     _qualified_fire(executive, controller, vertical_correction_rad=-0.4)
     controller._capture_height_hint(board)
     fire(executive, controller, detected=False)
-    if invalid == 'wall_age':
-        image, pose, received = board['verify_height_hint']
-        board['verify_height_hint'] = (image, pose, received - 16.0)
+    if invalid == 'clock_frozen':
+        executive.get_clock = lambda: SimpleNamespace(
+            now=lambda: SimpleNamespace(nanoseconds=int(executive.now * 1e9)),
+            ros_time_is_active=True)
+        controller._height_clock_progress()
+        original_now = executive.now
+        monkeypatch.setattr(verification.time, 'monotonic', lambda: original_now + 16.0)
     elif invalid == 'image_age':
-        executive.now += 6.0
+        executive.now += 16.0
     elif invalid == 'distance':
         executive.odometry.pose.pose.position.x = 4.0
     elif invalid == 'yaw':
@@ -1670,9 +1723,10 @@ def test_height_image_already_used_for_visible_correction_is_not_reused_as_memor
     image = _qualified_fire(executive, controller, vertical_correction_rad=0.4)
     controller._capture_height_hint(board)
     assert controller._fire_vertical_preference(board, image) == 0.5
+    controller._move_visible_fire_height(board, 0.5)
     fire(executive, controller, detected=False)
     assert not controller._recover_fire_height(board)
-    assert not any(event[0] == 'recovery_plan' for event in executive.events)
+    assert len([event for event in executive.events if event[0] == 'recovery_plan']) == 1
 
 
 def test_arrival_at_smoke_leg_limit_still_enters_inspection(system):
@@ -1711,3 +1765,115 @@ def test_vertical_leg_finishes_through_fire_loss_but_obeys_vehicle_interrupts(sy
             controller.center_fire(Blackboard())
         assert executive.odometry.pose.pose.position == Point(z=6.0)
     assert not any(e[0] == 'inspection_report' for e in executive.events)
+
+
+def _slow_height_hint(system, monkeypatch, wall_seconds, angle=-0.2):
+    """Finish one 3 m leg in six source seconds with an independently slow clock."""
+    executive, controller = system
+    wall = [executive.now]
+    monkeypatch.setattr(verification.time, 'monotonic', lambda: wall[0])
+    executive.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=int(executive.now * 1e9)),
+        ros_time_is_active=True)
+    board = Blackboard()
+    _qualified_fire(executive, controller, vertical_correction_rad=angle)
+    controller._movement_guard(board)
+    fire(executive, controller, detected=False)
+    source_start, wall_start = executive.now, wall[0]
+    for second in range(1, wall_seconds + 1):
+        wall[0] = wall_start + second
+        executive.now = source_start + 6.0 * second / wall_seconds
+        executive.odometry.pose.pose.position.x = 3.0 * second / wall_seconds
+        controller._movement_guard(board)
+    monkeypatch.setattr(controller, '_inspection_wait_fire', lambda _: None)
+    return executive, controller, board, wall
+
+
+@pytest.mark.parametrize('wall_seconds', [30, 60, 150])
+@pytest.mark.parametrize('angle', [-0.2, 0.2])
+@pytest.mark.parametrize('operation', ['approach_smoke', 'reacquire', 'search_fire'])
+def test_slow_leg_preserves_moderate_height_guidance_until_arrival(
+        system, monkeypatch, wall_seconds, angle, operation):
+    executive, controller, board, _ = _slow_height_hint(
+        system, monkeypatch, wall_seconds, angle)
+    assert controller.stable_fire() is None
+    assert getattr(controller, operation)(board) == 'reacquire'
+    assert executive.odometry.pose.pose.position == Point(
+        x=3.0, z=6.0 + math.copysign(0.5, angle))
+    assert not controller._recover_fire_height(board)
+    assert len([event for event in executive.events if event[0] == 'recovery_plan']) == 1
+    assert not any(event[0] in {'navigation', 'inspection_report'} for event in executive.events)
+
+
+@pytest.mark.parametrize('planner_result', [False, True])
+def test_slow_descent_rejection_or_no_movement_cannot_become_forward_flight(
+        system, monkeypatch, planner_result):
+    executive, controller, board, _ = _slow_height_hint(system, monkeypatch, 150)
+    executive._verify_recovery_plan_to = lambda *args, **kwargs: planner_result
+    with pytest.raises(RuntimeError, match='selected fire-height reacquisition was not executed'):
+        controller.reacquire(board)
+    assert executive.odometry.pose.pose.position == Point(x=3.0, z=6.0)
+    assert not controller._recover_fire_height(board)
+    assert not any(event[0] in {'navigation', 'inspection_report'} for event in executive.events)
+
+
+def test_slow_leg_does_not_preserve_height_guidance_through_a_frozen_clock(system, monkeypatch):
+    executive, controller, board, wall = _slow_height_hint(system, monkeypatch, 60)
+    wall[0] += 6.0
+    assert not controller._recover_fire_height(board)
+    assert not any(event[0] == 'recovery_plan' for event in executive.events)
+    assert any('source clock unavailable or frozen' in event[1]
+               for event in executive.events if event[0] == 'status')
+
+
+def test_slow_height_hint_is_rejected_after_source_clock_rewind(system, monkeypatch):
+    executive, controller, board, wall = _slow_height_hint(system, monkeypatch, 60)
+    executive.now -= 1.0
+    wall[0] += 1.0
+    assert not controller._recover_fire_height(board)
+    assert any('source clock rewound' in event[1]
+               for event in executive.events if event[0] == 'status')
+
+
+def test_temporary_yaw_rejection_does_not_consume_pending_height_hint(system, monkeypatch):
+    executive, controller, board, _ = _slow_height_hint(system, monkeypatch, 30)
+    executive.odometry.pose.pose.orientation = quaternion_from_yaw(math.radians(20.0))
+    assert not controller._recover_fire_height(board)
+    assert verification._bb_get(board, 'verify_height_hint_consumed', 0) == 0
+    executive.odometry.pose.pose.orientation = quaternion_from_yaw(0.0)
+    assert controller._recover_fire_height(board)
+    assert executive.odometry.pose.pose.position == Point(x=3.0, z=5.5)
+
+
+def test_unused_height_hint_cannot_cross_a_second_forward_leg(system, monkeypatch):
+    executive, controller, board, _ = _slow_height_hint(system, monkeypatch, 30)
+    executive.odometry.pose.pose.orientation = quaternion_from_yaw(math.radians(20.0))
+    assert not controller._recover_fire_height(board)
+    controller._begin_forward_leg(board)
+    executive.odometry.pose.pose.orientation = quaternion_from_yaw(0.0)
+    assert not controller._recover_fire_height(board)
+    assert not any(event[0] == 'recovery_plan' for event in executive.events)
+
+
+def test_height_preference_does_not_consume_an_unselected_recovery(system, monkeypatch):
+    executive, controller, board, _ = _slow_height_hint(system, monkeypatch, 30)
+    fire_image = board['verify_height_hint'][0]
+    # Simulate an earlier decision that computed height preference but never
+    # selected a path. Only an actual selected correction consumes the image.
+    board['verify_vertical_stamp'] = controller._stamp_ns(fire_image)
+    assert controller._recover_fire_height(board)
+    assert executive.odometry.pose.pose.position == Point(x=3.0, z=5.5)
+
+
+def test_center_fire_discards_unused_hint_before_selecting_another_forward_leg(system):
+    executive, controller = system
+    board = Blackboard()
+    executive.wall_x = 13.5
+    controller.config['verify_fire_approach_max_steps'] = 3
+    _qualified_fire(executive, controller)
+    controller._capture_height_hint(board)
+    executive.on_motion = lambda: fire(executive, controller, detected=False)
+    assert controller.center_fire(board) == 'reacquire'
+    assert board['verify_height_hint'] is None
+    assert not controller._recover_fire_height(board)
+    assert any(event[0] == 'navigation' for event in executive.events)

@@ -388,14 +388,33 @@ vertical correction cannot authorize closer forward travel toward an edge-of-vie
 fire. Each completed correction requires another post-stop observation before
 another correction; completed reporting additionally requires fresh wall evidence.
 
-A confirmed fire seen during motion can supply one remembered edge-recovery
-correction after arrival if it disappears through either the top or bottom of the
-image. `verify_vertical_memory_timeout` defaults to 15 wall seconds; the image
-must also be no older than `verify_reacquire_observation_timeout` (5 ROS seconds),
-movement since capture must be at most one smoke step plus position tolerance
-(3.3 m by default), and yaw change must be at most 15 degrees. Track changes or
-an expired hint reject the correction. The hint is consumed once, followed by
-a wait for new confirmation; it is never treated as fresh fire for reporting.
+A confirmed fire seen during motion can supply one remembered height-recovery
+correction after arrival if it disappears above or below the image centre.
+The normal 7-degree activation threshold applies; the image need not already
+show the fire beyond the 15-degree edge-priority threshold.
+`verify_vertical_memory_timeout` defaults to 15 source/ROS seconds. A short leg
+lasting 30–150 wall seconds in slow simulation can therefore retain usable
+direction. This timeout is independent of the post-arrival detector wait.
+`verify_vertical_clock_timeout` separately rejects a simulated clock that stops
+advancing for more than 5 wall seconds. Clock rewind also invalidates old hints.
+Movement since capture must remain within one smoke step plus position tolerance
+(3.3 m by default), yaw change must remain within 15 degrees, and target identity
+must remain consistent. An unused hint is discarded before another forward leg.
+
+Eligibility is evaluated before arrival scanning or further advance. A rejected
+hint logs its exact reason, source/wall ages, angle, travel, rotation and clock
+silence. Temporary ineligibility does not consume the hint. Selecting the single
+checked correction consumes it, even if terrain or planning blocks execution;
+the result distinguishes selection, rejection, and actual height movement.
+Another correction needs new confirmation. Remembered direction never qualifies
+as fresh fire for reporting. Detector diagnostics separately retain raw producer
+confirmation progress, including `CONFIRMING` messages that cannot steer.
+
+Slow-clock regressions use a real 0.2× ROS clock and verify actual 0.5 m descent
+and climb after fire disappears during a roughly 40-wall-second approach leg.
+Deterministic cases additionally cover 30-, 60-, and 150-wall-second legs,
+frozen/rewound clocks, discarded hints, and blocked/no-op descent attempts.
+The executive checkpoint immediately before this timing fix is `b2e8d58`.
 
 A short fire-approach maneuver retains its selected heading
 through detector gaps or tracking-ID changes. Each actual planned route is limited
