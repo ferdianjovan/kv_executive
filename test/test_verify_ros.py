@@ -1083,6 +1083,133 @@ def test_slow_smoke_leg_retains_nonedge_fire_height_until_checked_recovery(
     _assert_airborne_safety(mission)
 
 
+@pytest.mark.parametrize('mission', [{'clock_rate': 0.2}], indirect=True)
+def test_slow_floor_blocked_height_recovery_advances_then_descends_after_cliff(
+    mission, monitoring_sensors,
+):
+    """A blocked remembered descent defers one leg, then fresh fire can lower it."""
+    sensors, fcu, executive = monitoring_sensors, mission.fcu, mission.executive
+    for config in (executive.config, executive._verify.config):
+        config.update(verify_motion_speed=0.6, mode_timeout=20.0, waypoint_timeout=12.0,
+                      verify_navigation_step=3.0, verify_fire_approach_max_steps=3,
+                      verify_reacquire_observation_timeout=5.0)
+    with fcu.lock:
+        ground_z = fcu.pose.position.z - 5.03
+    cliff = {}
+
+    def ground_height(x, y):
+        if cliff:
+            anchor, direction = cliff['anchor'], cliff['direction']
+            forward = (x - anchor.x) * direction[0] + (y - anchor.y) * direction[1]
+            if forward > 2.5:
+                return ground_z - 1.0
+        return ground_z
+
+    with fcu.lock:
+        fcu.inspection_terrain_height = ground_height
+    started, release = threading.Event(), threading.Event()
+    selected = []
+    original_plan, original_mode = fcu.plan_to_pose, fcu.set_mode
+
+    def selected_leg(request, response):
+        response = original_plan(request, response)
+        start, target = response.path.poses[0].pose, request.target.pose
+        selected.append((time.monotonic(), deepcopy(start), deepcopy(target)))
+        if len(selected) == 1:
+            distance = math.hypot(target.position.x - start.position.x,
+                                  target.position.y - start.position.y)
+            cliff.update(anchor=deepcopy(target.position), direction=(
+                (target.position.x - start.position.x) / distance,
+                (target.position.y - start.position.y) / distance))
+            started.set()
+            assert release.wait(5.0)
+        elif len(selected) in {2, 3}:
+            # Complete the already checked leg through detector loss. The next
+            # movement must wait for explicitly supplied post-arrival guidance.
+            with sensors.lock:
+                sensors.source = None
+        return response
+
+    def speed_up_after_arrival(request, response):
+        response = original_mode(request, response)
+        if request.custom_mode == 'AUTO.LOITER' and selected:
+            for config in (executive.config, executive._verify.config):
+                config['verify_motion_speed'] = 3.0
+        return response
+
+    fcu.fake_services[-1].callback = selected_leg
+    fcu.fake_services[0].callback = speed_up_after_arrival
+    goal = _start_airborne_exploration(mission)
+    result = goal.get_result_async()
+    with sensors.lock:
+        sensors.smoke_wall_range = None
+        sensors.source = 'smoke'
+    try:
+        wait_for(started.is_set, 20.0, 'first low-clearance slow-clock smoke leg')
+        selected_at, origin, target = selected[0]
+        with sensors.lock:
+            sensors.fire_guidance = lambda: (0.0, -0.2)
+            sensors.source = 'smoke_fire'
+        wait_for(lambda: executive._verify.stable_fire() is not None,
+                 3.0, 'confirmed lower fire before the slow smoke translation')
+        release.set()
+        wait_for(lambda: math.dist(_position(fcu.pose), _position(origin)) > 0.15,
+                 15.0, 'slow flight before confirmed fire disappears')
+        lost_wall = time.monotonic()
+        lost_ros = executive.get_clock().now().nanoseconds
+        with sensors.lock:
+            sensors.source = 'smoke'
+        wait_for(lambda: len(selected) >= 2 or result.done(), 120.0,
+                 'a checked forward fallback after the remembered descent is refused')
+        assert not result.done(), result.result().result.message if result.done() else ''
+        fallback_at, fallback_origin, fallback = selected[1]
+        assert fallback_at - lost_wall > 15.0
+        assert (executive.get_clock().now().nanoseconds - lost_ros) / 1e9 < (
+            executive._verify.config['verify_vertical_memory_timeout'])
+        _assert_arrival_before_reacquire(mission, target, after=selected_at)
+        assert math.hypot(fallback.position.x - fallback_origin.position.x,
+                          fallback.position.y - fallback_origin.position.y) > 2.9
+        assert fallback.position.z == pytest.approx(target.position.z, abs=0.03)
+        wait_for(lambda: math.dist(_position(fcu.pose), _position(fallback)) < 0.03
+                 and received_state(mission, mode='AUTO.LOITER'),
+                 35.0, 'the level fallback to arrive beyond the cliff edge')
+        desired_z = fallback.position.z - 0.5
+
+        def lower_fire():
+            return 0.0, -0.3 if fcu.pose.position.z > desired_z + 0.03 else 0.0
+
+        with sensors.lock:
+            sensors.fire_guidance = lower_fire
+            sensors.source = 'smoke_fire'
+        wait_for(lambda: len(selected) >= 3 or result.done(), 25.0,
+                 'fresh lower fire to permit descent again from the new viewpoint')
+        assert not result.done(), result.result().result.message if result.done() else ''
+        _, correction_origin, correction = selected[2]
+        assert correction.position.z == pytest.approx(desired_z, abs=0.03)
+        assert math.hypot(correction.position.x - correction_origin.position.x,
+                          correction.position.y - correction_origin.position.y) < 0.03
+        wait_for(lambda: abs(fcu.pose.position.z - desired_z) < 0.03
+                 and received_state(mission, mode='AUTO.LOITER'),
+                 25.0, 'the newly safe downward correction to finish')
+        with fcu.lock:
+            statuses = [text for _, text in fcu.statuses]
+        assert any('terrain clearance floor prevents downward image centering' in text
+                   for text in statuses)
+        assert any('deferring descent until one checked forward leg completes' in text
+                   for text in statuses)
+        assert any('descent guidance re-enabled after forward progress' in text
+                   for text in statuses)
+        assert not any('MISSION: aborted' in text for text in statuses)
+        assert not sensors.inspection_snapshot()
+        assert executive._verify.had_fire_confirmation()
+        _assert_terrain_planning(mission)
+        _assert_same_goal_phases(sensors, goal)
+    finally:
+        release.set()
+        cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
 @pytest.mark.parametrize('detection_during', ['planning', 'flight'])
 def test_smoke_leg_finishes_with_fire_heading_and_broad_smoke_before_reacquiring(
     mission, monitoring_sensors, detection_during,
@@ -1406,7 +1533,7 @@ def test_blocked_fire_approach_holds_without_reporting_success(
 
 
 @pytest.mark.parametrize('vertical_direction', [-1.0, 1.0])
-def test_visible_fire_adjusts_altitude_at_twenty_metre_standoff(
+def test_visible_fire_adjusts_altitude_at_fifteen_metre_standoff(
     mission, monitoring_sensors, vertical_direction,
 ):
     sensors, fcu = monitoring_sensors, mission.fcu
@@ -1434,7 +1561,7 @@ def test_visible_fire_adjusts_altitude_at_twenty_metre_standoff(
         sensors.source = None
     report = sensors.inspection_snapshot()[0]
     assert report.fire_found and not report.fire_location_valid
-    assert mission.executive.config['verify_smoke_standoff'] == 20.0
+    assert mission.executive.config['verify_smoke_standoff'] == 15.0
     assert report.observer_local_pose.pose.position.z == pytest.approx(desired_z, abs=0.03)
     with fcu.lock:
         requests = deepcopy(fcu.inspection_planning_requests)

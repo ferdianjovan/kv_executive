@@ -522,6 +522,9 @@ class InspectionNavigationMixin:
     ):
         """Fly a collision-checked terrain leg, retaining any localized fire standoff."""
         from kv_executive.mission_executive import MissionError
+        # Only a known terrain floor veto is an optional height preference.
+        # Other refusals and actual execution failures retain their own handling.
+        self._verify_height_rejection = ''
         if target is None:
             return False
         target = deepcopy(target)
@@ -540,6 +543,7 @@ class InspectionNavigationMixin:
         floor = self.config['verify_minimum_altitude']
         if terrain is None:
             if preserve_requested_altitude and requested_descent:
+                self._verify_height_rejection = 'terrain_unavailable'
                 self._report('Verify: ground height unavailable; downward motion withheld')
                 return False
             floor = max(floor, current.position.z)
@@ -552,6 +556,7 @@ class InspectionNavigationMixin:
         target.position.z = max(target.position.z, floor)
         if (preserve_requested_altitude and requested_descent
                 and target.position.z >= current.position.z - 0.01):
+            self._verify_height_rejection = 'terrain_floor'
             self._report('Verify: terrain clearance floor prevents downward image centering')
             return False
         if not preserve_requested_altitude:
@@ -977,12 +982,13 @@ class InspectionNavigationMixin:
         terrain_cache = {}
         attempted = set()
         missing_terrain = set()
+        floor_limited = set()
         attempts = 0
         range_status = 'image-bearing guidance; terrain clearance verified separately'
         reserved = min(5, limit // 3)
         forward_limit = limit - reserved
 
-        def candidates(offsets, clearances):
+        def candidates(offsets, clearances, vertical_bias, require_terrain=False):
             for forward, lateral in offsets:
                 if guard:
                     guard()
@@ -999,9 +1005,11 @@ class InspectionNavigationMixin:
                 terrain = terrain_cache[key]
                 if terrain is None:
                     missing_terrain.add(key)
+                    if require_terrain:
+                        continue
                 for clearance in clearances if terrain is not None else (None,):
                     requested_agl = minimum_agl if clearance is None else clearance
-                    target.position.z = max(current.position.z + vertical_offset,
+                    target.position.z = max(current.position.z + vertical_bias,
                                             self.config['verify_minimum_altitude'])
                     if terrain is not None:
                         ground_z, uncertainty = terrain
@@ -1009,10 +1017,12 @@ class InspectionNavigationMixin:
                             target.position.z, ground_z + requested_agl + uncertainty,
                             ground_z + minimum_agl + uncertainty
                             + self.config.get('position_tolerance', 0.3))
-                    if vertical_offset < 0.0 and (
+                    if vertical_bias < 0.0 and (
                             terrain is None or target.position.z >= current.position.z - 0.01):
-                        # A lower fire must not silently turn into another
-                        # forward or climbing leg when descent cannot be checked.
+                        if terrain is not None:
+                            floor_limited.add(key)
+                        # A blocked descent remains a refusal. Any forward
+                        # alternative is selected explicitly in a separate pass.
                         continue
                     displacement = math.dist(
                         tuple(getattr(current.position, axis) for axis in 'xyz'),
@@ -1044,8 +1054,11 @@ class InspectionNavigationMixin:
             batches = (
                 (forward_offsets, (preferred_agl, minimum_agl, maximum_agl), forward_limit),
                 (fallback_offsets, (minimum_agl,), limit))
-        for offsets, clearances, budget in batches:
-            for target, terrain, forward, lateral, clearance in candidates(offsets, clearances):
+
+        def try_candidates(offsets, clearances, budget, vertical_bias, require_terrain=False):
+            nonlocal attempts
+            for target, terrain, forward, lateral, clearance in candidates(
+                    offsets, clearances, vertical_bias, require_terrain):
                 if attempts >= budget:
                     break
                 self._check_running()
@@ -1065,8 +1078,24 @@ class InspectionNavigationMixin:
                     f'{terrain_status}, ' + range_status)
                 if self._verify_recovery_plan_to(
                         target, geometry, guard, terrain=terrain,
-                        preserve_requested_altitude=bool(vertical_offset)):
+                        preserve_requested_altitude=bool(vertical_bias)):
                     return True
+            return False
+
+        for offsets, clearances, budget in batches:
+            if try_candidates(offsets, clearances, budget, vertical_offset):
+                return True
+        if vertical_offset < 0.0 and attempts == 0 and floor_limited:
+            # No downward route was submitted: known terrain floors removed
+            # the height preference before planning. Select a distinct straight
+            # forward leg, with no extra survey-height preference. The same
+            # bounded budget, observed terrain, walls and corridor checks apply.
+            self._report(
+                'Verify: downward fire-height preference limited by terrain; '
+                'trying a checked forward leg at current altitude or the required terrain floor')
+            straight = [(step, 0.0), (step * 0.5, 0.0), (step * 0.25, 0.0)]
+            if try_candidates(straight, (None,), limit, 0.0, require_terrain=True):
+                return True
         mode = 'forward' if forward_only else 'terrain navigation'
         if attempts:
             reason = (f'{attempts} {mode} candidates rejected by planning or clearance checks; '

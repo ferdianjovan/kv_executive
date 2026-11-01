@@ -613,6 +613,7 @@ class MissionExecutive(
         blackboard['verify_height_hint'] = None
         blackboard['verify_height_hint_consumed'] = 0
         blackboard['verify_height_hint_epoch'] = 0
+        blackboard['verify_descent_deferred'] = False
         blackboard['verify_vertical_track'] = None
         blackboard['verify_vertical_stamp'] = 0
         blackboard['verify_vertical_direction'] = 0

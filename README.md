@@ -400,10 +400,18 @@ requests a bounded vertical-only correction before another forward advance.
 At the wall standoff, up to `verify_vertical_max_corrections` (3) corrections are
 best effort: perfect image centering is not an additional report requirement.
 Vertical corrections consume the existing fire-leg and inspection-time budgets.
-Missing terrain evidence or insufficient clearance prevents descent; a blocked
-vertical correction cannot authorize closer forward travel toward an edge-of-view
-fire. Each completed correction requires another post-stop observation before
-another correction; completed reporting additionally requires fresh wall evidence.
+Missing terrain evidence or insufficient clearance prevents descent. When an
+observed terrain floor prevents a useful downward correction, that optional
+correction is skipped and logged. With fresh post-stop smoke or confirmed fire
+guidance, the aircraft may instead select one short forward leg at its current
+altitude, climbing only as required by terrain clearance. The blocked downward
+preference is suppressed until that forward leg makes useful progress; height
+guidance is reconsidered from the new viewpoint, including where terrain drops
+away. This applies to remembered corrections, visible edge-priority corrections,
+and combined forward/downward approach goals. A blocked correction never relaxes
+the smoke-wall boundary or authorizes forward travel at the protected standoff.
+Each completed correction requires another post-stop observation before another
+correction; completed reporting additionally requires fresh wall evidence.
 
 A confirmed fire seen during motion can supply one remembered height-recovery
 correction after arrival if it disappears above or below the image centre.
@@ -423,15 +431,24 @@ hint logs its exact reason, source/wall ages, angle, travel, rotation and clock
 silence. Temporary ineligibility does not consume the hint. Selecting the single
 checked correction consumes it, even if terrain or planning blocks execution;
 the result distinguishes selection, rejection, and actual height movement.
+An observed terrain-floor veto permits ordinary reacquisition and the checked
+forward fallback above; missing terrain, other planning failures, and an executed
+correction with no useful height change retain their existing recovery/error
+handling. The fallback does not restart inspection or blocked-route budgets.
 Another correction needs new confirmation. Remembered direction never qualifies
 as fresh fire for reporting. Detector diagnostics separately retain raw producer
 confirmation progress, including `CONFIRMING` messages that cannot steer.
 
 Slow-clock regressions use real 0.1× and 0.2× ROS clocks and verify actual 0.5 m
 descent and climb after fire disappears during a long approach leg.
+The 0.2× terrain-floor regression also verifies a refused remembered descent,
+a completed level forward fallback, and a newly permitted 0.5 m descent after
+crossing a terrain drop, all within the same mission goal.
 Deterministic cases additionally cover 30-, 60-, and 150-wall-second legs,
 frozen/rewound clocks, discarded hints, and blocked/no-op descent attempts.
 The executive checkpoint immediately before this timing fix is `b2e8d58`.
+The baseline before terrain-limited descent fallback is tagged
+`checkpoint-before-height-fallback-20261101` in each `kv_` package repository.
 
 A short fire-approach maneuver retains its selected heading
 through detector gaps or tracking-ID changes. Each actual planned route is limited

@@ -736,6 +736,21 @@ class VerifyController:
         self._check_inspection_deadline(blackboard)
         self._capture_height_hint(blackboard)
 
+    def _height_floor_rejected(self, vertical):
+        """Recognize only a downward preference vetoed before flight by terrain."""
+        return vertical < 0.0 and getattr(
+            self.executive, '_verify_height_rejection', '') == 'terrain_floor'
+
+    def _defer_descent(self, blackboard):
+        """Allow one checked approach leg before reconsidering a blocked descent."""
+        if _bb_get(blackboard, 'verify_smoke_boundary_reached', False):
+            return
+        if not _bb_get(blackboard, 'verify_descent_deferred', False):
+            self.executive._report(
+                'Verify: downward fire-height correction skipped at terrain clearance floor; '
+                'deferring descent until one checked forward leg completes')
+        blackboard['verify_descent_deferred'] = True
+
     def _check_inspection_deadline(self, blackboard):
         try:
             self._inspection_guard(blackboard)
@@ -756,6 +771,11 @@ class VerifyController:
         fire, pose, received = hint
         stamp = self._stamp_ns(fire)
         if stamp <= _bb_get(blackboard, 'verify_height_hint_consumed', 0):
+            return False
+        if (fire.vertical_correction_rad < 0.0
+                and _bb_get(blackboard, 'verify_descent_deferred', False)
+                and not _bb_get(blackboard, 'verify_smoke_boundary_reached', False)):
+            blackboard['verify_height_hint_consumed'] = stamp
             return False
         current = self._pose()
         distance = math.dist(tuple(getattr(current.position, a) for a in 'xyz'),
@@ -800,10 +820,14 @@ class VerifyController:
         self.executive._report(
             f'Verify: remembered fire-height reacquisition {vertical:+.2f} m; '
             'one checked correction before another forward leg')
+        self.executive._verify_height_rejection = ''
         moved = self.executive._verify_recovery_plan_to(
             target, geometry=self._wall_geometry(blackboard),
             guard=lambda: self._movement_guard(blackboard), preserve_requested_altitude=True)
         actual_change = self._pose().position.z - current.position.z
+        if moved is False and self._height_floor_rejected(vertical):
+            self._defer_descent(blackboard)
+            return False
         if moved is False or actual_change * math.copysign(1.0, vertical) <= 0.01:
             reason = ('terrain or planning validation rejected it' if moved is False
                       else 'no useful movement in the requested height direction')
@@ -849,6 +873,8 @@ class VerifyController:
             return False
         moved = self._move_visible_fire_height(blackboard, vertical)
         if moved is False:
+            if self._height_floor_rejected(vertical):
+                return False
             if _bb_get(blackboard, 'verify_smoke_boundary_reached', False):
                 return False
             self._search_blocked(blackboard, 'fire height correction blocked')
@@ -899,8 +925,12 @@ class VerifyController:
                     'verify_vertical_edge_threshold']:
                 result = self._move_visible_fire_height(blackboard, vertical)
                 if result is False:
-                    self._search_blocked(blackboard, 'fire height correction blocked')
-                return 'reacquire'
+                    if self._height_floor_rejected(vertical):
+                        vertical = 0.0
+                    else:
+                        return self._search_blocked(blackboard, 'fire height correction blocked')
+                else:
+                    return 'reacquire'
             if vertical:
                 blackboard['verify_height_hint_consumed'] = self._stamp_ns(fire)
             self.executive._report(
@@ -1247,6 +1277,9 @@ class VerifyController:
             threshold = tolerance if previous == sign else tolerance + hysteresis
             if abs(error) > threshold:
                 direction = sign
+        if (direction < 0 and _bb_get(blackboard, 'verify_descent_deferred', False)
+                and not _bb_get(blackboard, 'verify_smoke_boundary_reached', False)):
+            direction = 0
         blackboard['verify_vertical_direction'] = direction
         self.executive._report(
             f'Verify: fire vertical angle={math.degrees(error):+.1f} deg; '
@@ -1303,6 +1336,9 @@ class VerifyController:
                 f'nearest={wall["nearest"]:.2f} m, uncertainty={wall["uncertainty"]:.2f} m')
             at_standoff = smoke_wall_standoff_reached(wall, standoff, tolerance)
             if height_blocked and not at_standoff:
+                if self._height_floor_rejected(vertical):
+                    self._defer_descent(blackboard)
+                    return None
                 self._search_blocked(blackboard, 'fire height correction blocked')
                 return None
             if self._stamp_ns(current_fire) > _bb_get(blackboard, 'verify_vertical_stamp', 0):
@@ -1427,11 +1463,14 @@ class VerifyController:
             'before wall ranging or further forward motion')
         blackboard['verify_height_hint_consumed'] = _bb_get(
             blackboard, 'verify_vertical_stamp', 0)
+        self.executive._verify_height_rejection = ''
         if self.executive._verify_recovery_plan_to(
                 target, geometry=self._wall_geometry(blackboard),
                 guard=lambda: self._movement_guard(blackboard),
                 preserve_requested_altitude=True) is False:
             self.executive._report('Verify: fire height correction blocked by path or terrain')
+            if self._height_floor_rejected(vertical):
+                self._defer_descent(blackboard)
             return False
         blackboard['verify_fire_approach_steps'] = _bb_get(
             blackboard, 'verify_fire_approach_steps', 0) + 1
@@ -1652,6 +1691,10 @@ class VerifyController:
         useful = moved is not False and not repeat and forward > tolerance
         if useful:
             blackboard['verify_search_failures'] = 0
+            if _bb_get(blackboard, 'verify_descent_deferred', False):
+                blackboard['verify_descent_deferred'] = False
+                self.executive._report(
+                    'Verify: fire-height descent guidance re-enabled after forward progress')
         stalled = 0 if useful else _bb_get(blackboard, 'verify_navigation_stalls', 0) + 1
         blackboard['verify_navigation_stalls'] = stalled
         if math.hypot(*displacement) > tolerance:

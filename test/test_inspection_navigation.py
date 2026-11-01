@@ -1309,6 +1309,7 @@ def test_floor_blocked_descent_does_not_reverse_into_an_upward_centering_command
 
     assert not executive._verify_recovery_plan_to(target, preserve_requested_altitude=True)
 
+    assert executive._verify_height_rejection == 'terrain_floor'
     assert executive.odometry.pose.pose.position.z == 5.0
     assert not any(event[0] == 'plan' for event in executive.events)
 
@@ -1320,7 +1321,22 @@ def test_unknown_terrain_never_authorizes_downward_image_centering(executive):
 
     assert not executive._verify_recovery_plan_to(target, preserve_requested_altitude=True)
 
+    assert executive._verify_height_rejection == 'terrain_unavailable'
     assert not any(event[0] == 'plan' for event in executive.events)
+
+
+def test_a_later_plan_refusal_cannot_reuse_a_previous_height_floor_rejection(executive):
+    executive.odometry.pose.pose.position.z = 7.4
+    target = deepcopy(executive.odometry.pose.pose)
+    target.position.z -= 0.5
+    assert not executive._verify_recovery_plan_to(target, preserve_requested_altitude=True)
+    assert executive._verify_height_rejection == 'terrain_floor'
+
+    executive.odometry.pose.pose.position.z = 20.0
+    target.position.z = 19.5
+    executive.corridor_safe = False
+    assert not executive._verify_recovery_plan_to(target, preserve_requested_altitude=True)
+    assert executive._verify_height_rejection == ''
 
 
 def test_live_heading_prefers_fresh_fire_then_smoke_and_holds_the_last_view_through_gaps(
@@ -1921,12 +1937,10 @@ def test_fire_descent_can_follow_falling_terrain_without_altitude_ratchet(execut
     assert executive.odometry.pose.pose.position.z == pytest.approx(7.4)
 
 
-@pytest.mark.parametrize('reason', ['terrain_floor', 'missing_terrain', 'blocked_path'])
+@pytest.mark.parametrize('reason', ['missing_terrain', 'blocked_path'])
 def test_unavailable_fire_descent_does_not_fall_back_to_forward_or_climbing_motion(
         executive, reason):
-    if reason == 'terrain_floor':
-        executive.odometry.pose.pose.position.z = 7.4
-    elif reason == 'missing_terrain':
+    if reason == 'missing_terrain':
         executive.ground_valid = False
     else:
         def block_path(request, response):
@@ -1940,6 +1954,133 @@ def test_unavailable_fire_descent_does_not_fall_back_to_forward_or_climbing_moti
     assert all(r.target.pose.position.z < original.position.z for r in requests)
     if reason != 'blocked_path':
         assert not requests
+
+
+@pytest.mark.parametrize('forward_only', [False, True])
+@pytest.mark.parametrize('rising_ground', [False, True])
+def test_terrain_limited_fire_descent_selects_a_separate_checked_forward_leg(
+        executive, forward_only, rising_ground):
+    executive.odometry.pose.pose.position.z = 7.4
+
+    def terrain_ahead(request, response):
+        if rising_ground and request.ground_query.point.x > 0.0:
+            response.ground_surface.point.z = 3.0
+
+    executive.on_query = terrain_ahead
+    assert executive._verify_navigation_viewpoint(
+        0.0, forward_only=forward_only, vertical_offset=-0.5)
+
+    target = executive.odometry.pose.pose.position
+    assert (target.x, target.y, target.z) == pytest.approx(
+        (3.0, 0.0, 8.4 if rising_ground else 7.4))
+    plans = [event for event in executive.events if event[0] == 'inspection_plan']
+    assert len(plans) == 1
+    assert plans[0][1].minimum_agl == 5.0
+    assert plans[0][1].terrain_envelope and plans[0][1].allow_terrain_escape
+    assert any('trying a checked forward leg' in event[1] for event in executive.events
+               if event[0] == 'status')
+    assert not any(event[0] in {'report', 'legacy_report'} for event in executive.events)
+
+
+def test_floor_limited_forward_fallback_still_checks_the_entire_terrain_corridor(executive):
+    executive.odometry.pose.pose.position.z = 7.4
+
+    def block_corridor(request, response):
+        if len(request.corridor.poses) > 1:
+            response.corridor_safe = False
+
+    executive.on_query = block_corridor
+    assert not executive._verify_navigation_viewpoint(
+        0.0, forward_only=True, vertical_offset=-0.5)
+    assert executive.odometry.pose.pose.position == Point(z=7.4)
+    requests = [event[1] for event in executive.events if event[0] == 'inspection_plan']
+    assert len(requests) == 3
+    assert all(request.target.pose.position.z == pytest.approx(7.4) for request in requests)
+
+
+def test_floor_limited_forward_fallback_obeys_the_same_candidate_budget(executive):
+    executive.odometry.pose.pose.position.z = 7.4
+    executive.config['verify_navigation_candidate_limit'] = 2
+
+    def block_corridor(request, response):
+        if len(request.corridor.poses) > 1:
+            response.corridor_safe = False
+
+    executive.on_query = block_corridor
+    assert not executive._verify_navigation_viewpoint(
+        0.0, forward_only=True, vertical_offset=-0.5)
+    assert len([event for event in executive.events if event[0] == 'inspection_plan']) == 2
+
+
+def test_floor_limited_forward_fallback_can_choose_a_shorter_safe_leg(executive):
+    executive.odometry.pose.pose.position.z = 7.4
+
+    def short_corridor_only(request, response):
+        if len(request.corridor.poses) > 1:
+            response.corridor_safe = request.corridor.poses[-1].pose.position.x <= 1.5
+
+    executive.on_query = short_corridor_only
+    assert executive._verify_navigation_viewpoint(
+        0.0, forward_only=True, vertical_offset=-0.5)
+    assert executive.odometry.pose.pose.position == Point(x=1.5, z=7.4)
+
+
+@pytest.mark.parametrize('interrupt', ['cancel', 'return'])
+def test_floor_limited_forward_fallback_preserves_vehicle_interrupts(executive, interrupt):
+    from kv_executive.mission_executive import MissionCanceled, MissionStateRequested
+    executive.odometry.pose.pose.position.z = 7.4
+    exception = MissionCanceled if interrupt == 'cancel' else MissionStateRequested
+
+    def guard():
+        if any(event[0] == 'status' and 'trying a checked forward leg' in event[1]
+               for event in executive.events):
+            reason = 'vehicle interrupt before fallback' if interrupt == 'cancel' else 'Return'
+            raise exception(reason)
+
+    with pytest.raises(exception):
+        executive._verify_navigation_viewpoint(
+            0.0, forward_only=True, vertical_offset=-0.5, guard=guard)
+    assert executive.odometry.pose.pose.position == Point(z=7.4)
+    assert not any(event[0] == 'inspection_plan' for event in executive.events)
+
+
+def test_floor_limited_forward_fallback_stops_for_a_new_map_outage(executive):
+    from kv_executive.verification import VerificationMapUnavailable
+    executive.odometry.pose.pose.position.z = 7.4
+
+    def stale_fallback_corridor(request, response):
+        if len(request.corridor.poses) > 1:
+            response.map_header = header(executive.now - 6.0, 'map')
+
+    executive.on_query = stale_fallback_corridor
+    with pytest.raises(VerificationMapUnavailable):
+        executive._verify_navigation_viewpoint(0.0, forward_only=True, vertical_offset=-0.5)
+    assert executive.odometry.pose.pose.position == Point(z=7.4)
+
+
+def test_descent_becomes_eligible_again_after_a_terrain_following_leg(executive):
+    executive.odometry.pose.pose.position.z = 7.4
+    assert executive._verify_navigation_viewpoint(
+        0.0, forward_only=True, vertical_offset=-0.5)
+    assert executive.odometry.pose.pose.position == Point(x=3.0, z=7.4)
+
+    executive.ground_z = 0.0
+    assert executive._verify_navigation_viewpoint(
+        0.0, forward_only=True, vertical_offset=-0.5)
+    assert executive.odometry.pose.pose.position == Point(x=6.0, z=6.9)
+
+
+@pytest.mark.parametrize('remaining', [0.0, 0.5])
+def test_floor_limited_forward_fallback_cannot_cross_fifteen_meter_wall(executive, remaining):
+    executive.config['verify_smoke_standoff'] = 15.0
+    executive.odometry.pose.pose.position.z = 7.4
+    wall = _measured_navigation_wall(executive, nearest=15.5 + remaining)
+    wall['origin'].z = 7.4
+    geometry = {'wall_probe_only': True, 'smoke_navigation_wall': wall}
+    assert executive._verify_navigation_viewpoint(
+        0.0, geometry=geometry, forward_only=True, vertical_offset=-0.5) is (remaining > 0.0)
+    assert executive.odometry.pose.pose.position.x == pytest.approx(remaining)
+    assert executive.odometry.pose.pose.position.z == pytest.approx(7.4)
 
 
 @pytest.mark.parametrize('offset', [-0.51, 0.51, math.nan, math.inf, True])

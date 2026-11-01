@@ -1833,15 +1833,207 @@ def test_slow_leg_preserves_moderate_height_guidance_until_arrival(
 
 
 @pytest.mark.parametrize('planner_result', [False, True])
+@pytest.mark.parametrize('previous_reason', ['', 'terrain_floor'])
 def test_slow_descent_rejection_or_no_movement_cannot_become_forward_flight(
-        system, monkeypatch, planner_result):
+        system, monkeypatch, planner_result, previous_reason):
     executive, controller, board, _ = _slow_height_hint(system, monkeypatch, 150)
+    executive._verify_height_rejection = previous_reason
     executive._verify_recovery_plan_to = lambda *args, **kwargs: planner_result
     with pytest.raises(RuntimeError, match='selected fire-height reacquisition was not executed'):
         controller.reacquire(board)
     assert executive.odometry.pose.pose.position == Point(x=3.0, z=6.0)
     assert not controller._recover_fire_height(board)
     assert not any(event[0] in {'navigation', 'inspection_report'} for event in executive.events)
+
+
+@pytest.mark.parametrize('wall_seconds', [30, 150])
+def test_slow_floor_blocked_memory_reacquires_then_reconsiders_descent_after_forward_leg(
+        system, monkeypatch, wall_seconds):
+    executive, controller, board, _ = _slow_height_hint(system, monkeypatch, wall_seconds)
+    controller.config['verify_fire_approach_max_steps'] = 8
+    executive.wall_x = 50.0
+    recovery = executive._verify_recovery_plan_to
+    blocked = []
+    cliff_reached = [False]
+
+    def terrain_checked_move(target, **kwargs):
+        if target.position.z < executive.odometry.pose.pose.position.z and not cliff_reached[0]:
+            blocked.append(deepcopy(target.position))
+            executive._verify_height_rejection = 'terrain_floor'
+            return False
+        return recovery(target, **kwargs)
+
+    executive._verify_recovery_plan_to = terrain_checked_move
+    smoke(executive, controller)
+    assert controller.reacquire(board) == 'approach'
+    started = board['verify_inspection_started']
+    assert executive.odometry.pose.pose.position == Point(x=3.0, z=6.0)
+    assert board['verify_descent_deferred']
+    assert not controller._recover_fire_height(board)
+    assert len(blocked) == 1
+    assert not any(event[0] == 'navigation' for event in executive.events)
+
+    # A newly confirmed lower fire must not re-trigger descent before movement.
+    _qualified_fire(executive, controller, vertical_correction_rad=-0.4)
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert executive.odometry.pose.pose.position == Point(x=6.0, z=6.0)
+    assert len(blocked) == 1
+    assert not board['verify_descent_deferred']
+    assert board['verify_inspection_started'] == started
+    assert verification._bb_get(board, 'verify_search_failures', 0) == 0
+
+    # Past a cliff, a fresh observation may request a genuine checked descent.
+    cliff_reached[0] = True
+    _qualified_fire(executive, controller, vertical_correction_rad=-0.4)
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert executive.odometry.pose.pose.position == Point(x=6.0, z=5.5)
+    assert len(blocked) == 1
+    assert not any(event[0] == 'inspection_report' for event in executive.events)
+
+
+def test_floor_blocked_memory_does_not_authorize_translation_without_fresh_source(
+        system, monkeypatch):
+    executive, controller, board, _ = _slow_height_hint(system, monkeypatch, 60)
+
+    def reject(*args, **kwargs):
+        executive._verify_height_rejection = 'terrain_floor'
+        return False
+
+    executive._verify_recovery_plan_to = reject
+    monkeypatch.setattr(controller, '_smoke_guidance', lambda **kwargs: None)
+    assert controller.reacquire(board) == 'reacquire'
+    assert board['verify_descent_deferred']
+    assert executive.odometry.pose.pose.position == Point(x=3.0, z=6.0)
+    assert not any(event[0] in {'navigation', 'plan', 'inspection_report'}
+                   for event in executive.events)
+
+
+@pytest.mark.parametrize('hover_drift', [0.0, 0.02, -0.02, 0.2])
+def test_preflight_floor_veto_remains_recoverable_through_hover_drift(
+        system, monkeypatch, hover_drift):
+    executive, controller, board, _ = _slow_height_hint(system, monkeypatch, 60)
+
+    def reject_before_flight(*args, **kwargs):
+        executive.odometry.pose.pose.position.z += hover_drift
+        executive._verify_height_rejection = 'terrain_floor'
+        return False
+
+    executive._verify_recovery_plan_to = reject_before_flight
+    smoke(executive, controller)
+    assert controller.reacquire(board) == 'approach'
+    assert board['verify_descent_deferred']
+    assert executive.odometry.pose.pose.position == Point(x=3.0, z=6.0 + hover_drift)
+    assert not controller._recover_fire_height(board)
+    assert not any(event[0] in {'navigation', 'plan', 'inspection_report'}
+                   for event in executive.events)
+
+
+@pytest.mark.parametrize('reason', ['terrain_unavailable', ''])
+def test_remembered_descent_other_rejections_remain_fatal(system, monkeypatch, reason):
+    executive, controller, board, _ = _slow_height_hint(system, monkeypatch, 60)
+
+    def reject(*args, **kwargs):
+        executive._verify_height_rejection = reason
+        return False
+
+    executive._verify_recovery_plan_to = reject
+    with pytest.raises(RuntimeError, match='selected fire-height reacquisition was not executed'):
+        controller.reacquire(board)
+    assert not verification._bb_get(board, 'verify_descent_deferred', False)
+
+
+def test_remembered_descent_map_outage_is_not_a_skipped_height_preference(system, monkeypatch):
+    executive, controller, board, _ = _slow_height_hint(system, monkeypatch, 60)
+
+    def no_map(*args, **kwargs):
+        raise verification.VerificationMapUnavailable('map source expired')
+
+    executive._verify_recovery_plan_to = no_map
+    with pytest.raises(verification.VerificationMapUnavailable, match='map source expired'):
+        controller._recover_fire_height(board)
+    assert not verification._bb_get(board, 'verify_descent_deferred', False)
+
+
+@pytest.mark.parametrize('forward_up', [0.0, 0.4])
+def test_visible_edge_floor_veto_uses_checked_forward_leg_without_blocked_recovery(
+        system, forward_up):
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 8
+    executive.wall_x = 50.0
+    recovery = executive._verify_recovery_plan_to
+    blocked = []
+
+    def terrain_checked_move(target, **kwargs):
+        if target.position.z < executive.odometry.pose.pose.position.z:
+            blocked.append(deepcopy(target.position))
+            executive._verify_height_rejection = 'terrain_floor'
+            return False
+        target.position.z += forward_up
+        return recovery(target, **kwargs)
+
+    executive._verify_recovery_plan_to = terrain_checked_move
+    _qualified_fire(executive, controller, vertical_correction_rad=-0.4)
+    board = Blackboard()
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert executive.odometry.pose.pose.position == Point(x=3.0, z=6.0 + forward_up)
+    assert len(blocked) == 1
+    assert not board['verify_descent_deferred']
+    assert verification._bb_get(board, 'verify_search_failures', 0) == 0
+    assert not any(event[0] == 'inspection_report' for event in executive.events)
+
+
+def test_deferred_descent_stays_deferred_when_forward_leg_does_not_execute(system):
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 8
+    executive.wall_x = 50.0
+    attempts = []
+
+    def terrain_checked_move(target, **kwargs):
+        attempts.append(deepcopy(target.position))
+        if target.position.z < executive.odometry.pose.pose.position.z:
+            executive._verify_height_rejection = 'terrain_floor'
+        return False
+
+    executive._verify_recovery_plan_to = terrain_checked_move
+    _qualified_fire(executive, controller, vertical_correction_rad=-0.4)
+    board = Blackboard()
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert board['verify_descent_deferred']
+    assert executive.odometry.pose.pose.position == Point(z=6.0)
+    assert len([target for target in attempts if target.z < 6.0]) == 1
+    _qualified_fire(executive, controller, vertical_correction_rad=-0.4)
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert board['verify_descent_deferred']
+    assert len([target for target in attempts if target.z < 6.0]) == 1
+
+
+def test_deferred_descent_does_not_suppress_upward_fire_guidance(system):
+    executive, controller = system
+    board = Blackboard()
+    board['verify_descent_deferred'] = True
+    lower = _qualified_fire(executive, controller, vertical_correction_rad=-0.4)
+    assert controller._fire_vertical_preference(board, lower) == 0.0
+    upper = _qualified_fire(executive, controller, vertical_correction_rad=0.4)
+    assert controller._fire_vertical_preference(board, upper) == 0.5
+    assert board['verify_descent_deferred']
+
+
+def test_floor_blocked_height_at_wall_never_authorizes_forward_fallback(system):
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 8
+    board = _confirmed_wall_board(executive, controller)
+    feed_fire(executive, controller, vertical_correction_rad=-0.4)
+
+    def reject(*args, **kwargs):
+        executive._verify_height_rejection = 'terrain_floor'
+        return False
+
+    executive._verify_recovery_plan_to = reject
+    assert controller.center_fire(board) == 'explore'
+    assert executive.odometry.pose.pose.position == Point(z=6.0)
+    assert not any(event[0] == 'navigation' for event in executive.events)
+    assert any(event[0] == 'inspection_report' and event[2] is not None
+               for event in executive.events)
 
 
 def test_slow_leg_does_not_preserve_height_guidance_through_a_frozen_clock(system, monkeypatch):

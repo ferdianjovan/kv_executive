@@ -1694,6 +1694,7 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     blackboard['verify_wall_recheck_deadline'] = 123.0
     blackboard['verify_height_hint'] = 'old target'
     blackboard['verify_height_hint_consumed'] = 42
+    blackboard['verify_descent_deferred'] = True
 
     harness._exploration_parent_entry(blackboard)
     harness._takeoff(blackboard)
@@ -1714,6 +1715,7 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     assert blackboard['verify_wall_recheck_deadline'] is None
     assert blackboard['verify_height_hint'] is None
     assert blackboard['verify_height_hint_consumed'] == 0
+    assert not blackboard['verify_descent_deferred']
     assert harness._verify_retry_after == 0.0
     phase = next(event[1] for event in harness.events if event[0] == 'phase')
     assert phase.state == 'Exploration'
