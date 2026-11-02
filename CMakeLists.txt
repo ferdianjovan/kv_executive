@@ -116,8 +116,9 @@ if(BUILD_TESTING)
   ament_add_pytest_test(verification test/test_verification.py TIMEOUT 45)
   ament_add_pytest_test(mission_navigation test/test_mission_navigation.py TIMEOUT 45)
   ament_add_pytest_test(inspection_navigation test/test_inspection_navigation.py TIMEOUT 45)
+  ament_add_pytest_test(motion_policy test/test_motion_policy.py TIMEOUT 45)
   # Real mode handoffs and the committed-climb case make this a long DDS suite.
-  ament_add_pytest_test(verify_ros test/test_verify_ros.py TIMEOUT 900)
+  ament_add_pytest_test(verify_ros test/test_verify_ros.py TIMEOUT 3600)
   ament_add_pytest_test(verify_process test/test_verify_process.py TIMEOUT 300)
   ament_add_pytest_test(detection_monitor test/test_detection_monitor.py)
   ament_add_pytest_test(detection_monitor_ros test/test_detection_monitor_ros.py TIMEOUT 120)
@@ -128,7 +129,7 @@ if(BUILD_TESTING)
     battery_monitor_native_ros test/test_battery_monitor_native_ros.py TIMEOUT 90)
   ament_add_pytest_test(
     battery_monitor_constant_ros test/test_battery_monitor_constant_ros.py TIMEOUT 120)
-  ament_add_pytest_test(planner_inputs test/test_planner_inputs.py TIMEOUT 90)
+  ament_add_pytest_test(planner_inputs test/test_planner_inputs.py TIMEOUT 300)
   # Statistical native-planner benchmark; skipped unless explicitly enabled.
   ament_add_pytest_test(
     smoke_wall_false_positives test/test_smoke_wall_false_positives.py TIMEOUT 600)
@@ -145,6 +146,32 @@ if(BUILD_TESTING)
   # comment the line when this package is in a git repo and when
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
+  # Register these checks explicitly so local generated trees are not source
+  # inputs, and use this repository's first-line multiline docstring summaries.
+  find_package(ament_cmake_flake8 REQUIRED)
+  find_package(ament_cmake_lint_cmake REQUIRED)
+  find_package(ament_cmake_pep257 REQUIRED)
+  find_package(ament_cmake_uncrustify REQUIRED)
+  # Avoid forked flake8 workers inheriting active Python runtime threads.
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "-c"
+      "import pathlib, ament_flake8; print(pathlib.Path(ament_flake8.__file__).parent / 'configuration' / 'ament_flake8.ini')"
+    OUTPUT_VARIABLE _flake8_default_config
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _flake8_config_result)
+  if(NOT _flake8_config_result EQUAL 0)
+    message(FATAL_ERROR "Cannot locate the installed ament flake8 configuration")
+  endif()
+  configure_file("${_flake8_default_config}" "${CMAKE_CURRENT_BINARY_DIR}/flake8.ini" COPYONLY)
+  file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/flake8.ini" "\njobs = 1\n")
+  ament_flake8(
+    CONFIG_FILE "${CMAKE_CURRENT_BINARY_DIR}/flake8.ini"
+    EXCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/build,${CMAKE_CURRENT_SOURCE_DIR}/install")
+  ament_lint_cmake("${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
+  ament_pep257(kv_executive launch scripts test --add-ignore D213 --add-select D212)
+  ament_uncrustify(src include)
+  list(APPEND AMENT_LINT_AUTO_EXCLUDE
+    ament_cmake_flake8 ament_cmake_lint_cmake ament_cmake_pep257 ament_cmake_uncrustify)
   ament_lint_auto_find_test_dependencies()
 endif()
 

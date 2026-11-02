@@ -22,7 +22,8 @@ class Harness:
         self.now = 100.0
         # Observation tests start at a measured wall standoff. Flight-policy
         # cases explicitly move the wall farther away and enable approach legs.
-        self.config = {'verify_fire_approach_max_steps': 0, 'verify_smoke_standoff': 10.0}
+        self.config = {'verify_fire_approach_max_steps': 0, 'verify_smoke_standoff': 10.0,
+                       'verify_smoke_inspection_max_distance': 10.6}
         self.wall_x = 10.5
         self.events = []
         self.odometry = Odometry()
@@ -132,7 +133,8 @@ class Harness:
             (getattr(current, a) - getattr(wall['origin'], a)) * wall['axis'][i]
             for i, a in enumerate('xyz'))
         return verification.smoke_wall_standoff_reached(
-            {**wall, 'nearest': distance}, self.config['verify_smoke_standoff'])
+            {**wall, 'nearest': distance}, self.config['verify_smoke_standoff'],
+            max_distance=self.config['verify_smoke_inspection_max_distance'])
 
     def _verify_record_fire(self, fire, bearing):
         self.events.append(('record', deepcopy(fire), bearing))
@@ -557,15 +559,17 @@ def test_default_fire_policy_approaches_smoke_wall_without_fire_range(system):
     executive.wall_x = 30.0
     executive.config.pop('verify_fire_approach_max_steps')
     executive.config.pop('verify_smoke_standoff')
+    executive.config.pop('verify_smoke_inspection_max_distance')
     controller = VerifyController(executive)
     executive._verify = controller
     executive.config['verify_smoke_standoff'] = 15.0
+    executive.config['verify_smoke_inspection_max_distance'] = 20.0
     executive.target_geometry.update(point=None, target_valid=False, range=math.nan)
     feed_fire(executive, controller)
     _enable_wall_probes(executive)
     assert _run_verify_controller(executive, controller) == 'explore'
-    assert executive.odometry.pose.pose.position.x == pytest.approx(14.5)
-    assert len([e for e in executive.events if e[0] == 'navigation']) == 5
+    assert executive.odometry.pose.pose.position.x == pytest.approx(12.0)
+    assert len([e for e in executive.events if e[0] == 'navigation']) == 4
     assert any(e[0] == 'inspection_report' and e[2].detected for e in executive.events)
 
 
@@ -2172,14 +2176,88 @@ def test_fresh_far_observation_releases_arrival_without_restarting_inspection_cl
     assert board['verify_wall_near_count'] == 0
 
 
-def test_first_close_observation_retreats_without_waiting_for_confirmation(system):
+def test_first_close_observation_holds_without_retreat_or_inspection(system):
     executive, controller = system
     board = Blackboard()
     controller._record_wall_observation(board, _qualified_wall(executive, 8.0, 101))
     assert controller._wall_action(board) == 'reacquire'
-    assert executive.odometry.pose.pose.position.x < 0.0
+    assert executive.odometry.pose.pose.position.x == 0.0
     assert board['verify_wall_near_count'] == 1
+    assert board['verify_wall_close_count'] == 1
     assert not verification._bb_get(board, 'verify_smoke_boundary_reached', False)
+    assert not any(event[0] in {'recovery_plan', 'navigation', 'inspection_report'}
+                   for event in executive.events)
+
+
+@pytest.mark.parametrize('angle', [-0.2, 0.2])
+def test_pending_wall_reconfirmation_preserves_height_hint_without_translation(system, angle):
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 3
+    board = Blackboard()
+    _qualified_fire(executive, controller, vertical_correction_rad=angle)
+    controller._capture_height_hint(board)
+    fire(executive, controller, detected=False)
+    hint = deepcopy(board['verify_height_hint'])
+    board['verify_wall_recheck_deadline'] = executive.now + 20.0
+    assert not controller._recover_fire_height(board)
+    assert board['verify_height_hint'] == hint
+    assert verification._bb_get(board, 'verify_height_hint_consumed', 0) == 0
+    assert not verification._bb_get(board, 'verify_height_only_attempted', False)
+    assert not any(event[0] == 'recovery_plan' for event in executive.events)
+    assert executive.odometry.pose.pose.position == Point(z=6.0)
+    board['verify_wall_recheck_deadline'] = None
+    assert controller._recover_fire_height(board)
+    assert executive.odometry.pose.pose.position.z == pytest.approx(
+        6.0 + math.copysign(0.5, angle))
+
+
+def test_two_new_close_observations_authorize_one_checked_retreat_then_reconfirm(system):
+    executive, controller = system
+    board = Blackboard()
+    controller._record_wall_observation(board, _qualified_wall(executive, 8.0, 101))
+    controller._record_wall_observation(board, _qualified_wall(executive, 8.1, 102))
+    started = board['verify_inspection_started']
+    assert controller._wall_action(board) == 'reacquire'
+    assert executive.odometry.pose.pose.position.x < 0.0
+    assert board['verify_wall_latest'] is None
+    assert board['verify_wall_near_count'] == 0
+    assert board['verify_wall_close_count'] == 0
+    assert board['verify_wall_recheck_deadline'] > executive.now
+    assert board['verify_inspection_started'] == started
+    assert controller._wall_action(board) == 'reacquire'
+    assert len([event for event in executive.events if event[0] == 'recovery_plan']) == 1
+
+
+def test_confirmed_band_does_not_authorize_retreat_from_one_new_close_reading(system):
+    executive, controller = system
+    board = _confirmed_wall_board(executive, controller)
+    executive.now += 0.1
+    controller._record_wall_observation(board, _qualified_wall(executive, 8.0))
+    assert controller._wall_action(board) == 'reacquire'
+    assert board['verify_wall_close_count'] == 1
+    assert executive.odometry.pose.pose.position.x == 0.0
+    assert not any(event[0] == 'recovery_plan' for event in executive.events)
+
+
+def test_required_retreat_does_not_consume_stationary_reconfirmation_budget(system):
+    executive, controller = system
+    board = Blackboard()
+    controller._record_wall_observation(board, _qualified_wall(executive, 8.0, 101))
+    controller._record_wall_observation(board, _qualified_wall(executive, 8.1, 102))
+    started = board['verify_inspection_started']
+    recover = executive._verify_recovery_plan_to
+
+    def slow_recovery(*args, **kwargs):
+        executive.now += 34.0
+        return recover(*args, **kwargs)
+
+    executive._verify_recovery_plan_to = slow_recovery
+    assert controller._wall_action(board) == 'reacquire'
+    assert board['verify_wall_recheck_deadline'] == pytest.approx(executive.now + 20.0)
+    assert board['verify_inspection_started'] == started
+    controller._record_wall_observation(board, None)
+    assert controller._wall_action(board) == 'reacquire'
+    assert executive.now - started > 34.0
 
 
 def test_unavailable_near_wall_revalidation_has_one_bounded_budget(system):
@@ -2236,14 +2314,15 @@ def test_confirmed_wall_needs_two_new_near_readings_after_a_missing_probe(system
     assert controller._wall_action(board) == 'ready'
 
 
-def test_repeated_map_can_tighten_clearance_without_confirming_arrival(system):
+def test_repeated_map_close_candidate_holds_without_confirming_or_retreating(system):
     executive, controller = system
     board = Blackboard()
     controller._record_wall_observation(board, _qualified_wall(executive, 18.0, 101))
     controller._record_wall_observation(board, _qualified_wall(executive, 8.0, 101))
     assert controller._wall_action(board) == 'reacquire'
-    assert executive.odometry.pose.pose.position.x < 0.0
+    assert executive.odometry.pose.pose.position.x == 0.0
     assert board['verify_wall_near_count'] == 0
+    assert board['verify_wall_close_count'] == 0
     assert not verification._bb_get(board, 'verify_smoke_boundary_reached', False)
 
 
@@ -2413,3 +2492,35 @@ def test_default_inspection_budget_runs_past_five_minutes_and_expires_at_ten(
     with pytest.raises(RuntimeError, match='inspection time budget exhausted'):
         controller._check_inspection_deadline(board)
     assert not any(event[0] == 'inspection_report' for event in executive.events)
+
+
+@pytest.mark.parametrize('distance', [15.0, 17.5, 20.0])
+def test_inspection_band_accepts_two_fresh_qualified_ranges_without_advancing(system, distance):
+    executive, controller = system
+    for config in (executive.config, controller.config):
+        config.update(verify_smoke_standoff=15.0, verify_smoke_inspection_max_distance=20.0)
+    board = Blackboard()
+    controller._record_wall_observation(
+        board, _qualified_wall(executive, distance + 0.1, 101))
+    assert controller._wall_action(board) == 'reacquire'
+    controller._record_wall_observation(
+        board, _qualified_wall(executive, distance + 0.1, 102))
+    assert controller._wall_action(board) == 'ready'
+    assert board['verify_wall_close_count'] == 0
+    assert executive.odometry.pose.pose.position == Point(z=6.0)
+    assert not any(event[0] in {'navigation', 'recovery_plan'} for event in executive.events)
+
+
+def test_fresh_range_beyond_twenty_metres_releases_band_without_resetting_clock(system):
+    executive, controller = system
+    for config in (executive.config, controller.config):
+        config.update(verify_smoke_standoff=15.0, verify_smoke_inspection_max_distance=20.0)
+    board = Blackboard()
+    controller._record_wall_observation(board, _qualified_wall(executive, 18.1, 101))
+    controller._record_wall_observation(board, _qualified_wall(executive, 18.1, 102))
+    started = board['verify_inspection_started']
+    controller._record_wall_observation(board, _qualified_wall(executive, 20.2, 103))
+    assert controller._wall_action(board) == 'approach'
+    assert not board['verify_smoke_boundary_reached']
+    assert board['verify_wall_close_count'] == 0
+    assert board['verify_inspection_started'] == started

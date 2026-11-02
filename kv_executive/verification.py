@@ -64,9 +64,17 @@ VERIFY_DEFAULTS = {
     'verify_fire_approach_max_steps': 64,
     'verify_fire_leg_max_length': 12.0,
     'verify_fire_leg_timeout': 60.0,
+    'verify_approach_max_rise': 1.0,
+    'verify_approach_max_drop': 1.0,
+    'verify_approach_max_backtrack': 0.3,
+    'verify_approach_max_path_length': 12.0,
+    'verify_recovery_max_rise': 6.0,
+    'verify_recovery_max_drop': 1.0,
+    'verify_recovery_max_backtrack': 3.3,
     'verify_fire_standoff': 10.0,
     'verify_navigation_no_progress_max': 2,
     'verify_smoke_standoff': 15.0,
+    'verify_smoke_inspection_max_distance': 20.0,
     'verify_inspection_altitude': 3.0,
     'verify_inspection_lateral_step': 5.0,
     'verify_inspection_max_attempts': 3,
@@ -560,6 +568,7 @@ class VerifyController:
         if wall is None:
             blackboard['verify_wall_latest'] = None
             blackboard['verify_wall_near_count'] = 0
+            blackboard['verify_wall_close_count'] = 0
             if _bb_get(blackboard, 'verify_wall_recheck_deadline', None) is None and not (
                     _bb_get(blackboard, 'verify_smoke_boundary_reached', False)):
                 blackboard['verify_smoke_walls'] = []
@@ -580,12 +589,18 @@ class VerifyController:
         blackboard['verify_wall_latest'] = wall
         self._retain_wall(blackboard, wall)
         blackboard['verify_wall_last_stamp_ns'] = stamp
-        limit = self.config['verify_smoke_standoff'] + 2 * self.config.get(
-            'position_tolerance', 0.3)
-        if self._wall_distance(wall) > limit:
+        distance = self._wall_distance(wall)
+        limit = self.config['verify_smoke_inspection_max_distance']
+        self.executive._report(
+            f'Verify: qualified wall range mean={wall["mean"]:.2f} m, '
+            f'nearest={wall["nearest"]:.2f} m, uncertainty={wall["uncertainty"]:.2f} m, '
+            f'conservative distance={distance:.2f} m; '
+            f'inspection band={self.config["verify_smoke_standoff"]:g}–{limit:g} m')
+        if distance > limit:
             was_near = (_bb_get(blackboard, 'verify_smoke_boundary_reached', False)
                         or _bb_get(blackboard, 'verify_wall_recheck_deadline', None) is not None)
             blackboard['verify_wall_near_count'] = 0
+            blackboard['verify_wall_close_count'] = 0
             blackboard['verify_smoke_boundary_reached'] = False
             blackboard['verify_wall_recheck_deadline'] = None
             blackboard['verify_search_active'] = False
@@ -593,10 +608,13 @@ class VerifyController:
             blackboard['verify_inspection_attempts'] = 0
             if was_near:
                 self.executive._report(
-                    'Verify: fresh wall moved beyond standoff; resuming approach')
+                    'Verify: fresh wall moved beyond inspection band; resuming approach')
             return
         count = min(2, _bb_get(blackboard, 'verify_wall_near_count', 0) + 1)
         blackboard['verify_wall_near_count'] = count
+        blackboard['verify_wall_close_count'] = (
+            min(2, _bb_get(blackboard, 'verify_wall_close_count', 0) + 1)
+            if distance < self.config['verify_smoke_standoff'] else 0)
         self.executive._report(f'Verify: wall confirmation {count}/2 from new map observations')
         if count == 2:
             blackboard['verify_smoke_boundary_reached'] = True
@@ -643,11 +661,15 @@ class VerifyController:
     def _wall_action(self, blackboard):
         """Keep clearance immediately; reserve inspection for confirmed arrival."""
         wall = _bb_get(blackboard, 'verify_wall_latest', None)
-        limit = self.config['verify_smoke_standoff'] + 2 * self.config.get(
-            'position_tolerance', 0.3)
+        limit = self.config['verify_smoke_inspection_max_distance']
         if wall is not None:
-            if self._retreat_from_wall(blackboard):
-                return 'reacquire'
+            if self._wall_distance(wall) < self.config['verify_smoke_standoff']:
+                if self._retreat_from_wall(blackboard):
+                    return 'reacquire'
+                self.executive._report(
+                    'Verify: tentative close wall; holding for a second fresh close '
+                    'observation before wall-based retreat')
+                return self._wait_for_wall(blackboard)
             if self._wall_distance(wall) <= limit:
                 if self._at_known_wall(blackboard):
                     return 'ready'
@@ -662,6 +684,8 @@ class VerifyController:
         return 'approach'
 
     def _retreat_from_wall(self, blackboard):
+        if _bb_get(blackboard, 'verify_wall_close_count', 0) < 2:
+            return False
         walls = _bb_get(blackboard, 'verify_smoke_walls', [])
         if not walls:
             return False
@@ -677,13 +701,25 @@ class VerifyController:
             setattr(target.position, axis,
                     getattr(target.position, axis) - retreat * wall['axis'][i])
         self.executive._report(
-            'Verify: inside measured smoke standoff; attempting checked retreat')
+            'Verify: confirmed close wall on two fresh maps; attempting checked retreat')
         moved = self.executive._verify_recovery_plan_to(
-            target, geometry=self._wall_geometry(blackboard),
+            target, geometry={**self._wall_geometry(blackboard),
+                              'safety_recovery_reason': 'confirmed_smoke_wall_inside_standoff',
+                              'confirmed_wall_retreat': True},
             guard=lambda: self._movement_guard(blackboard), preserve_requested_altitude=True)
         if moved is False:
             raise self.error_type('Verify: measured-wall retreat blocked; holding for operator')
         blackboard['verify_inspection_after_ns'] = self._now_ns()
+        # The bounded recheck is a stationary sensor decision. A necessary
+        # validated retreat must not use up that window before it can begin.
+        blackboard['verify_wall_latest'] = None
+        blackboard['verify_wall_near_count'] = 0
+        blackboard['verify_wall_close_count'] = 0
+        blackboard['verify_wall_recheck_deadline'] = (
+            time.monotonic() + self.config['verify_wall_recheck_timeout'])
+        self.executive._report(
+            'Verify: confirmed-wall retreat completed; starting stationary wall recheck '
+            f'for {self.config["verify_wall_recheck_timeout"]:g} s')
         return True
 
     def _capture_height_hint(self, blackboard):
@@ -862,6 +898,10 @@ class VerifyController:
 
     def _recover_fire_height(self, blackboard):
         """Use remembered height alone only when no fresh bearing permits a combined leg."""
+        if _bb_get(blackboard, 'verify_wall_recheck_deadline', None) is not None:
+            # Wall reconfirmation holds all optional translation. Retain the
+            # hint so a fresh far reading can release this hold without loss.
+            return False
         fire = self._remembered_height_fire(blackboard)
         if fire is None or fire is False:
             return False
@@ -1413,7 +1453,9 @@ class VerifyController:
             self.executive._report(
                 f'Verify/CENTER_FIRE: 3 x 3 m smoke wall mean={wall["mean"]:.2f} m, '
                 f'nearest={wall["nearest"]:.2f} m, uncertainty={wall["uncertainty"]:.2f} m')
-            at_standoff = smoke_wall_standoff_reached(wall, standoff, tolerance)
+            at_standoff = smoke_wall_standoff_reached(
+                wall, standoff, tolerance,
+                max_distance=self.config['verify_smoke_inspection_max_distance'])
             if height_blocked and not at_standoff:
                 if self._height_floor_rejected(vertical):
                     self._defer_descent(blackboard)

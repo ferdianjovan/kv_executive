@@ -677,7 +677,7 @@ def test_local_standoff_tolerates_only_submicrometre_roundoff(executive):
 
 def test_unranged_recovery_keeps_requested_heading_and_validates_known_free_corridor(executive):
     target = deepcopy(executive.odometry.pose.pose)
-    target.position.z += 2.0
+    target.position.z += 0.5
     target.orientation = quaternion_from_yaw(0.7)
 
     assert executive._verify_recovery_plan_to(target)
@@ -859,10 +859,13 @@ def test_coarse_advance_cannot_request_more_than_ten_metres(executive):
 
 
 def test_coarse_approach_raises_altitude_above_observed_terrain(executive):
-    executive.ground_z = 25.0
+    # The current body is below its terrain clearance floor, so a bounded
+    # required climb remains available even when it exceeds ordinary pursuit.
+    executive.ground_z = 16.0
+    executive.config['verify_navigation_preferred_agl'] = 5.0
     assert executive._verify_localization_viewpoint(coarse_geometry(), index=0)
     assert executive.odometry.pose.pose.position.x == 3.0
-    assert executive.odometry.pose.pose.position.z == pytest.approx(30.4)
+    assert executive.odometry.pose.pose.position.z == pytest.approx(21.4)
 
 
 def test_rejected_coarse_advance_can_try_an_ordinary_safe_observation_view(executive):
@@ -893,7 +896,7 @@ def test_coarse_approach_service_errors_do_not_turn_into_optional_viewpoints(exe
 def test_ranged_recovery_ignores_fire_coordinates(executive):
     geometry = target_geometry()
     target = deepcopy(executive.odometry.pose.pose)
-    target.position.z += 2.0
+    target.position.z += 0.5
 
     assert executive._verify_recovery_plan_to(target, geometry)
 
@@ -956,7 +959,9 @@ def test_unknown_source_navigation_prefers_forward_oblique_terrain_relative_goal
     assert executive._verify_navigation_viewpoint(0.0, geometry=geometry)
 
     target = executive.odometry.pose.pose
-    assert target.position == Point(x=3.0, y=1.5, z=11.1)
+    # The preferred 11.1 m goal exceeds the bounded safety climb. The lower
+    # clearance band still provides a terrain-safe forward/oblique leg.
+    assert target.position == Point(x=3.0, y=1.5, z=8.9)
     planned = next(event[1] for event in executive.events if event[0] == 'inspection_plan')
     assert planned.minimum_agl == 5.0
     assert planned.allow_initial_climb and planned.allow_terrain_escape
@@ -1144,15 +1149,16 @@ def test_forward_only_never_replaces_blocked_progress_with_lateral_motion(
                    for event in executive.events if event[0] == 'status')
 
 
-@pytest.mark.parametrize('safe_height,expected_z', [(8.0, 7.4), (12.0, 12.1)])
+@pytest.mark.parametrize('safe_height,expected_z', [(8.0, 7.4), (10.0, 10.1)])
 def test_navigation_tries_other_clearance_bands_when_preferred_goal_is_unavailable(
         executive, safe_height, expected_z):
     executive.odometry.pose.pose.position.z = 5.0
+    executive.config['verify_navigation_max_agl'] = 8.0
 
     def band_clearance(request, response):
         if len(request.corridor.poses) > 1:
             height = request.corridor.poses[-1].pose.position.z
-            response.corridor_safe = height < safe_height if safe_height == 8.0 else height > 12.0
+            response.corridor_safe = height < safe_height if safe_height == 8.0 else height > 10.0
 
     executive.on_query = band_clearance
 
@@ -1233,7 +1239,7 @@ def test_missing_ground_height_rejects_a_descending_planner_detour(executive):
     validate = plan[2]['path_validator']
     path = Path(header=header(), poses=[
         PoseStamped(pose=Pose(position=Point(z=20.0))),
-        PoseStamped(pose=Pose(position=Point(x=1.5, z=18.0))),
+        PoseStamped(pose=Pose(position=Point(x=1.5, z=19.5))),
         PoseStamped(pose=Pose(position=Point(x=3.0, z=20.0))),
     ])
 
@@ -1330,7 +1336,15 @@ def test_navigation_candidate_budget_is_bounded_when_all_routes_are_occupied(exe
     executive.on_query = blocked_destination
     assert not executive._verify_navigation_viewpoint(0.0)
 
-    assert len([event for event in executive.events if event[0] == 'inspection_plan']) == 6
+    candidates = [event for event in executive.events
+                  if event[0] == 'status'
+                  and event[1].startswith('Verify: terrain navigation candidate ')]
+    assert len(candidates) == 6
+    # A candidate withheld by the motion limit consumes the same search budget
+    # as a candidate that reaches the native planner.
+    assert len([event for event in executive.events if event[0] == 'inspection_plan']) < 6
+    assert any('proposed destination rejected' in event[1]
+               for event in executive.events if event[0] == 'status')
     assert executive.odometry.pose.pose.position == Point(z=5.0)
 
 
@@ -1379,9 +1393,12 @@ def test_recovery_destination_is_raised_above_the_terrain_floor(executive):
     assert request.minimum_agl == 5.0 and request.allow_terrain_escape
 
 
-@pytest.mark.parametrize('requested_z, expected_z', [(19.5, 19.5), (3.0, 7.4)])
+@pytest.mark.parametrize('current_z, requested_z, expected_z', [
+    (20.0, 19.5, 19.5), (7.8, 7.3, 7.4),
+])
 def test_vertical_image_centering_can_descend_only_to_the_observed_terrain_floor(
-        executive, requested_z, expected_z):
+        executive, current_z, requested_z, expected_z):
+    executive.odometry.pose.pose.position.z = current_z
     target = deepcopy(executive.odometry.pose.pose)
     target.position.z = requested_z
 
@@ -1554,7 +1571,7 @@ def test_exhausted_start_recovery_does_not_repeat_for_each_destination(executive
     assert len(calls) == 1
 
 
-def test_navigation_can_use_a_retreating_tangent_to_follow_convex_terrain(executive):
+def test_ordinary_navigation_rejects_a_retreating_tangent_around_convex_terrain(executive):
     def only_retreating_tangent(request, response):
         if len(request.corridor.poses) > 1:
             endpoint = request.corridor.poses[-1].pose.position
@@ -1562,11 +1579,14 @@ def test_navigation_can_use_a_retreating_tangent_to_follow_convex_terrain(execut
 
     executive.on_query = only_retreating_tangent
 
-    assert executive._verify_navigation_viewpoint(0.0)
+    before = deepcopy(executive.odometry.pose.pose)
+    assert not executive._verify_navigation_viewpoint(0.0)
 
-    endpoint = executive.odometry.pose.pose.position
-    assert endpoint == Point(x=-0.75, y=3.0, z=20.0)
+    assert executive.odometry.pose.pose == before
     assert len([event for event in executive.events if event[0] == 'inspection_plan']) <= 18
+    assert any('proposed destination rejected' in event[1]
+               and 'backward=0.75 m' in event[1] and 'ordinary approach' in event[1]
+               for event in executive.events if event[0] == 'status')
 
 
 def test_enu_geolocation_changes_target_coordinates_in_correct_directions(executive):
@@ -2638,6 +2658,107 @@ def test_wall_probe_explains_excessive_range_spread(executive):
     assert executive._verify_opportunistic_wall('rgb_camera', 0.0) is None
     assert any('uncertainty=2.50 m exceeds' in event[1] for event in executive.events
                if event[0] == 'status')
+
+
+def _smoke_camera_roi(executive):
+    smoke = executive.smoke
+    smoke.angular_bounds_valid = True
+    smoke.yaw_correction_rad = 0.1
+    smoke.vertical_correction_rad = -0.25
+    smoke.yaw_min_rad, smoke.yaw_max_rad = -0.1, 0.3
+    smoke.vertical_min_rad, smoke.vertical_max_rad = -0.4, -0.1
+    executive.smoke_wall_valid = True
+    return smoke
+
+
+def test_wall_probe_associates_hits_with_actual_rgb_smoke_bounds_and_height(executive):
+    smoke = _smoke_camera_roi(executive)
+    wall = executive._verify_opportunistic_wall('thermal_camera', 1.2)
+    request = next(event[1] for event in executive.events if event[0] == 'query')
+    assert request.smoke_wall_reject_terrain
+    assert request.smoke_wall_camera_roi
+    assert request.origin.header.frame_id == smoke.header.frame_id
+    assert request.direction.header.frame_id == smoke.header.frame_id
+    assert request.smoke_camera_header == smoke.header
+    assert request.direction.vector.x == 1.0
+    assert request.direction.vector.y == pytest.approx(math.tan(0.1))
+    assert request.direction.vector.z == pytest.approx(math.tan(-0.25))
+    assert (request.smoke_yaw_min_rad, request.smoke_yaw_max_rad,
+            request.smoke_vertical_min_rad, request.smoke_vertical_max_rad) == pytest.approx(
+                (-0.1, 0.3, -0.4, -0.1))
+    assert wall['camera_frame'] == smoke.header.frame_id
+    assert wall['camera_associated']
+    assert wall['smoke_camera_stamp_ns'] == 100_000_000_000
+
+
+@pytest.mark.parametrize('failure', ['stale', 'unconfirmed', 'reversed', 'nonfinite', 'outside'])
+def test_explicit_invalid_camera_bounds_cannot_silently_use_an_ungated_wall(executive, failure):
+    smoke = _smoke_camera_roi(executive)
+    if failure == 'stale':
+        smoke.header.stamp = header(executive.now - 3.0).stamp
+    elif failure == 'unconfirmed':
+        smoke.status = 2
+    elif failure == 'reversed':
+        smoke.yaw_min_rad = 0.5
+    elif failure == 'nonfinite':
+        smoke.vertical_min_rad = math.nan
+    else:
+        smoke.yaw_correction_rad = 0.6
+    assert executive._verify_opportunistic_wall('rgb_camera', 0.0) is None
+    assert not any(event[0] == 'query' for event in executive.events)
+
+
+@pytest.mark.parametrize('failure', ['lost', 'moved', 'aged'])
+def test_camera_association_is_rechecked_after_blocking_wall_measurement(executive, failure):
+    _smoke_camera_roi(executive)
+
+    def changed_smoke(request, response):
+        if failure == 'lost':
+            executive.smoke.detected = False
+        elif failure == 'moved':
+            executive.smoke.yaw_min_rad = 0.7
+            executive.smoke.yaw_max_rad = 0.9
+            executive.smoke.yaw_correction_rad = 0.8
+        else:
+            executive.now += 3.0
+
+    executive.on_query = changed_smoke
+    assert executive._verify_opportunistic_wall('rgb_camera', 0.0) is None
+
+
+def test_missing_camera_roi_keeps_terrain_guard_without_claiming_image_association(executive):
+    executive.smoke_wall_valid = True
+    wall = executive._verify_opportunistic_wall('rgb_camera', 0.0)
+    request = next(event[1] for event in executive.events if event[0] == 'query')
+    assert request.smoke_wall_reject_terrain
+    assert not request.smoke_wall_camera_roi
+    assert not wall['camera_associated']
+
+
+def test_missing_source_image_transform_is_an_unavailable_association_not_a_map_outage(executive):
+    _smoke_camera_roi(executive)
+
+    def missing_camera_transform(request, response):
+        response.success = False
+        response.error_code = 3
+        response.message = 'No camera transform at the smoke image time'
+
+    executive.on_query = missing_camera_transform
+    assert executive._verify_opportunistic_wall('rgb_camera', 0.0) is None
+
+
+def test_invalid_camera_request_remains_a_programming_error(executive):
+    from kv_executive.mission_executive import MissionError
+    _smoke_camera_roi(executive)
+
+    def invalid_request(request, response):
+        response.success = False
+        response.error_code = 2
+        response.message = 'Invalid camera ROI request'
+
+    executive.on_query = invalid_request
+    with pytest.raises(MissionError, match='Invalid camera ROI request'):
+        executive._verify_opportunistic_wall('rgb_camera', 0.0)
 
 
 def test_legacy_single_ray_cannot_authorize_a_negative_report_without_aperture(executive):

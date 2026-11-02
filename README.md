@@ -477,8 +477,10 @@ it. The five-second detector wait starts after stopping and cannot cut a climb.
 Ordinary fire-guided legs and successful arrival reports require fresh post-stop
 fire guidance; the one-shot edge-recovery search is the bounded exception above.
 The approach is bounded by 64 legs and a 600-second real-time inspection deadline.
-A positive report requires fresh confirmed fire and a fresh wall measurement at
-the configured standoff, checked again before publication. Blocked movement,
+A positive report requires fresh confirmed fire and a fresh wall measurement in
+the configured 15–20 m inspection band, checked again before publication. The
+distance used is the nearest qualifying return minus its uncertainty; the
+maximum accepted uncertainty remains 2 m. Blocked movement,
 step exhaustion and timeout do not authorize success. A zero step limit permits
 reporting only when already at the measured standoff. Fire coordinates, when
 independently available, remain optional report metadata. The inspection timer
@@ -491,7 +493,16 @@ terrain-aware forward steps (`verify_navigation_step`, 3 m by default). It tries
 straight 3 m, 1.5 m and 0.75 m candidates and bounded forward-oblique candidates
 to both sides. Level destinations across the fan precede terrain-required climbs,
 so a high straight-ahead terrain estimate cannot preempt a lower side route.
-Every route still requires full corridor validation. An upper-image smoke cue
+Every route still requires full corridor validation. Ordinary routes also limit
+the entire path to 1 m of rise, 1 m of drop, 0.3 m of backward travel and 12 m of
+length, relative to the leg's starting pose and selected bearing. Intermediate
+vertices and actual progress during execution are checked, so a forward endpoint
+cannot hide a backward or high detour. Rejected candidates leave shorter and
+side alternatives available. A measured current terrain-floor violation or a
+wall confirmed too close on two fresh maps permits bounded safety recovery
+(6 m rise, 1 m drop, 3.3 m backward travel); collision and terrain checks still
+apply. Logs give route extrema, length and the recovery reason.
+An upper-image smoke cue
 does not command a separate altitude correction. Ordinary pursuit retains
 positive forward progress; the separate checked retreat applies only inside a
 measured boundary.
@@ -527,6 +538,26 @@ four image regions is observation information: it neither stops smoke navigation
 nor independently starts timed inspection. A static first-hit obstacle alone
 cannot prove a smoke boundary. A stale, unknown or non-plume
 surface cannot establish a negative inspection result.
+Production aperture probes reject an inclined plane supported by earlier maps
+before counting flickering returns. This rejects stable sloping terrain whose
+voxel occupancy jitters, while leaving its occupied cells in the collision map.
+The geometry is a heuristic: persistent inclined smoke can resemble terrain and
+be rejected. Confirmed RGB smoke detections also publish an angular rectangle;
+when available, qualifying hits must project into that fresh camera region.
+Invalid or stale explicit image bounds cannot silently bypass association.
+Legacy producers without bounds retain terrain-guarded probing, without claiming
+camera association. An image rectangle is not proof of smoke at a specific depth.
+
+One close observation holds position for reconfirmation. Wall-based retreat
+requires two fresh close observations below 15 m; two prior observations in the
+inspection band do not authorize retreat on one later close glitch. Two fresh
+observations at or within 20 m confirm proximity; inspection requires the current
+measurement to be in the 15–20 m band. This permits `CENTER_FIRE` with confirmed
+fire or `SEARCH_FIRE` otherwise. Fresh evidence beyond 20 m resumes approach. The
+20-second stationary recheck window starts again after a required retreat
+finishes; that movement does not consume its reconfirmation time. The overall
+600-second inspection deadline keeps its existing start and is never reset by
+these state transitions or retreats.
 When a qualifying aperture measurement is available outside the boundary, its
 remaining measured clearance limits the selected smoke leg and validated path.
 Without qualifying evidence, a short
@@ -1002,10 +1033,22 @@ KV_RUN_WALL_FALSE_POSITIVE_BENCHMARK=1 \
   -m pytest -q -s src/kv_executive/test/test_smoke_wall_false_positives.py
 ```
 
-The benchmark writes a [readable report](test/reports/smoke_wall_false_positives_20261102.md)
-and [raw measurements](test/reports/smoke_wall_false_positives_20261102.json).
+The original [readable report](test/reports/smoke_wall_false_positives_20261102.md)
+and [raw measurements](test/reports/smoke_wall_false_positives_20261102.json)
+are retained. A paired guarded rerun writes a
+[comparison report](test/reports/smoke_wall_false_positives_guarded_20261102.md)
+and [raw measurements](test/reports/smoke_wall_false_positives_guarded_20261102.json).
+On the same 240 synthetic terrain episodes the unguarded estimator qualified
+false walls in 175 episodes and the guarded estimator in zero. Smoke positive
+controls run separately. This result does not measure the rate in flight or
+prove that all terrain or smoke shapes are classified correctly.
 Set `KV_WALL_FALSE_POSITIVE_REPORT_DIR` to keep a rerun's output elsewhere.
 No live mission or detector thresholds are changed by these tests.
+
+The package repositories are tagged
+`checkpoint-before-wall-validation-motion-limits-20261102` before these changes.
+Rollback of the executive and perception must be paired and followed by a rebuild
+and restart because their ROS message and service interfaces changed together.
 
 Detection monitor tests cover either detector independently, confirmed-status
 gating, stale/future/zero source stamps, goal and phase boundaries, duplicate

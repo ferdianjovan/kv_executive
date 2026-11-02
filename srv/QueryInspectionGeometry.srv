@@ -6,6 +6,17 @@ float64 max_range
 # Opt-in CENTER_FIRE measurement: side length of a square of parallel camera
 # +X rays, spanning camera Y/Z. Zero leaves all existing queries unchanged.
 float64 smoke_wall_width
+# Reject a spatially coherent inclined surface already present in earlier maps.
+# This only affects smoke classification; occupied cells remain obstacles.
+bool smoke_wall_reject_terrain
+# Optionally associate aperture hits with a fresh confirmed camera smoke region.
+# Camera coordinates are +X forward, +Y left, +Z up. Angles are radians.
+bool smoke_wall_camera_roi
+std_msgs/Header smoke_camera_header
+float64 smoke_yaw_min_rad
+float64 smoke_yaw_max_rad
+float64 smoke_vertical_min_rad
+float64 smoke_vertical_max_rad
 geometry_msgs/PointStamped ground_query
 nav_msgs/Path corridor
 geometry_msgs/PointStamped keepout_center

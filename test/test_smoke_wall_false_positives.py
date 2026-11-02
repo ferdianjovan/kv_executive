@@ -6,6 +6,7 @@ rates measure the effect of map registration jitter, not real mission prevalence
 
 from collections import defaultdict
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
@@ -33,6 +34,7 @@ SLOPES = (1.0, 2.0)
 DISTANCES = (8.0, 16.0, 24.0)
 ORIGIN = (0.1, 0.1, 6.1)
 RAY_GRID = tuple((row, column) for row in range(-2, 3) for column in range(-2, 3))
+RULES = ('accepted_3_2_2', 'counterfactual_6_3_3', 'terrain_guard_3_2_2')
 planner_factory = planner_fixture
 
 
@@ -164,16 +166,21 @@ def _episode_events(observations, rule):
         if observation['stamp_ns'] <= last_accepted_stamp:
             continue
         last_accepted_stamp = observation['stamp_ns']
-        near = observation['conservative_range_m'] <= 15.6
+        near = _rule_distance(observation, rule) <= 15.6
         streak = streak + 1 if near else 0
         confirmed = confirmed or streak >= 2
     return {
         'any_accepted': any(o[rule] for o in observations),
-        'any_near': any(o[rule] and o['conservative_range_m'] <= 15.6 for o in observations),
+        'any_near': any(o[rule] and _rule_distance(o, rule) <= 15.6 for o in observations),
         'retreat_eligible': any(
-            o[rule] and o['conservative_range_m'] < 15.0 for o in observations),
+            o[rule] and _rule_distance(o, rule) < 15.0 for o in observations),
         'two_successive_near_maps': confirmed,
     }
+
+
+def _rule_distance(observation, rule):
+    return observation.get('guarded_conservative_range_m') if rule == 'terrain_guard_3_2_2' else (
+        observation['conservative_range_m'])
 
 
 def _wilson(successes, count):
@@ -187,7 +194,7 @@ def _wilson(successes, count):
 
 def _summarize(episodes):
     result = {'episodes': len(episodes), 'queries': sum(len(e['observations']) for e in episodes)}
-    for rule in ('accepted_3_2_2', 'counterfactual_6_3_3'):
+    for rule in RULES:
         events = [_episode_events(episode['observations'], rule) for episode in episodes]
         rule_result = {}
         for event in ('any_accepted', 'any_near', 'retreat_eligible', 'two_successive_near_maps'):
@@ -212,17 +219,23 @@ def _write_reports(episodes, elapsed):
     directory = Path(os.environ.get(
         'KV_WALL_FALSE_POSITIVE_REPORT_DIR', str(Path(__file__).parent / 'reports')))
     directory.mkdir(parents=True, exist_ok=True)
-    stem = directory / 'smoke_wall_false_positives_20261102'
+    stem = directory / 'smoke_wall_false_positives_guarded_20261102'
     grouped = defaultdict(list)
     for episode in episodes:
         grouped[(episode['slope'], episode['jitter_half_width_m'])].append(episode)
     groups = [{'slope': slope, 'jitter_half_width_m': jitter,
                **_summarize(values)} for (slope, jitter), values in sorted(grouped.items())]
+    repository = Path(__file__).resolve().parents[1]
     commit = subprocess.check_output(
-        ['git', '-C', str(Path(__file__).resolve().parents[1]), 'rev-parse', 'HEAD'],
-        text=True).strip()
+        ['git', '-C', str(repository), 'rev-parse', 'HEAD'], text=True).strip()
+    modified = bool(subprocess.check_output(
+        ['git', '-C', str(repository), 'status', '--porcelain'], text=True).strip())
     report = {
         'generated_utc': datetime.now(timezone.utc).isoformat(), 'commit': commit,
+        'native_source_sha256': hashlib.sha256(
+            (Path(__file__).resolve().parents[1] / 'src' / 'planner_node.cpp').read_bytes()
+        ).hexdigest(),
+        'working_tree_modified': modified,
         'seed': SEED, 'elapsed_wall_seconds': elapsed, 'resolution_m': RESOLUTION,
         'frames_per_episode': FRAMES_PER_EPISODE, 'episodes_per_group': EPISODES_PER_GROUP,
         'aperture_m': 3.0, 'rays': 25, 'distances_m': DISTANCES,
@@ -239,6 +252,10 @@ def _write_reports(episodes, elapsed):
             'Fixed viewpoint: retreat-eligible events do not mean a retreat was flown.',
             'Two-successive-near gate is evaluated without executing the intervening retreat.',
             'Counterfactual 6/3/3 uses current native returns and statistics, not an old binary.',
+            'Terrain-guard results use a second real native query against the identical map; '
+            'camera association and control decisions are tested separately.',
+            'A stable inclined plane is geometrically ambiguous: this guard can reject a '
+            'persistent slanted smoke front. Vertical and irregular front controls remain valid.',
             'Query samples within an episode are correlated; Wilson intervals use episodes only.',
             'Every first map is a history warm-up with zero qualifying rays; separate summaries '
             'exclude it and show the eighth-map-only result.',
@@ -251,8 +268,9 @@ def _write_reports(episodes, elapsed):
     }
     stem.with_suffix('.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
     lines = [
-        '# Smoke-wall false-positive sensitivity benchmark', '',
-        f'Native planner commit: `{commit}`. Seed: `{SEED}`. Runtime: {elapsed:.2f} s.', '',
+        '# Smoke-wall false-positive sensitivity benchmark with terrain rejection', '',
+        f'Baseline commit: `{commit}` (modified native source; SHA256 recorded in JSON). '
+        f'Seed: `{SEED}`. Runtime: {elapsed:.2f} s.', '',
         '**These are controlled no-smoke terrain stress tests, not a measured mission rate.**', '',
         f'{len(episodes)} independent episodes, {FRAMES_PER_EPISODE} maps each; '
         '20 cm OctoMap cells and the real 25-ray, 3 × 3 m native estimator.', '',
@@ -260,13 +278,14 @@ def _write_reports(episodes, elapsed):
         'Ranges 8, 16 and 24 m are balanced within every group. The terrain stays physically '
         'static while its mapped depth shifts uniformly by the stated amount per frame.', '',
         '| Slope | Jitter ±m | Episodes | Any accepted 3/2/2 | Any accepted 6/3/3 | '
-        'Retreat-eligible 3/2/2 | Two near maps 3/2/2 |',
+        'Any accepted with terrain guard | Retreat-eligible with guard |',
         '|---:|---:|---:|---:|---:|---:|---:|',
     ]
     for group in groups:
         new, old = group['accepted_3_2_2'], group['counterfactual_6_3_3']
-        values = (new['any_accepted'], old['any_accepted'], new['retreat_eligible'],
-                  new['two_successive_near_maps'])
+        guard = group['terrain_guard_3_2_2']
+        values = (new['any_accepted'], old['any_accepted'], guard['any_accepted'],
+                  guard['retreat_eligible'])
         formatted = [f'{value["count"]}/{group["episodes"]} ({value["rate"]:.1%})'
                      for value in values]
         lines.append(f'| {math.degrees(math.atan(group["slope"])):.1f}° | '
@@ -283,7 +302,7 @@ def _write_reports(episodes, elapsed):
                      f'(episode Wilson 95% interval {low:.1%}–{high:.1%}); '
                      f'6/3/3 counterfactual: {old["count"]}/{summary["episodes"]} '
                      f'({old["rate"]:.1%}).')
-        for rule in ('accepted_3_2_2', 'counterfactual_6_3_3'):
+        for rule in RULES:
             after_first = summary[rule]['accepted_queries_after_first_map']
             final = summary[rule]['last_frame_accepted']
             low, high = final['wilson_95']
@@ -293,7 +312,7 @@ def _write_reports(episodes, elapsed):
                          f'{final["count"]}/{final["queries"]} ({final["rate"]:.1%}), '
                          f'episode Wilson 95% interval {low:.1%}–{high:.1%}.')
     lines.extend(['', '## Equally weighted aggregate', ''])
-    for rule in ('accepted_3_2_2', 'counterfactual_6_3_3'):
+    for rule in RULES:
         result = report['overall'][rule]
         lines.append(f'**{rule}**')
         lines.append('')
@@ -353,6 +372,20 @@ def test_static_terrain_registration_jitter_smoke_wall_false_positive_rates(plan
     positive = _publish_and_query(planner, calibration_frame, _terrain_map(8.0, 2.0, 0.0, 0.0))
     assert positive.smoke_wall_valid and positive.smoke_wall_samples == 25, positive.message
     assert _observation(positive)['accepted_3_2_2']
+    control = _request(calibration_frame)
+    control.smoke_wall_reject_terrain = True
+    assert planner.query_geometry(control).smoke_wall_valid  # A new volume has no terrain history.
+
+    # A repeatedly observed vertical smoke front must not be classified as
+    # terrain solely because older occupied returns remain nearby.
+    front_frame = 'wall_benchmark_vertical_positive_control'
+    _publish_and_query(
+        planner, front_frame, _terrain_map(16.0, math.inf, 0.03, 0.0, free_surface=True))
+    for _ in range(3):
+        _publish_and_query(planner, front_frame, _terrain_map(16.0, math.inf, 0.03, 0.0))
+        control = _request(front_frame)
+        control.smoke_wall_reject_terrain = True
+        assert planner.query_geometry(control).smoke_wall_valid
 
     rng = random.Random(SEED)
     episodes = []
@@ -368,6 +401,25 @@ def test_static_terrain_registration_jitter_smoke_wall_false_positive_rates(plan
                     response = _publish_and_query(
                         planner, frame, _terrain_map(distance, slope, phase, translation))
                     observation = _observation(response)
+                    guarded_request = _request(frame)
+                    guarded_request.smoke_wall_reject_terrain = True
+                    guarded_response = planner.query_geometry(guarded_request)
+                    assert guarded_response.success, guarded_response.message
+                    assert guarded_response.map_header == response.map_header
+                    guarded = _observation(guarded_response)
+                    # Preserve both native responses for inspecting a rejected
+                    # estimate instead of inferring it from aggregate counters.
+                    observation['baseline_diagnostic'] = response.message
+                    observation['guarded_native_response'] = {
+                        **guarded, 'diagnostic': guarded_response.message}
+                    observation['terrain_guard_3_2_2'] = guarded['accepted_3_2_2']
+                    observation['guarded_conservative_range_m'] = guarded['conservative_range_m']
+                    observation['guarded_qualifying_rays'] = guarded['qualifying_rays']
+                    excluded = re.search(
+                        r'stable terrain rays excluded=(\d+)', guarded_response.message)
+                    assert excluded, guarded_response.message
+                    observation['terrain_rays_excluded'] = int(excluded.group(1))
+                    assert not observation['terrain_guard_3_2_2'], guarded_response.message
                     if index == 0:
                         assert observation['qualifying_rays'] == 0, response.message
                     if observations:

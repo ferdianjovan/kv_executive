@@ -132,6 +132,16 @@ mission_executive:
     verify_navigation_no_progress_max: 2
     # Proximity to a fresh observed plume/smoke-wall proxy, never fire distance.
     verify_smoke_standoff: 15.0
+    verify_smoke_inspection_max_distance: 20.0
+    # Ordinary approach never uses large detours or climbs to chase an endpoint.
+    verify_approach_max_rise: 1.0
+    verify_approach_max_drop: 1.0
+    verify_approach_max_backtrack: 0.3
+    verify_approach_max_path_length: 12.0
+    # These wider limits require a measured current hazard or confirmed near wall.
+    verify_recovery_max_rise: 6.0
+    verify_recovery_max_drop: 1.0
+    verify_recovery_max_backtrack: 3.3
     # Clearance above a validated observed support surface; unknown means no descent.
     verify_inspection_altitude: 3.0
     verify_inspection_lateral_step: 5.0

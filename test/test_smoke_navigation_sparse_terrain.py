@@ -115,7 +115,7 @@ def test_fire_guided_descent_uses_native_terrain_checks(planner_factory, ground_
         assert checked.success and checked.corridor_safe, checked.message
 
 
-def test_smoke_advances_over_missing_ground_then_climbs_for_observed_terrain(planner_factory):
+def test_smoke_advances_over_missing_ground_then_shortens_leg_before_new_canopy(planner_factory):
     planner = _terrain_planner(
         planner_factory, ground_absent=True, planner_parameters={
             'inspection_require_observed_free_space': None,
@@ -143,5 +143,13 @@ def test_smoke_advances_over_missing_ground_then_climbs_for_observed_terrain(pla
 
     assert probe._verify_navigation_viewpoint(0.0, forward_only=True), probe.messages
     assert len(probe.paths) == 3
-    assert probe.pose.position.x == pytest.approx(3.0)
-    assert probe.pose.position.z > 11.5  # Observed canopy is 6.5 m, plus clearance.
+    # The canopy is ahead of the body. That future obstacle cannot authorize
+    # an oversized safety climb; choose a shorter level leg while it is clear.
+    assert probe.pose.position.x == pytest.approx(1.5)
+    assert probe.pose.position.z == pytest.approx(10.0)
+    assert all(vertex.pose.position.z <= 11.0 for vertex in probe.paths[-1].poses)
+    assert any('proposed destination rejected' in text and 'ordinary approach' in text
+               for text in probe.messages)
+    checked = planner.query_geometry(QueryInspectionGeometry.Request(
+        corridor=probe.paths[-1], minimum_agl=5.0, terrain_envelope=True))
+    assert checked.success and checked.corridor_safe, checked.message

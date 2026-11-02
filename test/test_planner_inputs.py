@@ -250,7 +250,8 @@ class PlannerHarness:
 @pytest.fixture
 def planner_factory(monkeypatch, tmp_path):
     # Never discover a real planner, MAVROS, or PX4 instance on this machine.
-    monkeypatch.setenv('ROS_DOMAIN_ID', str(160 + os.getpid() % 30))
+    monkeypatch.setenv('ROS_DOMAIN_ID', os.environ.get(
+        'ROS_DOMAIN_ID', str(160 + os.getpid() % 30)))
     monkeypatch.setenv('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST')
     monkeypatch.setenv('ROS_LOG_DIR', str(tmp_path / 'ros_logs'))
     planners = []
@@ -1765,3 +1766,162 @@ def test_wall_aperture_observation_identity_tracks_new_current_support(planner_f
     second = planner.query_geometry(request)
     assert second.smoke_wall_valid
     assert second.map_header.stamp == second_map.header.stamp != first.map_header.stamp
+
+
+@pytest.mark.parametrize('slope', [1.0, 2.0])
+def test_wall_guard_rejects_previously_observed_jittering_inclined_terrain(
+        planner_factory, slope):
+    from test_smoke_wall_false_positives import _publish_and_query, _request, _terrain_map
+    planner = planner_factory()
+    frame = 'guarded_inclined_terrain'
+    _publish_and_query(planner, frame, _terrain_map(12.0, slope, 0.03, 0.09))
+    baseline = _publish_and_query(planner, frame, _terrain_map(12.0, slope, 0.03, -0.09))
+    assert baseline.smoke_wall_valid and baseline.smoke_wall_samples >= 3
+    request = _request(frame)
+    request.smoke_wall_reject_terrain = True
+    guarded = planner.query_geometry(request)
+    assert guarded.success and not guarded.smoke_wall_valid, guarded.message
+    assert 'stable terrain rays excluded=25' in guarded.message
+    assert 'prior terrain support=25' in guarded.message
+
+
+def test_wall_guard_preserves_repeated_vertical_smoke_fronts(planner_factory):
+    from test_smoke_wall_false_positives import _publish_and_query, _request, _terrain_map
+    planner = planner_factory()
+    frame = 'guarded_vertical_smoke'
+    _publish_and_query(
+        planner, frame, _terrain_map(16.0, math.inf, 0.01, 0.0, free_surface=True))
+    _publish_and_query(planner, frame, _terrain_map(16.0, math.inf, 0.01, 0.0))
+    request = _request(frame)
+    request.smoke_wall_reject_terrain = True
+    for _ in range(3):
+        _publish_and_query(planner, frame, _terrain_map(16.0, math.inf, 0.01, 0.0))
+        result = planner.query_geometry(request)
+        assert result.success and result.smoke_wall_valid, result.message
+        assert result.smoke_wall_samples == 25
+        assert 'stable terrain rays excluded=0' in result.message
+
+
+def test_wall_guard_does_not_call_a_new_inclined_volume_preexisting_terrain(planner_factory):
+    from test_smoke_wall_false_positives import _publish_and_query, _request, _terrain_map
+    planner = planner_factory()
+    frame = 'new_inclined_volume'
+    _publish_and_query(planner, frame, _terrain_map(16.0, 1.0, 0.0, 0.0, free_surface=True))
+    _publish_and_query(planner, frame, _terrain_map(16.0, 1.0, 0.0, 0.0))
+    request = _request(frame)
+    request.smoke_wall_reject_terrain = True
+    result = planner.query_geometry(request)
+    assert result.success and result.smoke_wall_valid, result.message
+    assert result.smoke_wall_samples == 25
+
+
+def _guard_aperture_scene(*, smoke=False, curved=False, translation=0.0):
+    from test_smoke_wall_false_positives import ORIGIN, RAY_GRID, _encode_octomap, _float32, _key
+    leaves = {}
+    for row, column in RAY_GRID:
+        y = _float32(_float32(ORIGIN[1]) + column * 0.75)
+        z = _float32(_float32(ORIGIN[2]) + row * 0.75)
+        if curved:
+            depth = 16.0 + 0.6 * row * row + 0.4 * column * column + translation
+            occupied = True
+        else:
+            depth = 8.0 + row * 0.75 + column * 0.75 * 0.15 if row <= 0 else 16.0
+            occupied = row <= 0 or smoke
+        hit = _key(ORIGIN[0] + depth)
+        for x in range(_key(ORIGIN[0]), hit + 1):
+            leaves[(x, _key(y), _key(z))] = 2 if x == hit and occupied else 1
+    return _encode_octomap(leaves)
+
+
+def test_wall_guard_excludes_foreground_slope_but_preserves_smoke_above_it(planner_factory):
+    from test_smoke_wall_false_positives import _publish_and_query, _request
+    planner = planner_factory()
+    frame = 'smoke_and_foreground_slope'
+    _publish_and_query(planner, frame, _guard_aperture_scene(smoke=False))
+    _publish_and_query(planner, frame, _guard_aperture_scene(smoke=True))
+    request = _request(frame)
+    request.smoke_wall_reject_terrain = True
+    result = planner.query_geometry(request)
+    assert result.success and result.smoke_wall_valid, result.message
+    assert result.smoke_wall_samples == 10
+    assert 'stable terrain rays excluded=15' in result.message
+    assert result.smoke_wall_nearest_range > 15.0
+
+
+def test_wall_guard_does_not_reject_unstructured_returns_using_a_weak_plane_fit(planner_factory):
+    from test_smoke_wall_false_positives import _publish_and_query, _request
+    planner = planner_factory()
+    frame = 'irregular_changing_smoke'
+    _publish_and_query(planner, frame, _guard_aperture_scene(curved=True, translation=0.21))
+    _publish_and_query(planner, frame, _guard_aperture_scene(curved=True))
+    request = _request(frame)
+    request.smoke_wall_reject_terrain = True
+    result = planner.query_geometry(request)
+    assert result.success and result.smoke_wall_valid, result.message
+    assert 'stable terrain rays excluded=0' in result.message
+
+
+def _camera_association_request(planner, frame='planner_test_map'):
+    request = _inspection_request()
+    request.smoke_wall_width = 3.0
+    request.smoke_wall_camera_roi = True
+    request.smoke_camera_header.frame_id = frame
+    request.smoke_camera_header.stamp = planner.node.get_clock().now().to_msg()
+    # The test camera origin is the map origin, so the 3 m wall spans these angles.
+    request.smoke_yaw_min_rad, request.smoke_yaw_max_rad = -0.7, 0.7
+    request.smoke_vertical_min_rad, request.smoke_vertical_max_rad = -0.1, 1.0
+    return request
+
+
+def test_wall_camera_association_rejects_hits_outside_detected_smoke(planner_factory):
+    planner = planner_factory()
+    _publish_inspection_map(planner, wall=False)
+    _publish_inspection_map(planner, wall=True)
+    request = _camera_association_request(planner)
+    accepted = planner.query_geometry(request)
+    assert accepted.success and accepted.smoke_wall_valid, accepted.message
+    request.smoke_yaw_min_rad, request.smoke_yaw_max_rad = 1.0, 1.2
+    rejected = planner.query_geometry(request)
+    assert rejected.success and not rejected.smoke_wall_valid, rejected.message
+    assert 'camera-associated rays=0' in rejected.message
+
+
+def test_wall_camera_association_uses_translated_and_rotated_source_frame(planner_factory):
+    planner = planner_factory()
+    _publish_inspection_map(planner, wall=False, rotate=True)
+    _publish_inspection_map(planner, wall=True, rotate=True)
+    camera = TransformStamped()
+    camera.header.stamp = planner.node.get_clock().now().to_msg()
+    camera.header.frame_id = 'planner_test_map'
+    camera.child_frame_id = planner.namespace.strip('/') + '_rgb_camera'
+    camera.transform.translation.x = 0.125
+    camera.transform.translation.y = 0.125
+    camera.transform.translation.z = 2.125
+    camera.transform.rotation.z = math.sin(math.pi / 4.0)
+    camera.transform.rotation.w = math.cos(math.pi / 4.0)
+    planner.transform_broadcaster.sendTransform(camera)
+    request = _camera_association_request(planner, camera.child_frame_id)
+    request.direction.vector.x = 0.0
+    request.direction.vector.y = 1.0
+    request.smoke_yaw_min_rad, request.smoke_yaw_max_rad = -0.6, 0.6
+    request.smoke_vertical_min_rad, request.smoke_vertical_max_rad = -0.6, 0.6
+    response = planner.query_geometry(request)
+    assert response.success and response.smoke_wall_valid, response.message
+    assert response.smoke_wall_samples == 25
+    assert 'camera-associated rays=25' in response.message
+
+
+@pytest.mark.parametrize('problem', ['bounds', 'image_age', 'missing_frame'])
+def test_wall_camera_association_requires_valid_source_metadata(planner_factory, problem):
+    planner = planner_factory()
+    _publish_inspection_map(planner, wall=False)
+    _publish_inspection_map(planner, wall=True)
+    request = _camera_association_request(planner)
+    if problem == 'bounds':
+        request.smoke_yaw_min_rad = request.smoke_yaw_max_rad
+    elif problem == 'image_age':
+        request.smoke_camera_header.stamp.sec -= 10
+    else:
+        request.smoke_camera_header.frame_id = ''
+    response = planner.query_geometry(request)
+    assert not response.success and response.error_code == response.INVALID_REQUEST

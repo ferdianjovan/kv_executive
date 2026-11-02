@@ -1026,6 +1026,80 @@ private:
     return false;
   }
 
+  struct ApertureReturn
+  {
+    int row, column;
+    double u, v, depth, size;
+    octomap::point3d hit;
+  };
+
+  struct AperturePlane
+  {
+    bool valid{false};
+    double a{0.0}, b{0.0}, c{0.0}, residual{0.0}, up{0.0};
+    std::vector<size_t> inliers;
+  };
+
+  static AperturePlane fitAperturePlane(
+    const std::vector<ApertureReturn> & hits, const octomap::point3d & ray,
+    const octomap::point3d & side, const octomap::point3d & up, double tolerance)
+  {
+    AperturePlane best;
+    if (hits.size() < 8) {return best;}
+    const auto consider = [&](double a, double b, double c) {
+        const auto normal = ray - side * a - up * b;
+        const double vertical = std::abs(normal.z()) / normal.norm();
+        // A frontal/vertical smoke surface must not be rejected merely for
+        // persisting. This test is deliberately limited to inclined surfaces.
+        if (!std::isfinite(vertical) || vertical < 0.35) {return;}
+        std::vector<size_t> inliers;
+        std::set<int> rows, columns;
+        double square_error = 0.0;
+        for (size_t i = 0; i < hits.size(); ++i) {
+          const auto & h = hits[i];
+          const double error = h.depth - (a * h.u + b * h.v + c);
+          if (std::abs(error) <= tolerance) {
+            inliers.push_back(i);
+            rows.insert(h.row);
+            columns.insert(h.column);
+            square_error += error * error;
+          }
+        }
+        if (inliers.size() < std::max<size_t>(8, (hits.size() * 3 + 4) / 5) ||
+          rows.size() < 2 || columns.size() < 2)
+        {
+          return;
+        }
+        const double residual = std::sqrt(square_error / inliers.size());
+        if (!best.valid || inliers.size() > best.inliers.size() ||
+          (inliers.size() == best.inliers.size() && residual < best.residual))
+        {
+          best.valid = true;
+          best.a = a; best.b = b; best.c = c;
+          best.residual = residual; best.up = vertical;
+          best.inliers = std::move(inliers);
+        }
+      };
+    // The aperture has at most 25 returns. Deterministic three-point models
+    // retain a terrain component even when some rays see a distinct smoke front.
+    for (size_t i = 0; i < hits.size(); ++i) {
+      for (size_t j = i + 1; j < hits.size(); ++j) {
+        for (size_t k = j + 1; k < hits.size(); ++k) {
+          const auto & x = hits[i]; const auto & y = hits[j]; const auto & z = hits[k];
+          const double u1 = y.u - x.u, u2 = z.u - x.u;
+          const double v1 = y.v - x.v, v2 = z.v - x.v;
+          const double det = u1 * v2 - u2 * v1;
+          if (std::abs(det) < 1e-9) {continue;}
+          const double d1 = y.depth - x.depth, d2 = z.depth - x.depth;
+          const double a = (d1 * v2 - d2 * v1) / det;
+          const double b = (u1 * d2 - u2 * d1) / det;
+          consider(a, b, x.depth - a * x.u - b * x.v);
+        }
+      }
+    }
+    return best;
+  }
+
   void queryInspectionGeometry(
     const kv_executive::srv::QueryInspectionGeometry::Request::SharedPtr request,
     kv_executive::srv::QueryInspectionGeometry::Response::SharedPtr response)
@@ -1075,6 +1149,30 @@ private:
         (request->smoke_wall_width > 0.0 && request->direction.header.frame_id.empty()))
       {
         throw std::invalid_argument("Smoke wall width must be between zero and 3 metres");
+      }
+      if (request->smoke_wall_camera_roi) {
+        const auto valid_angle = [](double angle) {
+            return std::isfinite(angle) && std::abs(angle) < M_PI / 2.0;
+          };
+        if (request->smoke_camera_header.frame_id.empty() ||
+          !valid_angle(request->smoke_yaw_min_rad) ||
+          !valid_angle(request->smoke_yaw_max_rad) ||
+          !valid_angle(request->smoke_vertical_min_rad) ||
+          !valid_angle(request->smoke_vertical_max_rad) ||
+          request->smoke_yaw_min_rad >= request->smoke_yaw_max_rad ||
+          request->smoke_vertical_min_rad >= request->smoke_vertical_max_rad)
+        {
+          throw std::invalid_argument(
+            "Smoke camera association requires finite ordered angular bounds");
+        }
+        const double image_stamp = stampSeconds(request->smoke_camera_header.stamp);
+        const double image_age = this->get_clock()->now().seconds() - image_stamp;
+        if (image_stamp <= 0.0 || image_age < -inspection_future_tolerance_ ||
+          image_age > inspection_map_timeout_)
+        {
+          throw std::invalid_argument(
+            "Smoke camera association requires a fresh source image stamp");
+        }
       }
       const auto & frame = latest.header.frame_id;
       if (!request->direction.header.frame_id.empty()) {
@@ -1132,7 +1230,8 @@ private:
           vertical.normalize();
           std::vector<double> ranges;
           std::set<int> rows, columns;
-          size_t occupied_hits = 0, flicker_hits = 0;
+          std::vector<ApertureReturn> hits;
+          size_t occupied_hits = 0, flicker_hits = 0, terrain_hits = 0, associated_hits = 0;
           double voxel_uncertainty = 0.0;
           for (int row = -2; row <= 2; ++row) {
             for (int column = -2; column <= 2; ++column) {
@@ -1149,17 +1248,93 @@ private:
                 continue;
               }
               ++occupied_hits;
-              uint32_t occupied = 0, free = 0;
-              occupancyEvidence(history, wall_hit, occupied, free);
               const double depth = (wall_hit - sample).dot(ray_direction);
-              if (occupied > 0 && free > 0) {++flicker_hits;}
-              if (occupied > 0 && free > 0 && depth > 0.0 && depth <= request->max_range) {
-                ranges.push_back(depth);
-                rows.insert(row);
-                columns.insert(column);
-                voxel_uncertainty = std::max(voxel_uncertainty,
-                  std::sqrt(3.0) * leafSizeAt(*latest.tree, wall_hit) * 0.5);
+              if (depth > 0.0 && depth <= request->max_range) {
+                hits.push_back({row, column, column * request->smoke_wall_width / 4.0,
+                    row * request->smoke_wall_width / 4.0, depth,
+                    leafSizeAt(*latest.tree, wall_hit), wall_hit});
               }
+            }
+          }
+          AperturePlane terrain;
+          size_t prior_support = 0;
+          std::set<size_t> terrain_inliers;
+          if (request->smoke_wall_reject_terrain && !hits.empty()) {
+            double voxel = latest.tree->getResolution();
+            for (const auto & h : hits) {voxel = std::max(voxel, h.size);}
+            terrain = fitAperturePlane(hits, ray_direction, lateral, vertical,
+                std::max(0.08, voxel * 1.25));
+            if (terrain.valid) {
+              for (const auto & previous : history) {
+                if (previous.tree == latest.tree ||
+                  stampSeconds(previous.header.stamp) >= stampSeconds(latest.header.stamp))
+                {
+                  continue;
+                }
+                size_t support = 0;
+                std::set<int> support_rows, support_columns;
+                for (const auto index : terrain.inliers) {
+                  const auto & h = hits[index];
+                  const auto sample = ray_origin + lateral * h.u + vertical * h.v;
+                  octomap::point3d old_hit;
+                  if (previous.tree->castRay(sample, ray_direction, old_hit, true,
+                      request->max_range))
+                  {
+                    const double old_depth = (old_hit - sample).dot(ray_direction);
+                    const double expected = terrain.a * h.u + terrain.b * h.v + terrain.c;
+                    const double margin = 2.0 * std::max(voxel,
+                        leafSizeAt(*previous.tree, old_hit));
+                    if (std::abs(old_depth - expected) <= margin + 1e-6) {
+                      ++support;
+                      support_rows.insert(h.row); support_columns.insert(h.column);
+                    }
+                  }
+                }
+                if (support >= std::max<size_t>(8, (terrain.inliers.size() * 3 + 4) / 5) &&
+                  support_rows.size() >= 2 && support_columns.size() >= 2)
+                {
+                  prior_support = support;
+                  terrain_inliers.insert(terrain.inliers.begin(), terrain.inliers.end());
+                  break;
+                }
+              }
+            }
+          }
+          geometry_msgs::msg::TransformStamped camera_from_map;
+          if (request->smoke_wall_camera_roi) {
+            camera_from_map = tf_buffer_->lookupTransform(
+              request->smoke_camera_header.frame_id, frame,
+              rclcpp::Time(request->smoke_camera_header.stamp),
+              rclcpp::Duration::from_seconds(transform_timeout_));
+          }
+          for (size_t i = 0; i < hits.size(); ++i) {
+            const auto & h = hits[i];
+            if (terrain_inliers.count(i)) {++terrain_hits; continue;}
+            if (request->smoke_wall_camera_roi) {
+              geometry_msgs::msg::PointStamped map_hit, camera_hit;
+              map_hit.header = latest.header;
+              map_hit.point.x = h.hit.x(); map_hit.point.y = h.hit.y();
+              map_hit.point.z = h.hit.z();
+              tf2::doTransform(map_hit, camera_hit, camera_from_map);
+              const auto & p = camera_hit.point;
+              const double yaw = std::atan2(p.y, p.x), pitch = std::atan2(p.z, p.x);
+              if (p.x <= 0.0 || yaw < request->smoke_yaw_min_rad ||
+                yaw > request->smoke_yaw_max_rad || pitch < request->smoke_vertical_min_rad ||
+                pitch > request->smoke_vertical_max_rad)
+              {
+                continue;
+              }
+            }
+            ++associated_hits;
+            uint32_t occupied = 0, free = 0;
+            occupancyEvidence(history, h.hit, occupied, free);
+            if (occupied > 0 && free > 0) {++flicker_hits;}
+            if (occupied > 0 && free > 0) {
+              ranges.push_back(h.depth);
+              rows.insert(h.row);
+              columns.insert(h.column);
+              voxel_uncertainty = std::max(voxel_uncertainty,
+                  std::sqrt(3.0) * h.size * 0.5);
             }
           }
           response->smoke_wall_samples = ranges.size();
@@ -1181,7 +1356,14 @@ private:
                      << ", qualifying rays=" << ranges.size()
                      << ", rows=" << rows.size() << ", columns=" << columns.size()
                      << ", required=3 rays/2 rows/2 columns"
-                     << ", fresh history maps=" << history.size();
+                     << ", fresh history maps=" << history.size()
+                     << ", stable terrain rays excluded=" << terrain_hits
+                     << ", prior terrain support=" << prior_support
+                     << ", camera-associated rays=" << associated_hits;
+          if (terrain.valid) {
+            diagnostic << ", terrain normal up=" << terrain.up
+                       << ", terrain fit residual=" << terrain.residual << " m";
+          }
           if (response->smoke_wall_valid) {
             diagnostic << ", mean=" << response->smoke_wall_range
                        << " m, nearest=" << response->smoke_wall_nearest_range

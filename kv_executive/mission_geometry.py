@@ -1,5 +1,4 @@
-"""
-Validated geometry for mission paths and fixed frame conversions.
+"""Validated geometry for mission paths and fixed frame conversions.
 
 Transforms follow the ROS convention: ``transform_pose(pose, transform)``
 applies the transform to the pose, including its orientation.  Path distances
@@ -162,8 +161,7 @@ def _interpolate_stamped(start, end, fraction, path_header):
 
 
 def split_path(path: Path, segments: int = 3) -> list[Path]:
-    """
-    Split a path into equal arc lengths while retaining its original turns.
+    """Split a path into equal arc lengths while retaining its original turns.
 
     Shared boundaries are duplicated between adjacent output paths. Original
     pose headers are copied; inserted boundaries interpolate timestamps and
@@ -247,8 +245,7 @@ def transform_pose(pose: Pose, transform: Transform) -> Pose:
 
 
 def relative_transform(local_body: Pose, source_body: Pose) -> Transform:
-    """
-    Map source coordinates into local using coincident body-frame poses.
+    """Map source coordinates into local using coincident body-frame poses.
 
     The returned transform is ``T_local_body * inverse(T_source_body)``.
     The two inputs must describe the same body at the same instant.

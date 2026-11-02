@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Cancelable ROS action for Exploration and observation-driven Verify.
+"""Cancelable ROS action for Exploration and observation-driven Verify.
 
 Run this node with a MultiThreadedExecutor: mission states wait for telemetry
 and service replies while independent callbacks keep OFFBOARD setpoints alive.
@@ -271,6 +270,9 @@ class MissionExecutive(
                 <= self.config['verify_vertical_step']):
             raise ValueError(
                 'Vertical guidance must satisfy position tolerance < minimum change <= step')
+        if self.config['verify_smoke_inspection_max_distance'] <= self.config[
+                'verify_smoke_standoff']:
+            raise ValueError('Smoke inspection maximum must exceed the minimum standoff')
 
         self._callbacks = ReentrantCallbackGroup()
         self._data_lock = threading.Lock()
@@ -614,6 +616,7 @@ class MissionExecutive(
         blackboard['verify_wall_latest'] = None
         blackboard['verify_wall_last_stamp_ns'] = 0
         blackboard['verify_wall_near_count'] = 0
+        blackboard['verify_wall_close_count'] = 0
         blackboard['verify_wall_recheck_deadline'] = None
         blackboard['verify_height_hint'] = None
         blackboard['verify_height_hint_consumed'] = 0

@@ -458,7 +458,8 @@ def test_translation_reopens_unlocalized_completion_permanently(executive, axis)
     assert not executive._verify_request_is_completed()
 
 
-@pytest.mark.parametrize('condition', ['missing_tf', 'missing_pose', 'invalid_pose', 'stale_image'])
+@pytest.mark.parametrize(
+    'condition', ['missing_tf', 'missing_pose', 'invalid_pose', 'stale_image'])
 def test_unassociated_unlocalized_completion_cannot_suppress_inspection(executive, condition):
     executive.fire = executive.detection()
     if condition == 'missing_tf':

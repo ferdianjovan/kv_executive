@@ -15,10 +15,12 @@ import threading
 import time
 from types import SimpleNamespace
 
+from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from kv_executive.mission_geometry import angular_distance, yaw_from_quaternion
 from kv_executive.verification import VERIFY_DEFAULTS
 import rclpy
+from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 
 from test_mission_action import cancel_goal, send_goal, SimulatedFcu, wait_for
@@ -158,12 +160,26 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
                 assert monitor_process.poll() is None, (
                     f'Monitor exited {monitor_process.returncode}; '
                     f'log:\n{monitor_log_path.read_text()}')
+                assert active is None or active.status != GoalStatus.STATUS_ABORTED, (
+                    f'Mission aborted while waiting for {description}; '
+                    f'executive log:\n{log_path.read_text()}')
                 return predicate()
             wait_for(check, seconds, description)
 
         alive_wait(lambda: fcu.mission_client.server_is_ready()
                    and sensors.smoke_publisher.get_subscription_count() >= 2,
                    8.0, 'isolated executive discovery')
+        alive_wait(lambda: fcu.status_publisher.get_subscription_count() > 0
+                   and fcu.odometry_publisher.get_subscription_count() > 0
+                   and fcu.gps_publisher.get_subscription_count() > 0,
+                   8.0, 'executive FCU telemetry subscriptions')
+        # Action discovery can finish before the child's state reader exists.
+        # Publish a fresh heartbeat after telemetry discovery and require its
+        # reliable DDS acknowledgement before admitting the first mission.
+        with fcu.lock:
+            fcu.next_heartbeat = 0.0
+        fcu.publish_telemetry()
+        assert fcu.status_publisher.wait_for_all_acked(Duration(seconds=3.0))
         for label, child in (('executive', process), ('monitor', monitor_process)):
             # Retain the actual mapped interpreter/libraries for comparing
             # runtime controls; never infer this from the requested prefix.
@@ -230,8 +246,15 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
         assert process.poll() is None
         assert monitor_process.poll() is None
     finally:
-        if active is not None and process is not None and process.poll() is None:
-            cancel_goal(active)
+        if (active is not None and process is not None and process.poll() is None
+                and active.status not in (GoalStatus.STATUS_SUCCEEDED,
+                                          GoalStatus.STATUS_CANCELED, GoalStatus.STATUS_ABORTED)):
+            # Failure cleanup must still reap both processes if the goal
+            # finishes between the status check and cancellation response.
+            canceled = active.cancel_goal_async()
+            deadline = time.monotonic() + 3.0
+            while not canceled.done() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
         for child in (process, monitor_process):
             if child is not None and child.poll() is None:
                 child.send_signal(signal.SIGINT)

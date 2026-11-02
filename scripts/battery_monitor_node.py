@@ -2,8 +2,8 @@
 """Compatibility entry point for the native passive battery monitor."""
 
 import os
-import sys
 from pathlib import Path
+import sys
 
 
 def main():

@@ -24,8 +24,8 @@ def _finite_point(point):
     return all(math.isfinite(getattr(point, axis)) for axis in 'xyz')
 
 
-def smoke_wall_standoff_reached(wall, standoff, tolerance=0.3):
-    """Require the observed wall's conservative range to be at the standoff."""
+def smoke_wall_standoff_reached(wall, standoff, tolerance=0.3, max_distance=None):
+    """Require the conservative wall range to be inside the inspection band."""
     if wall is None:
         return False
     nearest = wall.get('nearest', math.nan)
@@ -34,7 +34,10 @@ def smoke_wall_standoff_reached(wall, standoff, tolerance=0.3):
             or nearest <= 0.0 or uncertainty < 0.0 or standoff <= 0.0 or tolerance <= 0.0):
         return False
     distance = nearest - uncertainty
-    return standoff - 1e-9 <= distance <= standoff + 2.0 * tolerance + 1e-9
+    maximum = standoff + 2.0 * tolerance if max_distance is None else max_distance
+    if (isinstance(maximum, bool) or not math.isfinite(maximum) or maximum < standoff):
+        return False
+    return standoff - 1e-9 <= distance <= maximum + 1e-9
 
 
 def _unknown_point(frame='', stamp=None):
@@ -100,7 +103,8 @@ class InspectionNavigationMixin:
         self._thermal_bearing_localizer = ThermalBearingLocalizer()
 
     def _inspection_query(self, request, *, require_map=False, timeout=None,
-                          report_unavailable=True, allow_timeout=False):
+                          report_unavailable=True, allow_timeout=False,
+                          allow_transform_failure=False):
         from kv_executive.mission_executive import MissionError, MissionTimeout
         from kv_executive.verification import VerificationMapUnavailable
         self._check_running()
@@ -123,6 +127,10 @@ class InspectionNavigationMixin:
         map_ns = _stamp_ns(response.map_header)
         self._verify_last_geometry_stamp_ns = map_ns
         if not response.success:
+            if allow_transform_failure and getattr(response, 'error_code', 1) == 3:
+                if report_unavailable:
+                    self._report(f'Verify: camera association unavailable: {response.message}')
+                return None
             if getattr(response, 'error_code', 1) in (2, 3):
                 raise MissionError(f'Inspection geometry failed: {response.message}')
             reason = f'Inspection map unavailable: {response.message}'
@@ -517,6 +525,74 @@ class InspectionNavigationMixin:
             return last_heading
         return heading
 
+    def _verify_current_terrain_hazard(self, current):
+        """Recognize below-floor clearance from fresh terrain below the actual body."""
+        cached = getattr(self, '_verify_current_terrain', None)
+        now_ns = self.get_clock().now().nanoseconds
+        terrain = None
+        if cached is not None:
+            age = (now_ns - cached['stamp_ns']) / 1e9
+            moved = math.dist(tuple(getattr(current.position, a) for a in 'xyz'),
+                              tuple(getattr(cached['position'], a) for a in 'xyz'))
+            if 0.0 <= age <= self.config.get('verify_geometry_timeout', 5.0) and moved <= 0.05:
+                terrain = cached['terrain']
+            else:
+                cached = None
+        if cached is None:
+            terrain = self._inspection_ground(
+                deepcopy(current), terrain_envelope=True, require_map=True)
+        if terrain is None:
+            return ''
+        clearance = current.position.z - terrain[0]
+        if clearance < self.config.get('verify_inspection_altitude', 3.0) - 1e-6:
+            return f'current terrain clearance {clearance:.2f} m is below the required floor'
+        return ''
+
+    def _verify_path_motion_policy(
+            self, path, origin, bearing, state, recovery_reason='', description='planned path'):
+        """Bound the whole route, including intermediate backtracking and altitude peaks."""
+        points = [vertex.pose.position for vertex in path.poses]
+        if not points:
+            return False
+        if not all(_finite_point(point) for point in points):
+            return False
+        projections = [((point.x - origin.x) * math.cos(bearing)
+                        + (point.y - origin.y) * math.sin(bearing)) for point in points]
+        actual_peak = max(state.get('actual_peak', 0.0), projections[0])
+        backward = actual_peak - projections[0]
+        peak = projections[0]
+        for projection in projections:
+            peak = max(peak, projection)
+            backward = max(backward, peak - projection, -projection)
+        rise = max(0.0, *(point.z - origin.z for point in points))
+        drop = max(0.0, *(origin.z - point.z for point in points))
+        length = sum(math.dist(tuple(getattr(a, c) for c in 'xyz'),
+                               tuple(getattr(b, c) for c in 'xyz'))
+                     for a, b in zip(points, points[1:]))
+        prefix = 'verify_recovery_' if recovery_reason else 'verify_approach_'
+        limits = (
+            self.config.get(prefix + 'max_rise', 6.0 if recovery_reason else 1.0),
+            self.config.get(prefix + 'max_drop', 1.0),
+            self.config.get(prefix + 'max_backtrack', 3.3 if recovery_reason else 0.3),
+            self.config.get('verify_approach_max_path_length', 12.0))
+        if not all(math.isfinite(value) and value > 0.0 for value in limits):
+            raise ValueError('Path motion limits must be finite and positive')
+        accepted = all(value <= limit + 1e-6
+                       for value, limit in zip((rise, drop, backward, length), limits))
+        signature = (accepted, recovery_reason)
+        now = time.monotonic()
+        if (state.get('reported') != signature
+                or now - state.get('reported_at', -math.inf) >= 5.0):
+            self._report(
+                f'Verify: {description} {"accepted" if accepted else "rejected"}; '
+                f'backward={backward:.2f} m, rise={rise:.2f} m, drop={drop:.2f} m, '
+                f'length={length:.2f} m; reason={recovery_reason or "ordinary approach"}')
+            state['reported'] = signature
+            state['reported_at'] = now
+        if accepted:
+            state['actual_peak'] = actual_peak
+        return accepted
+
     def _verify_recovery_plan_to(
         self, target, geometry=None, guard=None, terrain=None, preserve_requested_altitude=False,
     ):
@@ -530,6 +606,25 @@ class InspectionNavigationMixin:
         target = deepcopy(target)
         minimum_agl = self.config.get('verify_inspection_altitude', 3.0)
         _, current = self._verify_control_pose()
+        recovery_reason = ''
+        if ((geometry or {}).get('confirmed_wall_retreat', False)
+                and (geometry or {}).get('safety_recovery_reason')
+                == 'confirmed_smoke_wall_inside_standoff'):
+            for wall in self._verify_smoke_navigation_walls(geometry):
+                distance = wall['nearest'] - wall['uncertainty'] - sum(
+                    (getattr(current.position, a) - getattr(wall['origin'], a)) * wall['axis'][i]
+                    for i, a in enumerate('xyz'))
+                if distance < self.config.get('verify_smoke_standoff', 15.0):
+                    recovery_reason = 'confirmed smoke wall is inside the minimum standoff'
+                    break
+        if not recovery_reason:
+            recovery_reason = self._verify_current_terrain_hazard(current)
+        policy_origin = deepcopy(current.position)
+        policy_bearing = (geometry or {}).get('navigation_bearing',
+                                              yaw_from_quaternion(target.orientation))
+        if not math.isfinite(policy_bearing):
+            raise MissionError('Motion policy requires a finite approach bearing')
+        policy_state = {}
         requested_height = target.position.z - current.position.z
         minimum_height = self.config.get('verify_vertical_minimum_change', 0.1)
         height_tolerance = self.config.get('verify_vertical_position_tolerance', 0.05)
@@ -580,6 +675,12 @@ class InspectionNavigationMixin:
                 return False
         if not preserve_requested_altitude:
             target.position.z = max(target.position.z, current.position.z)
+        endpoint = Path()
+        endpoint.poses = [PoseStamped(pose=deepcopy(current)), PoseStamped(pose=deepcopy(target))]
+        if not self._verify_path_motion_policy(
+                endpoint, policy_origin, policy_bearing, {}, recovery_reason,
+                description='proposed destination'):
+            return False
         escape_state = {'origin': deepcopy(current.position), 'complete': False}
         keepout_radius = (geometry or {}).get('fire_keepout_radius', 0.0)
         keepout_point = None
@@ -591,6 +692,9 @@ class InspectionNavigationMixin:
                 raise MissionError('Fire standoff requires a valid localized source and radius')
 
         def validate(path):
+            if not self._verify_path_motion_policy(
+                    path, policy_origin, policy_bearing, policy_state, recovery_reason):
+                return False
             if geometry and geometry.get('center_fire_wall') is not None:
                 if not self._verify_center_fire_wall_path(path, geometry):
                     return False
@@ -671,12 +775,43 @@ class InspectionNavigationMixin:
                 self._verify_wall_rejection_at = now
             return None
 
+        def bounds(message):
+            if not self._inspection_detection_valid(message, 'smoke'):
+                return None
+            values = tuple(getattr(message, name, math.nan) for name in (
+                'yaw_min_rad', 'yaw_max_rad', 'vertical_min_rad', 'vertical_max_rad'))
+            if (not all(math.isfinite(value) and abs(value) < math.pi / 2 for value in values)
+                    or not values[0] < values[1] or not values[2] < values[3]
+                    or not values[0] <= message.yaw_correction_rad <= values[1]
+                    or not values[2] <= message.vertical_correction_rad <= values[3]):
+                return None
+            return values
+
+        smoke = self._verify.fresh_smoke()
+        roi_source, roi_bounds = None, None
+        if smoke is not None and getattr(smoke, 'angular_bounds_valid', False):
+            roi_bounds = bounds(smoke)
+            if roi_bounds is None:
+                return unavailable('smoke-camera bounds are stale, invalid or inconsistent')
+            roi_source = smoke
+            # A thermal observation may guide flight, but wall identity is
+            # associated with the confirmed RGB smoke region in its own frame.
+            camera_frame = smoke.header.frame_id
+
         request = QueryInspectionGeometry.Request()
         request.origin.header.frame_id = request.direction.header.frame_id = camera_frame
+        request.smoke_wall_reject_terrain = True
         # Latest camera TF: this is a current map measurement, not an old image ray.
         request.direction.vector.x = 1.0
         conversion = None
-        if bearing is not None:
+        if roi_source is not None:
+            request.smoke_wall_camera_roi = True
+            request.smoke_camera_header = deepcopy(roi_source.header)
+            (request.smoke_yaw_min_rad, request.smoke_yaw_max_rad,
+             request.smoke_vertical_min_rad, request.smoke_vertical_max_rad) = roi_bounds
+            request.direction.vector.y = math.tan(roi_source.yaw_correction_rad)
+            request.direction.vector.z = math.tan(roi_source.vertical_correction_rad)
+        elif bearing is not None:
             from kv_executive.mission_navigation import _inverse
             if not camera_frame or not math.isfinite(bearing):
                 raise ValueError('Wall probe requires a camera frame and finite bearing')
@@ -696,9 +831,9 @@ class InspectionNavigationMixin:
         request.smoke_wall_width = 3.0
         response = self._inspection_query(
             request, require_map=True, timeout=timeout, allow_timeout=timeout is not None,
-            report_unavailable=timeout is None)
+            report_unavailable=timeout is None, allow_transform_failure=roi_source is not None)
         if response is None:
-            return unavailable('geometry query returned no measurement before its deadline')
+            return unavailable('geometry query or camera association returned no measurement')
         if not response.smoke_wall_valid:
             return unavailable(
                 f'aperture not qualified ({response.smoke_wall_samples} rays); '
@@ -737,11 +872,24 @@ class InspectionNavigationMixin:
         if not -self.config['verify_future_tolerance'] <= age <= self.config.get(
                 'verify_geometry_timeout', 5.0):
             return unavailable(f'map aged during transform: {age:.2f} source seconds')
+        if roi_source is not None:
+            current = self._verify.fresh_smoke()
+            current_bounds = bounds(current) if current is not None and getattr(
+                current, 'angular_bounds_valid', False) else None
+            if (not self._inspection_detection_valid(roi_source, 'smoke')
+                    or current_bounds is None or current.header.frame_id != camera_frame
+                    or max(roi_bounds[0], current_bounds[0]) > min(
+                        roi_bounds[1], current_bounds[1])
+                    or max(roi_bounds[2], current_bounds[2]) > min(
+                        roi_bounds[3], current_bounds[3])):
+                return unavailable('confirmed smoke-camera association changed during wall query')
         self._verify_wall_rejection = ''
         return {'origin': local, 'axis': tuple(v / norm for v in axis), 'mean': mean,
                 'nearest': nearest, 'uncertainty': uncertainty, 'camera_frame': camera_frame,
                 'bearing': bearing, 'map_header': deepcopy(response.map_header),
-                'map_stamp_ns': _stamp_ns(response.map_header)}
+                'map_stamp_ns': _stamp_ns(response.map_header),
+                'camera_associated': roi_source is not None,
+                'smoke_camera_stamp_ns': _stamp_ns(roi_source.header) if roi_source else 0}
 
     @staticmethod
     def _verify_valid_wall(wall):
@@ -777,7 +925,8 @@ class InspectionNavigationMixin:
                       * wall['axis'][index] for index, axis in enumerate('xyz'))
         return smoke_wall_standoff_reached(
             {**wall, 'nearest': wall['nearest'] - advance},
-            self.config['verify_smoke_standoff'], self.config.get('position_tolerance', 0.3))
+            self.config['verify_smoke_standoff'], self.config.get('position_tolerance', 0.3),
+            max_distance=self.config.get('verify_smoke_inspection_max_distance'))
 
     def _verify_center_fire_wall_path(self, path, geometry):
         """Protect the observed wall plane through a short maneuver and map flicker."""
@@ -903,13 +1052,14 @@ class InspectionNavigationMixin:
         request.corridor.header.frame_id = frame
         request.corridor.poses = [PoseStamped(
             header=deepcopy(request.corridor.header), pose=transform_pose(current, conversion))]
+        # Current clearance must use support below the body, not a raised
+        # endpoint query that can mistake an overhead canopy for current ground.
         probe = deepcopy(current)
-        probe.position.z += (self.config.get('verify_navigation_max_agl', 10.0)
-                             + self.config.get('verify_inspection_altitude', 3.0))
         request.ground_query.header.frame_id = frame
         request.ground_query.header.stamp = self.get_clock().now().to_msg()
         request.ground_query.point = transform_pose(probe, conversion).position
         response = self._inspection_query(request, require_map=True)
+        self._verify_current_terrain = None
         if not response.corridor_safe:
             raise VerificationStartUnavailable(
                 'Current body clearance check failed: '
@@ -928,6 +1078,11 @@ class InspectionNavigationMixin:
                 f'{current.position.z - ground.z:.2f} m '
                 f'(uncertainty {response.ground_uncertainty:.2f} m); '
                 f'local altitude {current.position.z:.2f} m')
+            self._verify_current_terrain = {
+                'position': deepcopy(current.position),
+                'stamp_ns': _stamp_ns(response.map_header),
+                'terrain': (ground.z, response.ground_uncertainty),
+            }
         else:
             self._report(
                 'Verify: current body collision check passed; terrain-envelope height unavailable')
@@ -1422,7 +1577,8 @@ class InspectionNavigationMixin:
             wall = self._verify_center_fire_wall(fire_message.header.frame_id)
             if not smoke_wall_standoff_reached(
                     wall, self.config['verify_smoke_standoff'],
-                    self.config.get('position_tolerance', 0.3)):
+                    self.config.get('position_tolerance', 0.3),
+                    max_distance=self.config.get('verify_smoke_inspection_max_distance')):
                 raise VerificationObservationLost(
                     'A fresh smoke wall at the standoff is required for a fire-found result')
             latest = self._verify.stable_fire()
@@ -1453,7 +1609,8 @@ class InspectionNavigationMixin:
             wall = self._verify_center_fire_wall(fire_message.header.frame_id)
             if not smoke_wall_standoff_reached(
                     wall, self.config['verify_smoke_standoff'],
-                    self.config.get('position_tolerance', 0.3)):
+                    self.config.get('position_tolerance', 0.3),
+                    max_distance=self.config.get('verify_smoke_inspection_max_distance')):
                 raise VerificationObservationLost(
                     'Smoke-wall standoff evidence became unavailable before publishing')
         # Decide classification after the last potentially blocking query too.
