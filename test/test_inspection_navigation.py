@@ -146,6 +146,8 @@ class Harness(InspectionNavigationMixin):
             smoke_wall_valid=self.smoke_wall_valid, smoke_wall_range=self.smoke_wall_nearest,
             smoke_wall_nearest_range=self.smoke_wall_nearest,
             smoke_wall_uncertainty=0.2, smoke_wall_samples=25,
+            smoke_wall_evidence=1, smoke_wall_mixed_samples=25,
+            smoke_wall_rows=5, smoke_wall_columns=5,
         )
         ray_header = deepcopy(request.origin.header)
         ray_header.frame_id = 'map'
@@ -1824,7 +1826,7 @@ def test_visible_fire_cannot_report_without_fresh_wall_standoff(executive, wall_
 
     assert not any(event[0] in {'report', 'legacy_report'} for event in executive.events)
     requests = [event[1] for event in executive.events if event[0] == 'query']
-    assert any(request.smoke_wall_width == 3.0 for request in requests)
+    assert any(request.smoke_wall_width == 4.5 for request in requests)
 
 
 @pytest.mark.parametrize('late_change', ['missing_wall', 'distant_wall', 'fire_lost'])
@@ -1982,7 +1984,7 @@ def test_fire_loss_after_legacy_preparation_prevents_both_reports(executive):
 
 def test_center_fire_wall_queries_physical_camera_aperture_and_preserves_mean(executive):
     def wall(request, response):
-        assert request.smoke_wall_width == 3.0
+        assert request.smoke_wall_width == 4.5
         assert request.direction.vector.x == 1.0
         assert request.origin.header.frame_id == 'thermal_camera'
         assert request.origin.header.stamp.sec == 0
@@ -2629,7 +2631,13 @@ def test_fresh_plume_hit_tightens_an_older_retained_aperture_plane(executive):
 @pytest.mark.parametrize('samples, accepted', [(2, False), (3, True), (6, True)])
 def test_wall_probe_python_guard_requires_at_least_three_samples(executive, samples, accepted):
     executive.smoke_wall_valid = True
-    executive.on_query = lambda request, response: setattr(response, 'smoke_wall_samples', samples)
+
+    def evidence_counts(request, response):
+        response.smoke_wall_samples = samples
+        response.smoke_wall_mixed_samples = 1
+        response.smoke_wall_rows = response.smoke_wall_columns = 3
+
+    executive.on_query = evidence_counts
     wall = executive._verify_opportunistic_wall('rgb_camera', 0.0)
     assert (wall is not None) is accepted
 
@@ -2669,6 +2677,72 @@ def _smoke_camera_roi(executive):
     smoke.vertical_min_rad, smoke.vertical_max_rad = -0.4, -0.1
     executive.smoke_wall_valid = True
     return smoke
+
+
+def _wall_evidence(response, evidence=1, samples=6, mixed=1, rows=3, columns=3):
+    response.smoke_wall_evidence = evidence
+    response.smoke_wall_samples = samples
+    response.smoke_wall_mixed_samples = mixed
+    response.smoke_wall_rows, response.smoke_wall_columns = rows, columns
+
+
+@pytest.mark.parametrize('evidence,samples,mixed,associated', [
+    (1, 3, 1, False), (1, 6, 1, True), (2, 6, 0, True),
+])
+def test_extended_wall_routes_retain_typed_support_and_camera_proof(
+        executive, evidence, samples, mixed, associated):
+    executive.smoke_wall_valid = True
+    if associated:
+        _smoke_camera_roi(executive)
+    executive.on_query = lambda request, response: _wall_evidence(
+        response, evidence=evidence, samples=samples, mixed=mixed)
+    wall = executive._verify_opportunistic_wall('thermal_camera', 1.2)
+    request = next(event[1] for event in executive.events if event[0] == 'query')
+    assert request.smoke_wall_extended_evidence
+    assert request.smoke_wall_width == 4.5
+    assert request.smoke_wall_reject_terrain
+    assert wall['evidence'] == ('flicker' if evidence == 1 else 'persistent')
+    assert wall['evidence_code'] == evidence
+    assert (wall['samples'], wall['mixed_samples'], wall['rows'], wall['columns']) == (
+        samples, mixed, 3, 3)
+    assert wall['camera_associated'] is associated
+    assert any(f'evidence={wall["evidence"]}, support={samples}/49' in event[1]
+               for event in executive.events if event[0] == 'status')
+
+
+@pytest.mark.parametrize('changes', [
+    {'evidence': 0}, {'evidence': 99}, {'evidence': True},
+    {'samples': 2, 'rows': 2, 'columns': 2}, {'samples': 50, 'rows': 7, 'columns': 7},
+    {'mixed': 0}, {'mixed': -1}, {'mixed': 7}, {'mixed': 1.5},
+    {'rows': 0}, {'rows': 2}, {'rows': 7}, {'rows': 8},
+    {'columns': 0}, {'columns': 2}, {'columns': 8},
+    {'samples': 10}, {'evidence': 2, 'samples': 5, 'mixed': 0},
+])
+def test_extended_wall_rejects_unknown_routes_and_inconsistent_support_counts(executive, changes):
+    _smoke_camera_roi(executive)
+    executive.on_query = lambda request, response: _wall_evidence(response, **changes)
+    assert executive._verify_opportunistic_wall('rgb_camera', 0.0) is None
+    assert any('measurement rejected' in event[1] for event in executive.events
+               if event[0] == 'status')
+
+
+@pytest.mark.parametrize('association', ['missing', 'stale', 'invalid', 'lost'])
+def test_persistent_wall_requires_fresh_actual_smoke_camera_bounds(executive, association):
+    executive.smoke_wall_valid = True
+    if association != 'missing':
+        smoke = _smoke_camera_roi(executive)
+        if association == 'stale':
+            smoke.header.stamp = header(executive.now - 3.0).stamp
+        elif association == 'invalid':
+            smoke.yaw_min_rad = math.nan
+
+    def persistent(request, response):
+        _wall_evidence(response, evidence=2, mixed=0)
+        if association == 'lost':
+            executive.smoke.detected = False
+
+    executive.on_query = persistent
+    assert executive._verify_opportunistic_wall('thermal_camera', 1.2) is None
 
 
 def test_wall_probe_associates_hits_with_actual_rgb_smoke_bounds_and_height(executive):

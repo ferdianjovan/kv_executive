@@ -1741,7 +1741,10 @@ def test_wall_aperture_requires_three_returns_across_two_rows_and_columns(
 
     assert response.success, response.message
     assert response.smoke_wall_samples == len(samples)
+    assert response.smoke_wall_mixed_samples == len(samples)
     assert response.smoke_wall_valid is accepted
+    assert response.smoke_wall_evidence == (
+        response.WALL_EVIDENCE_FLICKER if accepted else response.WALL_EVIDENCE_NONE)
     assert f'qualifying rays={len(samples)}' in response.message
     assert 'required=3 rays/2 rows/2 columns' in response.message
 
@@ -1925,3 +1928,191 @@ def test_wall_camera_association_requires_valid_source_metadata(planner_factory,
         request.smoke_camera_header.frame_id = ''
     response = planner.query_geometry(request)
     assert not response.success and response.error_code == response.INVALID_REQUEST
+
+
+EXTENDED_WALL_GRID = tuple((row, column) for row in range(-3, 4) for column in range(-3, 4))
+
+
+def _extended_wall_scene(occupied_samples=EXTENDED_WALL_GRID, *, free_samples=(),
+                         slope=math.inf, translation=0.0, distance=12.0, phase=0.0):
+    """Encode occupied/free returns at the production 0.75 m aperture spacing."""
+    from test_smoke_wall_false_positives import ORIGIN, _encode_octomap, _float32, _key
+    occupied_samples = set(occupied_samples)
+    leaves = {}
+    for row, column in occupied_samples | set(free_samples):
+        y = _float32(_float32(ORIGIN[1]) + column * 0.75)
+        z = _float32(_float32(ORIGIN[2]) + row * 0.75)
+        depth = distance + phase + row * 0.75 / slope + column * 0.75 * 0.15
+        base, hit = _key(ORIGIN[0] + depth), _key(ORIGIN[0] + depth + translation)
+        for x in range(base - 2, hit + 1):
+            leaves[(x, _key(y), _key(z))] = (
+                2 if x == hit and (row, column) in occupied_samples else 1)
+    return _encode_octomap(leaves)
+
+
+def _extended_wall_request(planner, frame, *, camera_roi=True, reject_terrain=True):
+    from test_smoke_wall_false_positives import _request
+    request = _request(frame)
+    request.smoke_wall_extended_evidence = True
+    request.smoke_wall_width = 4.5
+    request.smoke_wall_reject_terrain = reject_terrain
+    request.smoke_wall_camera_roi = camera_roi
+    request.smoke_camera_header.frame_id = frame
+    request.smoke_camera_header.stamp = planner.node.get_clock().now().to_msg()
+    request.smoke_yaw_min_rad, request.smoke_yaw_max_rad = -1.3, 1.3
+    request.smoke_vertical_min_rad, request.smoke_vertical_max_rad = -1.3, 1.3
+    return request
+
+
+def test_extended_wall_uses_one_mixed_ray_and_other_current_support(planner_factory):
+    from test_smoke_wall_false_positives import _publish_and_query
+    planner = planner_factory()
+    frame = 'extended_wall_one_mixed_ray'
+    previous = tuple(sample for sample in EXTENDED_WALL_GRID if sample != (0, 0))
+    _publish_and_query(planner, frame, _extended_wall_scene(previous, free_samples=((0, 0),)))
+    _publish_and_query(planner, frame, _extended_wall_scene())
+    response = planner.query_geometry(_extended_wall_request(planner, frame))
+    assert response.success and response.smoke_wall_valid, response.message
+    assert response.smoke_wall_evidence == response.WALL_EVIDENCE_FLICKER
+    assert response.smoke_wall_samples == 49 and response.smoke_wall_mixed_samples == 1
+    assert response.smoke_wall_rows == response.smoke_wall_columns == 7
+    assert 'grid=7x7, width=4.5 m, evidence=FLICKER' in response.message
+    assert 'camera ROI enabled=1, terrain rejection enabled=1' in response.message
+
+
+@pytest.mark.parametrize('samples, accepted', [
+    (((-1, -1), (0, 0), (1, 1)), True),
+    (((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 0), (0, 1)), False),
+    (((-1, -1), (0, -1), (1, -1), (-1, 0), (0, 0), (1, 0)), False),
+])
+def test_extended_wall_requires_three_rows_and_columns(planner_factory, samples, accepted):
+    from test_smoke_wall_false_positives import _publish_and_query
+    planner = planner_factory()
+    frame = 'extended_wall_coverage'
+    _publish_and_query(planner, frame, _extended_wall_scene((), free_samples=samples))
+    _publish_and_query(planner, frame, _extended_wall_scene(samples))
+    response = planner.query_geometry(_extended_wall_request(planner, frame))
+    assert response.success, response.message
+    assert response.smoke_wall_valid is accepted
+    assert response.smoke_wall_samples == response.smoke_wall_mixed_samples == len(samples)
+    assert response.smoke_wall_evidence == (
+        response.WALL_EVIDENCE_FLICKER if accepted else response.WALL_EVIDENCE_NONE)
+    assert 'required=3 rays/3 rows/3 columns' in response.message
+
+
+@pytest.mark.parametrize('samples, accepted', [
+    (((-1, -1), (-1, 0), (0, -1), (0, 1), (1, 0), (1, 1)), True),
+    (((-1, -1), (-1, 0), (0, -1), (0, 1), (1, 1)), False),
+])
+def test_extended_wall_persistent_route_requires_six_current_hits(
+        planner_factory, samples, accepted):
+    from test_smoke_wall_false_positives import _publish_and_query
+    planner = planner_factory()
+    frame = 'extended_wall_persistent_minimum'
+    _publish_and_query(planner, frame, _extended_wall_scene(samples))
+    _publish_and_query(planner, frame, _extended_wall_scene(samples))
+    response = planner.query_geometry(_extended_wall_request(planner, frame))
+    assert response.success, response.message
+    assert response.smoke_wall_valid is accepted
+    assert response.smoke_wall_mixed_samples == 0
+    assert response.smoke_wall_samples == len(samples)
+    assert response.smoke_wall_rows == response.smoke_wall_columns == 3
+    assert response.smoke_wall_evidence == (
+        response.WALL_EVIDENCE_PERSISTENT if accepted else response.WALL_EVIDENCE_NONE)
+
+
+@pytest.mark.parametrize('missing_guard', ['camera_roi', 'terrain_rejection'])
+def test_extended_wall_persistent_route_requires_both_classification_guards(
+        planner_factory, missing_guard):
+    from test_smoke_wall_false_positives import _publish_and_query
+    planner = planner_factory()
+    frame = 'extended_wall_requires_guards'
+    _publish_and_query(planner, frame, _extended_wall_scene())
+    _publish_and_query(planner, frame, _extended_wall_scene())
+    request = _extended_wall_request(
+        planner, frame, camera_roi=missing_guard != 'camera_roi',
+        reject_terrain=missing_guard != 'terrain_rejection')
+    response = planner.query_geometry(request)
+    assert response.success and not response.smoke_wall_valid, response.message
+    assert response.smoke_wall_evidence == response.WALL_EVIDENCE_NONE
+    assert response.smoke_wall_samples == 49 and response.smoke_wall_mixed_samples == 0
+
+
+def test_extended_wall_preserves_a_steady_vertical_front_without_mixed_history(planner_factory):
+    from test_smoke_wall_false_positives import _publish_and_query
+    planner = planner_factory()
+    frame = 'extended_wall_steady_front'
+    for index in range(3):
+        _publish_and_query(planner, frame, _extended_wall_scene())
+        response = planner.query_geometry(_extended_wall_request(planner, frame))
+        assert response.success, response.message
+        assert response.smoke_wall_valid is (index > 0)
+        assert response.smoke_wall_evidence == (
+            response.WALL_EVIDENCE_PERSISTENT if index else response.WALL_EVIDENCE_NONE)
+        assert response.smoke_wall_samples == 49 and response.smoke_wall_mixed_samples == 0
+        assert 'stable terrain rays excluded=0' in response.message
+        assert f'prior map context={int(index > 0)}' in response.message
+
+
+@pytest.mark.parametrize('slope', [1.0, 2.0])
+def test_extended_wall_guard_rejects_persistent_jittering_terrain(
+        planner_factory, slope, record_testsuite_property):
+    from test_smoke_wall_false_positives import _publish_and_query
+    planner = planner_factory()
+    frame = 'extended_wall_inclined_terrain'
+    _publish_and_query(planner, frame, _extended_wall_scene(slope=slope, translation=0.09))
+    initial = planner.query_geometry(_extended_wall_request(planner, frame))
+    assert initial.success and not initial.smoke_wall_valid, initial.message
+    assert initial.smoke_wall_evidence == initial.WALL_EVIDENCE_NONE
+    assert initial.smoke_wall_samples == 49
+    assert 'prior map context=0' in initial.message
+    _publish_and_query(planner, frame, _extended_wall_scene(slope=slope, translation=-0.09))
+    request = _extended_wall_request(planner, frame)
+    elapsed = []
+    for _ in range(3):
+        started = time.perf_counter()
+        response = planner.query_geometry(request)
+        elapsed.append(time.perf_counter() - started)
+        assert response.success and not response.smoke_wall_valid, response.message
+        assert response.smoke_wall_evidence == response.WALL_EVIDENCE_NONE
+        assert response.smoke_wall_samples == response.smoke_wall_mixed_samples == 0
+        assert 'stable terrain rays excluded=49' in response.message
+        assert 'prior terrain support=49' in response.message
+    median = sorted(elapsed)[len(elapsed) // 2]
+    prefix = f'wall_probe_49_ray_slope_{slope:g}'
+    record_testsuite_property(prefix + '_median_seconds', median)
+    record_testsuite_property(prefix + '_max_seconds', max(elapsed))
+    print(f'49-ray terrain guard slope={slope:g}: median query {median:.4f} s, '
+          f'maximum query {max(elapsed):.4f} s')
+
+
+def test_extended_wall_samples_outer_rays_at_two_and_a_quarter_metres(planner_factory):
+    from test_smoke_wall_false_positives import _publish_and_query, _request
+    planner = planner_factory()
+    frame = 'extended_wall_outer_grid'
+    samples = ((-3, -3), (0, 0), (3, 3))
+    _publish_and_query(planner, frame, _extended_wall_scene((), free_samples=samples))
+    _publish_and_query(planner, frame, _extended_wall_scene(samples))
+    legacy = planner.query_geometry(_request(frame))
+    assert not legacy.smoke_wall_valid and legacy.smoke_wall_samples == 1
+    extended = planner.query_geometry(_extended_wall_request(planner, frame))
+    assert extended.success and extended.smoke_wall_valid, extended.message
+    assert extended.smoke_wall_evidence == extended.WALL_EVIDENCE_FLICKER
+    assert extended.smoke_wall_samples == 3
+    assert extended.smoke_wall_rows == extended.smoke_wall_columns == 3
+
+
+def test_extended_wall_width_limit_is_separate_from_legacy_measurement(planner_factory):
+    from test_smoke_wall_false_positives import _publish_and_query, _request
+    planner = planner_factory()
+    frame = 'extended_wall_width_limit'
+    _publish_and_query(planner, frame, _extended_wall_scene())
+    request = _request(frame)
+    request.smoke_wall_width = 4.5
+    legacy = planner.query_geometry(request)
+    assert not legacy.success and legacy.error_code == legacy.INVALID_REQUEST
+    request = _extended_wall_request(planner, frame)
+    assert planner.query_geometry(request).success
+    request.smoke_wall_width = 4.5001
+    oversized = planner.query_geometry(request)
+    assert not oversized.success and oversized.error_code == oversized.INVALID_REQUEST

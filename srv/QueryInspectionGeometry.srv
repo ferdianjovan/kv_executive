@@ -6,6 +6,12 @@ float64 max_range
 # Opt-in CENTER_FIRE measurement: side length of a square of parallel camera
 # +X rays, spanning camera Y/Z. Zero leaves all existing queries unchanged.
 float64 smoke_wall_width
+# Extended evidence uses 7 x 7 rays (width <=4.5 m), including current occupied
+# support. False preserves the legacy 5 x 5, mixed-history-only measurement.
+# Extended FLICKER: >=3 current hits across >=3 rows/columns, >=1 mixed hit.
+# Extended PERSISTENT: >=6 current hits across >=3 rows/columns, fresh camera
+# association and terrain rejection enabled, with an older fresh map context.
+bool smoke_wall_extended_evidence
 # Reject a spatially coherent inclined surface already present in earlier maps.
 # This only affects smoke classification; occupied cells remain obstacles.
 bool smoke_wall_reject_terrain
@@ -70,9 +76,19 @@ bool current_clearance_reached
 # when no obstacle is hit; obstacle surfaces do not establish source identity.
 geometry_msgs/PointStamped ray_origin
 geometry_msgs/Vector3Stamped ray_direction
-# Observed occupied/free changes across fresh map history, not a fire range.
+uint8 WALL_EVIDENCE_NONE=0
+uint8 WALL_EVIDENCE_FLICKER=1
+uint8 WALL_EVIDENCE_PERSISTENT=2
+# A wall candidate, not arrival confirmation or a fire range. PERSISTENT also
+# requires an older fresh map for terrain context. Extended evidence requires
+# a second independently source-stamped map observation in the client.
 bool smoke_wall_valid
+uint8 smoke_wall_evidence
 float64 smoke_wall_range
 float64 smoke_wall_nearest_range
 float64 smoke_wall_uncertainty
 uint32 smoke_wall_samples
+# Mixed occupied/free support is a subset of extended current occupied support.
+uint32 smoke_wall_mixed_samples
+uint32 smoke_wall_rows
+uint32 smoke_wall_columns

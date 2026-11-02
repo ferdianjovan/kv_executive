@@ -743,7 +743,7 @@ class InspectionNavigationMixin:
         )
 
     def _verify_center_fire_wall(self, camera_frame):
-        """Measure a 3 x 3 m flickering smoke-wall aperture; never estimate fire range."""
+        """Measure a smoke-wall aperture; never estimate fire range."""
         return self._verify_measure_wall(camera_frame)
 
     def _verify_opportunistic_wall(self, camera_frame, bearing):
@@ -801,6 +801,7 @@ class InspectionNavigationMixin:
         request = QueryInspectionGeometry.Request()
         request.origin.header.frame_id = request.direction.header.frame_id = camera_frame
         request.smoke_wall_reject_terrain = True
+        request.smoke_wall_extended_evidence = True
         # Latest camera TF: this is a current map measurement, not an old image ray.
         request.direction.vector.x = 1.0
         conversion = None
@@ -828,7 +829,7 @@ class InspectionNavigationMixin:
                 setattr(request.direction.vector, axis,
                         getattr(endpoint, axis) - getattr(zero, axis))
         request.max_range = self.config.get('verify_inspection_max_range', 40.0)
-        request.smoke_wall_width = 3.0
+        request.smoke_wall_width = 4.5
         response = self._inspection_query(
             request, require_map=True, timeout=timeout, allow_timeout=timeout is not None,
             report_unavailable=timeout is None, allow_transform_failure=roi_source is not None)
@@ -838,11 +839,36 @@ class InspectionNavigationMixin:
             return unavailable(
                 f'aperture not qualified ({response.smoke_wall_samples} rays); '
                 + getattr(response, 'message', 'native qualification details unavailable'))
+        evidence = getattr(response, 'smoke_wall_evidence', 0)
+        samples, mixed, rows, columns = tuple(getattr(response, name, None) for name in (
+            'smoke_wall_samples', 'smoke_wall_mixed_samples',
+            'smoke_wall_rows', 'smoke_wall_columns'))
+        details = (f'evidence={evidence}, support={samples}/49, mixed={mixed}, '
+                   f'rows={rows}/7, columns={columns}/7')
+        if (any(type(value) is not int for value in (evidence, samples, mixed, rows, columns))
+                or not 0 <= mixed <= samples <= 49
+                or not 1 <= rows <= min(7, samples)
+                or not 1 <= columns <= min(7, samples)
+                or samples > rows * columns):
+            return unavailable(f'malformed wall evidence counts: {details}')
+        if rows < 3 or columns < 3:
+            return unavailable(f'wall support requires at least 3 rows and 3 columns: {details}')
+        if evidence == QueryInspectionGeometry.Response.WALL_EVIDENCE_FLICKER:
+            if samples < 3 or mixed < 1:
+                return unavailable(
+                    f'flicker evidence needs 3 support rays and 1 mixed ray: {details}')
+            evidence_name = 'flicker'
+        elif evidence == QueryInspectionGeometry.Response.WALL_EVIDENCE_PERSISTENT:
+            if samples < 6 or roi_source is None:
+                return unavailable(
+                    f'persistent evidence needs 6 support rays and confirmed smoke-camera bounds: '
+                    f'{details}')
+            evidence_name = 'persistent'
+        else:
+            return unavailable(f'unknown wall evidence route: {details}')
         mean, nearest, uncertainty = (
             response.smoke_wall_range, response.smoke_wall_nearest_range,
             response.smoke_wall_uncertainty)
-        if response.smoke_wall_samples < 3:
-            return unavailable(f'only {response.smoke_wall_samples} qualifying rays; required=3')
         if (not all(math.isfinite(v) for v in (mean, nearest, uncertainty))
                 or not 0.0 < nearest <= mean <= request.max_range):
             return unavailable(f'invalid range statistics: mean={mean}, nearest={nearest}')
@@ -883,11 +909,22 @@ class InspectionNavigationMixin:
                     or max(roi_bounds[2], current_bounds[2]) > min(
                         roi_bounds[3], current_bounds[3])):
                 return unavailable('confirmed smoke-camera association changed during wall query')
+        now = time.monotonic()
+        signature = (evidence, roi_source is not None)
+        if (getattr(self, '_verify_wall_evidence_reported', None) != signature
+                or now - getattr(self, '_verify_wall_evidence_reported_at', -math.inf) >= 5.0):
+            self._report(f'Verify: smoke-wall evidence={evidence_name}, support={samples}/49, '
+                         f'mixed={mixed}, rows={rows}/7, columns={columns}/7; '
+                         f'camera associated={roi_source is not None}')
+            self._verify_wall_evidence_reported = signature
+            self._verify_wall_evidence_reported_at = now
         self._verify_wall_rejection = ''
         return {'origin': local, 'axis': tuple(v / norm for v in axis), 'mean': mean,
                 'nearest': nearest, 'uncertainty': uncertainty, 'camera_frame': camera_frame,
                 'bearing': bearing, 'map_header': deepcopy(response.map_header),
                 'map_stamp_ns': _stamp_ns(response.map_header),
+                'evidence': evidence_name, 'evidence_code': evidence, 'samples': samples,
+                'mixed_samples': mixed, 'rows': rows, 'columns': columns,
                 'camera_associated': roi_source is not None,
                 'smoke_camera_stamp_ns': _stamp_ns(roi_source.header) if roi_source else 0}
 

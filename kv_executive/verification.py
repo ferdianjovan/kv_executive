@@ -565,13 +565,24 @@ class VerifyController:
 
     def _record_wall_observation(self, blackboard, wall):
         """Confirm proximity using two newly supported near measurements."""
+        self._check_wall_recheck_deadline(blackboard)
         if wall is None:
             blackboard['verify_wall_latest'] = None
-            blackboard['verify_wall_near_count'] = 0
-            blackboard['verify_wall_close_count'] = 0
-            if _bb_get(blackboard, 'verify_wall_recheck_deadline', None) is None and not (
-                    _bb_get(blackboard, 'verify_smoke_boundary_reached', False)):
-                blackboard['verify_smoke_walls'] = []
+            pending = _bb_get(blackboard, 'verify_wall_recheck_deadline', None) is not None
+            confirmed = _bb_get(blackboard, 'verify_smoke_boundary_reached', False)
+            if not pending or (
+                    confirmed and _bb_get(blackboard, 'verify_wall_near_count', 0) == 2):
+                blackboard['verify_wall_near_count'] = 0
+            if not pending:
+                # Confirmed arrival needs fresh revalidation after a gap. A
+                # pending vote, however, survives gaps inside its original
+                # bounded window; it is historical evidence, never live range.
+                blackboard['verify_wall_close_count'] = 0
+                if confirmed:
+                    blackboard['verify_wall_recheck_deadline'] = (
+                        time.monotonic() + self.config['verify_wall_recheck_timeout'])
+                else:
+                    blackboard['verify_smoke_walls'] = []
             return
         stamp = wall.get('map_stamp_ns', 0)
         last = _bb_get(blackboard, 'verify_wall_last_stamp_ns', 0)
@@ -582,7 +593,8 @@ class VerifyController:
             previous = _bb_get(blackboard, 'verify_wall_latest', None) or _bb_get(
                 blackboard, 'verify_smoke_wall_probe', None)
             if previous is None or self._wall_distance(wall) < self._wall_distance(previous):
-                blackboard['verify_wall_latest'] = wall
+                if _bb_get(blackboard, 'verify_wall_latest', None) is not None:
+                    blackboard['verify_wall_latest'] = wall
                 self._retain_wall(blackboard, wall)
             self.executive._report('Verify: repeated wall observation; confirmation unchanged')
             return
@@ -615,8 +627,12 @@ class VerifyController:
         blackboard['verify_wall_close_count'] = (
             min(2, _bb_get(blackboard, 'verify_wall_close_count', 0) + 1)
             if distance < self.config['verify_smoke_standoff'] else 0)
-        self.executive._report(f'Verify: wall confirmation {count}/2 from new map observations')
-        if count == 2:
+        close_count = blackboard['verify_wall_close_count']
+        self.executive._report(
+            f'Verify: wall confirmation {count}/2 from new map observations'
+            + (f'; close confirmation {close_count}/2 before retreat'
+               if distance < self.config['verify_smoke_standoff'] else ''))
+        if close_count == 2 or (count == 2 and distance >= self.config['verify_smoke_standoff']):
             blackboard['verify_smoke_boundary_reached'] = True
             blackboard['verify_wall_recheck_deadline'] = None
             self._inspection_begin(blackboard)
@@ -643,15 +659,19 @@ class VerifyController:
                     and wall is not None
                     and self.executive._verify_smoke_wall_at_standoff(wall))
 
+    def _check_wall_recheck_deadline(self, blackboard):
+        deadline = _bb_get(blackboard, 'verify_wall_recheck_deadline', None)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise self.error_type(
+                'Verify: near-wall revalidation exhausted; inspection incomplete; '
+                'holding for operator')
+
     def _wait_for_wall(self, blackboard):
         deadline = _bb_get(blackboard, 'verify_wall_recheck_deadline', None)
         if deadline is None:
             deadline = time.monotonic() + self.config['verify_wall_recheck_timeout']
             blackboard['verify_wall_recheck_deadline'] = deadline
-        if time.monotonic() >= deadline:
-            raise self.error_type(
-                'Verify: near-wall revalidation exhausted; inspection incomplete; '
-                'holding for operator')
+        self._check_wall_recheck_deadline(blackboard)
         self.executive._report('Verify: near-wall evidence unavailable; rechecking')
         self.executive._verify_hold(
             min(0.25, deadline - time.monotonic()),
@@ -1451,7 +1471,8 @@ class VerifyController:
             tolerance = self.config.get('position_tolerance', 0.3)
             remaining = wall['nearest'] - wall['uncertainty'] - standoff - tolerance
             self.executive._report(
-                f'Verify/CENTER_FIRE: 3 x 3 m smoke wall mean={wall["mean"]:.2f} m, '
+                f'Verify/CENTER_FIRE: 7 x 7 rays across 4.5 x 4.5 m smoke wall '
+                f'mean={wall["mean"]:.2f} m, '
                 f'nearest={wall["nearest"]:.2f} m, uncertainty={wall["uncertainty"]:.2f} m')
             at_standoff = smoke_wall_standoff_reached(
                 wall, standoff, tolerance,

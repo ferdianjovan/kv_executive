@@ -343,21 +343,34 @@ blocked recovery -> wait in LOITER for newer fresh maps -> bounded retry or expl
 ```
 
 Distance is measured to the observed smoke wall, never to an estimated fire
-position. An opt-in geometry query samples 25 parallel rays across a 3 m by 3 m
-patch perpendicular to the measurement direction: five rows and five columns,
-spaced 0.75 m apart. A candidate requires at least three qualifying rays covering
-at least two rows and two columns. Hits must be occupied in the latest map
-and have occupied/free changes in recent history. History alone cannot replay
-an old occupied hit when the latest map no longer supports it. This remains a
-suspected smoke boundary, not proof of the physical object's identity.
+position. Production geometry queries sample 49 parallel rays across a 4.5 m by
+4.5 m patch perpendicular to the measurement direction: seven rows and seven
+columns, spaced 0.75 m apart. Current returns must survive terrain rejection and
+camera association when image bounds are available. Two evidence routes exist:
+
+- Flicker-supported: at least three current returns across three rows and three
+  columns, including at least one hit with both occupied and explicitly free
+  observations in recent map history.
+- Persistent-return: at least six current returns across three rows and three
+  columns, without requiring occupied/free changes. Fresh confirmed RGB bounds,
+  enabled terrain rejection and an older fresh same-frame map are mandatory.
+  The earlier map supplies terrain-classification context; it does not count as
+  the controller's second independent wall observation.
+
+Neither route can replay an old hit when the latest map no longer supports it.
+Both produce candidates requiring independent reconfirmation. This remains a
+suspected smoke boundary, not proof of the physical object's identity. A vertical
+background object inside the smoke rectangle can still mimic persistent smoke.
+Legacy service requests retain the 25-ray, 3 m mixed-history-only measurement for
+compatibility and historical benchmark comparisons.
 Throttled diagnostics report current occupied hits, changing-occupancy hits,
 qualifying rows/columns, range uncertainty and unavailable query results, so a
 missing measurement can be distinguished from insufficient ray coverage.
 The mean range is logged, while the nearest sampled range, measurement
 uncertainty and tracking margin limit approach to `verify_smoke_standoff` (15 m).
 A positive report's conservative distance (nearest range minus uncertainty) must
-be at least the configured standoff and no more than twice the position tolerance
-beyond it. With the default 0.3 m tolerance, this is 15.0–15.6 m.
+be inside the configured inspection band, 15–20 m by default. The maximum
+accepted uncertainty remains 2 m.
 
 `APPROACH_SMOKE` probes along the next approach bearing. `SEARCH_FIRE` revalidates
 the nearby wall before entering inspection. `verify_wall_probe_timeout` limits
@@ -370,8 +383,12 @@ In `CENTER_FIRE`, missing wall evidence still prevents distance-based completion
 it does not prevent a separately validated height correction.
 
 A single far candidate can shorten its selected leg, but cannot be projected
-through later legs to declare arrival. Two consecutive near observations from
-distinct source-stamped maps confirm the inspection transition. Repeated queries
+through later legs to declare arrival. Two near observations from distinct
+source-stamped maps confirm the inspection transition. A first pending vote
+survives missing probes inside its original 20-second recheck window, so
+valid → missing → fresh valid can confirm arrival. Missing probes never provide
+live range or extend the deadline. An expired window remains an explicit
+incomplete-inspection abort; a late observation cannot revive it. Repeated queries
 on one map do not count twice. Each observation must satisfy the strengthened
 latest-map qualification; a new header cannot substitute for current occupied
 support. The two distances need not agree with a stationary plane or with the
@@ -385,7 +402,7 @@ A fresh qualifying farther measurement resets near confirmation and permits
 ordinary checked approach again, including when smoke moves away after arrival.
 The inspection clock is not restarted by these transitions. A closer observation
 withholds forward motion immediately, without waiting for a second reading;
-if already inside the standoff, a checked retreat is required.
+two independently observed close readings are required for a checked retreat.
 Publication still remeasures the boundary: cached observations cannot authorize
 a completed report, and no fire report is inferred from proximity alone.
 
@@ -539,7 +556,7 @@ nor independently starts timed inspection. A static first-hit obstacle alone
 cannot prove a smoke boundary. A stale, unknown or non-plume
 surface cannot establish a negative inspection result.
 Production aperture probes reject an inclined plane supported by earlier maps
-before counting flickering returns. This rejects stable sloping terrain whose
+before assembling either evidence route. This rejects stable sloping terrain whose
 voxel occupancy jitters, while leaving its occupied cells in the collision map.
 The geometry is a heuristic: persistent inclined smoke can resemble terrain and
 be rejected. Confirmed RGB smoke detections also publish an angular rectangle;
@@ -1045,10 +1062,31 @@ prove that all terrain or smoke shapes are classified correctly.
 Set `KV_WALL_FALSE_POSITIVE_REPORT_DIR` to keep a rerun's output elsewhere.
 No live mission or detector thresholds are changed by these tests.
 
+The expanded production probe has a separate opt-in terrain regression:
+
+```bash
+KV_RUN_WALL_FALSE_POSITIVE_BENCHMARK=1 \
+  colcon test --packages-select kv_executive --ctest-args -R '^expanded_wall_evidence$'
+```
+
+Its [raw report](test/reports/smoke_wall_expanded_evidence_20261102.json) records
+240 episodes of eight maps with 49 terrain-directed ray lanes. With terrain
+rejection enabled it accepted zero wall candidates across 1,920 queries. The
+reference without terrain rejection accepted candidates in 180 episodes; that
+reference also disables the persistent route because its terrain guard is absent.
+These are candidate diagnostics, not simulated arrival or retreat decisions.
+The measured 95th-percentile service time was about 90 ms, with a 185 ms maximum
+on this test machine; the optional production probe budget is 500 ms. Native
+tests separately cover both smoke evidence routes and their refusal cases.
+
 The package repositories are tagged
 `checkpoint-before-wall-validation-motion-limits-20261102` before these changes.
 Rollback of the executive and perception must be paired and followed by a rebuild
 and restart because their ROS message and service interfaces changed together.
+The checkpoint immediately before the expanded probe and confirmation-memory
+changes is `checkpoint-before-expanded-wall-evidence-20261102` in each package
+repository. This change updates the executive service interface; rebuild and
+restart the autonomy nodes together when applying it or rolling it back.
 
 Detection monitor tests cover either detector independently, confirmed-status
 gating, stale/future/zero source stamps, goal and phase boundaries, duplicate

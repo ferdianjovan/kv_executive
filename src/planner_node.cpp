@@ -1080,7 +1080,7 @@ private:
           best.inliers = std::move(inliers);
         }
       };
-    // The aperture has at most 25 returns. Deterministic three-point models
+    // The aperture has at most 49 returns. Deterministic three-point models
     // retain a terrain component even when some rays see a distinct smoke front.
     for (size_t i = 0; i < hits.size(); ++i) {
       for (size_t j = i + 1; j < hits.size(); ++j) {
@@ -1144,11 +1144,12 @@ private:
       {
         throw std::invalid_argument("Inspection clearances or corridor size are invalid");
       }
+      const double maximum_wall_width = request->smoke_wall_extended_evidence ? 4.5 : 3.0;
       if (!std::isfinite(request->smoke_wall_width) || request->smoke_wall_width < 0.0 ||
-        request->smoke_wall_width > 3.0 ||
+        request->smoke_wall_width > maximum_wall_width ||
         (request->smoke_wall_width > 0.0 && request->direction.header.frame_id.empty()))
       {
-        throw std::invalid_argument("Smoke wall width must be between zero and 3 metres");
+        throw std::invalid_argument("Smoke wall width is outside the selected aperture limits");
       }
       if (request->smoke_wall_camera_roi) {
         const auto valid_angle = [](double angle) {
@@ -1233,11 +1234,13 @@ private:
           std::vector<ApertureReturn> hits;
           size_t occupied_hits = 0, flicker_hits = 0, terrain_hits = 0, associated_hits = 0;
           double voxel_uncertainty = 0.0;
-          for (int row = -2; row <= 2; ++row) {
-            for (int column = -2; column <= 2; ++column) {
+          const int grid_radius = request->smoke_wall_extended_evidence ? 3 : 2;
+          const int grid_side = grid_radius * 2 + 1;
+          const double grid_spacing = request->smoke_wall_width / (grid_radius * 2);
+          for (int row = -grid_radius; row <= grid_radius; ++row) {
+            for (int column = -grid_radius; column <= grid_radius; ++column) {
               const auto sample = ray_origin + lateral *
-                (column * request->smoke_wall_width / 4.0) +
-                vertical * (row * request->smoke_wall_width / 4.0);
+                (column * grid_spacing) + vertical * (row * grid_spacing);
               // History supplies the flicker cue, never a substitute for a
               // current occupied return. A newer free map must not replay an
               // older wall as another independent proximity observation.
@@ -1250,8 +1253,8 @@ private:
               ++occupied_hits;
               const double depth = (wall_hit - sample).dot(ray_direction);
               if (depth > 0.0 && depth <= request->max_range) {
-                hits.push_back({row, column, column * request->smoke_wall_width / 4.0,
-                    row * request->smoke_wall_width / 4.0, depth,
+                hits.push_back({row, column, column * grid_spacing,
+                    row * grid_spacing, depth,
                     leafSizeAt(*latest.tree, wall_hit), wall_hit});
               }
             }
@@ -1328,8 +1331,9 @@ private:
             ++associated_hits;
             uint32_t occupied = 0, free = 0;
             occupancyEvidence(history, h.hit, occupied, free);
-            if (occupied > 0 && free > 0) {++flicker_hits;}
-            if (occupied > 0 && free > 0) {
+            const bool mixed = occupied > 0 && free > 0;
+            if (mixed) {++flicker_hits;}
+            if (mixed || request->smoke_wall_extended_evidence) {
               ranges.push_back(h.depth);
               rows.insert(h.row);
               columns.insert(h.column);
@@ -1338,7 +1342,27 @@ private:
             }
           }
           response->smoke_wall_samples = ranges.size();
-          if (ranges.size() >= 3 && rows.size() >= 2 && columns.size() >= 2) {
+          response->smoke_wall_mixed_samples = flicker_hits;
+          response->smoke_wall_rows = rows.size();
+          response->smoke_wall_columns = columns.size();
+          const size_t coverage = request->smoke_wall_extended_evidence ? 3 : 2;
+          const bool prior_context = std::any_of(history.begin(), history.end(),
+              [&](const auto & previous) {
+                return previous.tree != latest.tree && stampSeconds(previous.header.stamp) <
+                       stampSeconds(latest.header.stamp);
+              });
+          if (ranges.size() >= 3 && rows.size() >= coverage && columns.size() >= coverage) {
+            if (!request->smoke_wall_extended_evidence || flicker_hits > 0) {
+              response->smoke_wall_evidence = Response::WALL_EVIDENCE_FLICKER;
+            } else if (ranges.size() >= 6 && request->smoke_wall_camera_roi &&
+              request->smoke_wall_reject_terrain && prior_context)
+            {
+              // Static occupied support alone is only a candidate. The client
+              // must independently reconfirm it on a newly source-stamped map.
+              response->smoke_wall_evidence = Response::WALL_EVIDENCE_PERSISTENT;
+            }
+          }
+          if (response->smoke_wall_evidence != Response::WALL_EVIDENCE_NONE) {
             double sum = 0.0;
             for (const double range : ranges) {sum += range;}
             const double mean = sum / ranges.size();
@@ -1350,16 +1374,33 @@ private:
               std::sqrt(variance / ranges.size());
             response->smoke_wall_valid = true;
           }
+          const char * evidence = "NONE";
+          if (response->smoke_wall_evidence == Response::WALL_EVIDENCE_FLICKER) {
+            evidence = "FLICKER";
+          } else if (response->smoke_wall_evidence == Response::WALL_EVIDENCE_PERSISTENT) {
+            evidence = "PERSISTENT";
+          }
           std::ostringstream diagnostic;
-          diagnostic << "Smoke wall aperture: current occupied rays=" << occupied_hits << "/25"
+          diagnostic << "Smoke wall aperture: current occupied rays=" << occupied_hits
+                     << "/" << grid_side * grid_side
                      << ", occupied/free history rays=" << flicker_hits
                      << ", qualifying rays=" << ranges.size()
                      << ", rows=" << rows.size() << ", columns=" << columns.size()
-                     << ", required=3 rays/2 rows/2 columns"
+                     << ", required=3 rays/" << coverage << " rows/" << coverage << " columns"
+                     << ", grid=" << grid_side << "x" << grid_side
+                     << ", width=" << request->smoke_wall_width << " m"
+                     << ", evidence=" << evidence
+                     << ", camera ROI enabled=" << request->smoke_wall_camera_roi
+                     << ", terrain rejection enabled=" << request->smoke_wall_reject_terrain
+                     << ", prior map context=" << prior_context
                      << ", fresh history maps=" << history.size()
                      << ", stable terrain rays excluded=" << terrain_hits
                      << ", prior terrain support=" << prior_support
                      << ", camera-associated rays=" << associated_hits;
+          if (request->smoke_wall_extended_evidence) {
+            diagnostic << ", FLICKER requires >=1 mixed ray; PERSISTENT requires >=6 "
+                       << "current rays and prior map/camera/terrain guards";
+          }
           if (terrain.valid) {
             diagnostic << ", terrain normal up=" << terrain.up
                        << ", terrain fit residual=" << terrain.residual << " m";

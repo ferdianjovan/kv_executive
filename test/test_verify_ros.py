@@ -254,6 +254,10 @@ def monitoring_sensors(mission):
                 # to the approach probes that now confirm inspection arrival.
                 distance = sensors.smoke_wall_range
         if request.smoke_wall_width:
+            response.smoke_wall_samples = 6
+            response.smoke_wall_mixed_samples = 1
+            response.smoke_wall_rows = response.smoke_wall_columns = 3
+            response.smoke_wall_evidence = response.WALL_EVIDENCE_FLICKER
             # Most smoke-flight cases start outside ranging coverage. A near
             # thermal wall must not silently become smoke-arrival evidence.
             if request.direction.header.frame_id == response.map_header.frame_id:
@@ -915,7 +919,7 @@ def test_broad_smoke_alone_keeps_approaching_without_entering_timed_inspection(
         with fcu.lock:
             statuses = [text for _, text in fcu.statuses]
             probes = [request for request in fcu.geometry_requests
-                      if request.smoke_wall_width == 3.0
+                      if request.smoke_wall_width == 4.5
                       and request.origin.header.frame_id == 'test_rgb_camera']
         assert len(probes) >= 2
         assert 'Verify: approach destination reached; reacquiring smoke or fire' in statuses
@@ -947,7 +951,7 @@ def test_edge_fire_uses_symmetric_combined_height_and_forward_fallback_order(
         with fcu.lock:
             origin = deepcopy(fcu.pose)
             # An edge-height request must reach the opportunistic probe too.
-            assert any(query.smoke_wall_width == 3.0 for query in fcu.geometry_requests)
+            assert any(query.smoke_wall_width == 4.5 for query in fcu.geometry_requests)
         response = original_plan(request, response)
         target = deepcopy(request.target.pose)
         horizontal = math.hypot(target.position.x - origin.position.x,
@@ -1890,7 +1894,7 @@ def test_visible_fire_adjusts_altitude_at_fifteen_metre_standoff(
         assert all(math.hypot(request.target.pose.position.x - initial.position.x,
                               request.target.pose.position.y - initial.position.y) < 0.03
                    for request in requests)
-        assert any(request.smoke_wall_width == 3.0 for request in fcu.geometry_requests)
+        assert any(request.smoke_wall_width == 4.5 for request in fcu.geometry_requests)
     cancel_goal(goal)
     _assert_airborne_safety(mission)
 
@@ -2100,7 +2104,7 @@ def test_opportunistic_wall_arrival_searches_and_reports_without_broad_smoke(
         with fcu.lock:
             statuses = [text for _, text in fcu.statuses]
             requests = [request for request in fcu.geometry_requests
-                        if request.smoke_wall_width == 3.0
+                        if request.smoke_wall_width == 4.5
                         and request.origin.header.frame_id == 'test_rgb_camera']
         for state in ('APPROACH_SMOKE', 'REACQUIRE', 'SEARCH_FIRE', 'CENTER_FIRE'):
             assert f'Verify/{state}: started' in statuses
@@ -2197,6 +2201,73 @@ def test_one_close_wall_then_missing_holds_until_a_fresh_far_range(
             assert any('fresh wall moved beyond inspection band' in text
                        for _, text in fcu.statuses)
         _assert_terrain_planning(mission)
+    finally:
+        cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
+@pytest.mark.parametrize('evidence', ['flicker', 'persistent'])
+@pytest.mark.parametrize('fire_visible', [False, True], ids=['search_smoke', 'center_fire'])
+def test_two_qualified_maps_across_wall_gap_route_without_stale_success(
+    mission, monitoring_sensors, evidence, fire_visible,
+):
+    """Both evidence routes retain one vote through gaps, never its live range."""
+    sensors, fcu = monitoring_sensors, mission.fcu
+    original_geometry = fcu.geometry_service.callback
+    release = threading.Event()
+    probes, accepted, accepted_probe_counts = [], [], []
+
+    def wall_with_missing_gap(request, response):
+        response = original_geometry(request, response)
+        if request.smoke_wall_width and request.origin.header.frame_id == 'test_rgb_camera':
+            probes.append(deepcopy(request))
+            response.smoke_wall_valid = not accepted or (release.is_set() and len(accepted) == 1)
+            response.smoke_wall_range = response.smoke_wall_nearest_range = 18.1
+            response.smoke_wall_rows = response.smoke_wall_columns = 3
+            response.smoke_wall_samples = 3 if evidence == 'flicker' else 6
+            response.smoke_wall_mixed_samples = 1 if evidence == 'flicker' else 0
+            response.smoke_wall_evidence = (response.WALL_EVIDENCE_FLICKER
+                                            if evidence == 'flicker'
+                                            else response.WALL_EVIDENCE_PERSISTENT)
+            if response.smoke_wall_valid:
+                accepted.append(deepcopy(response.map_header.stamp))
+                accepted_probe_counts.append(len(probes))
+        return response
+
+    fcu.geometry_service.callback = wall_with_missing_gap
+    if fire_visible:
+        goal = _start_visible_fire(mission, sensors)
+    else:
+        goal = _start_airborne_exploration(mission)
+        with sensors.lock:
+            sensors.source = 'smoke'
+    try:
+        wait_for(lambda: len(probes) >= 3, 12.0,
+                 'one qualified map followed by missing wall probes')
+        with fcu.lock:
+            statuses = [text for _, text in fcu.statuses]
+            assert not fcu.target_requests and not fcu.inspection_planning_requests
+        assert any('wall confirmation 1/2' in text for text in statuses)
+        assert 'Verify/SEARCH_FIRE: started' not in statuses
+        assert 'Verify/CENTER_FIRE: started' not in statuses
+        assert not sensors.inspection_snapshot()
+        release.set()
+        destination = 'CENTER_FIRE' if fire_visible else 'SEARCH_FIRE'
+        wait_for(lambda: any(text == f'Verify/{destination}: started'
+                             for _, text in fcu.statuses),
+                 10.0, 'the second distinct qualified map to complete the retained vote')
+        assert len(accepted) == 2
+        assert len({(stamp.sec, stamp.nanosec) for stamp in accepted}) == 2
+        assert all(request.smoke_wall_extended_evidence and request.smoke_wall_width == 4.5
+                   for request in probes)
+        if evidence == 'persistent':
+            assert all(request.smoke_wall_camera_roi for request in probes)
+        # Every later probe is missing. Historical votes permit routing only;
+        # they cannot publish success without a current qualified wall range.
+        wait_for(lambda: len(probes) > accepted_probe_counts[-1], 5.0,
+                 'a missing post-arrival wall revalidation')
+        assert not sensors.inspection_snapshot()
+        assert not goal.get_result_async().done()
     finally:
         cancel_goal(goal)
     _assert_airborne_safety(mission)
@@ -2549,7 +2620,7 @@ def test_fire_informed_climb_finishes_through_flicker_before_reporting(
         assert completed_at - selected_at[0] <= (config['verify_fire_leg_timeout']
                                                  + config['mode_timeout'])
         assert not any('Tracked fire observation lost' in text for text in messages)
-        assert any(request.smoke_wall_width == 3.0 for request in fcu.geometry_requests)
+        assert any(request.smoke_wall_width == 4.5 for request in fcu.geometry_requests)
         assert not any(request.minimum_radius > 0.0
                        for request in fcu.inspection_planning_requests)
     cancel_goal(goal)

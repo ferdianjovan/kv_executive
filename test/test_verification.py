@@ -2150,14 +2150,173 @@ def test_duplicate_map_observation_cannot_confirm_near_arrival(system):
     assert not verification._bb_get(board, 'verify_smoke_boundary_reached', False)
 
 
-def test_unavailable_probe_breaks_unconfirmed_near_streak(system):
+@pytest.mark.parametrize('evidence', [
+    ('flicker', 'flicker'), ('persistent', 'persistent'),
+    ('flicker', 'persistent'), ('persistent', 'flicker'),
+])
+def test_missing_probes_preserve_pending_near_vote_without_live_range(system, evidence):
+    executive, controller = system
+    board = Blackboard()
+    first = {**_qualified_wall(executive, 10.4, 101), 'evidence': evidence[0]}
+    controller._record_wall_observation(board, first)
+    deadline = board['verify_wall_recheck_deadline']
+    for _ in range(3):
+        executive.now += 2.0
+        controller._record_wall_observation(board, None)
+        assert board['verify_wall_latest'] is None
+        assert board['verify_wall_near_count'] == 1
+        assert board['verify_wall_recheck_deadline'] == deadline
+        assert board['verify_smoke_walls'] == [first]
+        assert not controller._at_known_wall(board)
+        assert controller._wall_action(board) == 'reacquire'
+    controller._record_wall_observation(
+        board, {**_qualified_wall(executive, 10.3, 102), 'evidence': evidence[1]})
+    assert board['verify_wall_near_count'] == 2
+    assert controller._wall_action(board) == 'ready'
+    assert not any(event[0] in {'navigation', 'recovery_plan', 'inspection_report'}
+                   for event in executive.events)
+
+
+def test_missing_probes_preserve_close_vote_until_a_second_new_close_map(system):
+    executive, controller = system
+    board = Blackboard()
+    controller._record_wall_observation(board, _qualified_wall(executive, 8.0, 101))
+    deadline = board['verify_wall_recheck_deadline']
+    executive.now += 4.0
+    controller._record_wall_observation(board, None)
+    assert board['verify_wall_latest'] is None
+    assert board['verify_wall_close_count'] == 1
+    assert board['verify_wall_recheck_deadline'] == deadline
+    assert controller._wall_action(board) == 'reacquire'
+    assert not any(event[0] == 'recovery_plan' for event in executive.events)
+    controller._record_wall_observation(board, _qualified_wall(executive, 8.2, 102))
+    assert board['verify_wall_close_count'] == 2
+    assert controller._wall_action(board) == 'reacquire'
+    assert len([event for event in executive.events if event[0] == 'recovery_plan']) == 1
+
+
+@pytest.mark.parametrize('stamp', [100, 101])
+@pytest.mark.parametrize('distance', [10.4, 8.0])
+def test_replayed_or_reordered_map_after_gap_does_not_refresh_or_confirm(system, stamp, distance):
+    executive, controller = system
+    board = Blackboard()
+    controller._record_wall_observation(board, _qualified_wall(executive, distance, 101))
+    deadline = board['verify_wall_recheck_deadline']
+    controller._record_wall_observation(board, None)
+    executive.now += 1.0
+    controller._record_wall_observation(board, _qualified_wall(executive, distance - 0.1, stamp))
+    assert board['verify_wall_latest'] is None
+    assert board['verify_wall_last_stamp_ns'] == 101
+    assert board['verify_wall_near_count'] == 1
+    assert board['verify_wall_close_count'] == (1 if distance < 10.0 else 0)
+    assert board['verify_wall_recheck_deadline'] == deadline
+    assert controller._wall_action(board) == 'reacquire'
+    assert not controller._at_known_wall(board)
+    assert not any(event[0] == 'recovery_plan' for event in executive.events)
+    controller._record_wall_observation(board, _qualified_wall(executive, distance - 0.1, 102))
+    if distance < 10.0:
+        assert controller._wall_action(board) == 'reacquire'
+        assert len([event for event in executive.events if event[0] == 'recovery_plan']) == 1
+    else:
+        assert controller._wall_action(board) == 'ready'
+
+
+@pytest.mark.parametrize('kind', ['near', 'close', 'far', 'replayed', 'missing'])
+def test_expired_wall_window_rejects_reappearing_evidence_before_counting(system, kind):
+    executive, controller = system
+    board = Blackboard()
+    board['verify_inspection_started'] = executive.now - 5.0
+    started = board['verify_inspection_started']
+    controller._record_wall_observation(board, _qualified_wall(executive, 10.4, 101))
+    deadline = board['verify_wall_recheck_deadline']
+    controller._record_wall_observation(board, None)
+    executive.now = deadline
+    distance = {'near': 10.3, 'close': 8.0, 'far': 18.0, 'replayed': 10.3}
+    wall = (None if kind == 'missing' else _qualified_wall(
+        executive, distance[kind], 101 if kind == 'replayed' else 102))
+    with pytest.raises(RuntimeError, match='near-wall revalidation exhausted'):
+        controller._record_wall_observation(board, wall)
+    assert board['verify_wall_latest'] is None
+    assert board['verify_wall_near_count'] == 1
+    assert board['verify_wall_last_stamp_ns'] == 101
+    assert board['verify_wall_recheck_deadline'] == deadline
+    assert board['verify_inspection_started'] == started
+    assert not any(event[0] in {'navigation', 'recovery_plan', 'inspection_report'}
+                   for event in executive.events)
+
+
+@pytest.mark.parametrize('first_distance', [10.4, 8.0])
+def test_fresh_far_map_after_gap_clears_pending_vote_and_keeps_main_clock(system, first_distance):
+    executive, controller = system
+    board = Blackboard()
+    board['verify_inspection_started'] = executive.now - 5.0
+    started = board['verify_inspection_started']
+    controller._record_wall_observation(board, _qualified_wall(executive, first_distance, 101))
+    controller._record_wall_observation(board, None)
+    executive.now += 2.0
+    controller._record_wall_observation(board, _qualified_wall(executive, 18.0, 102))
+    assert controller._wall_action(board) == 'approach'
+    assert board['verify_wall_near_count'] == board['verify_wall_close_count'] == 0
+    assert board['verify_wall_recheck_deadline'] is None
+    assert board['verify_inspection_started'] == started
+    assert not verification._bb_get(board, 'verify_smoke_boundary_reached', False)
+    controller._record_wall_observation(board, _qualified_wall(executive, 10.3, 101))
+    assert controller._wall_action(board) == 'approach'
+
+
+@pytest.mark.parametrize('confirmed', [False, True])
+def test_band_votes_then_close_votes_share_bounded_window_across_gaps(system, confirmed):
     executive, controller = system
     board = Blackboard()
     controller._record_wall_observation(board, _qualified_wall(executive, 10.4, 101))
+    deadline = board['verify_wall_recheck_deadline']
+    if confirmed:
+        controller._record_wall_observation(board, _qualified_wall(executive, 10.3, 102))
+        assert board['verify_smoke_boundary_reached']
+        deadline = None
+    executive.now += 2.0
+    expected_deadline = executive.now + 20.0 if deadline is None else deadline
+    controller._record_wall_observation(board, _qualified_wall(executive, 8.0, 103))
+    assert board['verify_wall_near_count'] == 2
+    assert board['verify_wall_close_count'] == 1
+    assert board['verify_wall_recheck_deadline'] == expected_deadline
+    assert controller._wall_action(board) == 'reacquire'
+    assert not any(event[0] == 'recovery_plan' for event in executive.events)
+    executive.now += 2.0
     controller._record_wall_observation(board, None)
-    controller._record_wall_observation(board, _qualified_wall(executive, 10.3, 102))
+    assert board['verify_wall_near_count'] == (0 if confirmed else 2)
+    assert board['verify_wall_close_count'] == 1
+    assert board['verify_wall_recheck_deadline'] == expected_deadline
+    controller._record_wall_observation(board, _qualified_wall(executive, 8.2, 104))
+    assert controller._wall_action(board) == 'reacquire'
+    assert len([event for event in executive.events if event[0] == 'recovery_plan']) == 1
+
+
+def test_confirmed_band_then_close_gap_needs_new_near_votes_for_arrival(system):
+    executive, controller = system
+    board = _confirmed_wall_board(executive, controller)
+    started = board['verify_inspection_started']
+    executive.now += 1.0
+    controller._record_wall_observation(board, _qualified_wall(executive, 8.0))
+    deadline = board['verify_wall_recheck_deadline']
+    controller._record_wall_observation(board, None)
+    assert board['verify_wall_near_count'] == 0
+    assert board['verify_wall_close_count'] == 1
+    assert board['verify_wall_latest'] is None
+    executive.now += 1.0
+    controller._record_wall_observation(board, _qualified_wall(executive, 10.3))
     assert board['verify_wall_near_count'] == 1
-    assert not verification._bb_get(board, 'verify_smoke_boundary_reached', False)
+    assert board['verify_wall_close_count'] == 0
+    assert board['verify_wall_recheck_deadline'] == deadline
+    assert controller._wall_action(board) == 'reacquire'
+    assert not controller._at_known_wall(board)
+    assert not any(event[0] in {'recovery_plan', 'navigation', 'inspection_report'}
+                   for event in executive.events)
+    controller._record_wall_observation(board, None)
+    executive.now += 1.0
+    controller._record_wall_observation(board, _qualified_wall(executive, 10.4))
+    assert controller._wall_action(board) == 'ready'
+    assert board['verify_inspection_started'] == started
 
 
 def test_fresh_far_observation_releases_arrival_without_restarting_inspection_clock(system):
@@ -2198,14 +2357,15 @@ def test_pending_wall_reconfirmation_preserves_height_hint_without_translation(s
     controller._capture_height_hint(board)
     fire(executive, controller, detected=False)
     hint = deepcopy(board['verify_height_hint'])
-    board['verify_wall_recheck_deadline'] = executive.now + 20.0
+    controller._record_wall_observation(board, _qualified_wall(executive, 10.4, 101))
+    controller._record_wall_observation(board, None)
     assert not controller._recover_fire_height(board)
     assert board['verify_height_hint'] == hint
     assert verification._bb_get(board, 'verify_height_hint_consumed', 0) == 0
     assert not verification._bb_get(board, 'verify_height_only_attempted', False)
     assert not any(event[0] == 'recovery_plan' for event in executive.events)
     assert executive.odometry.pose.pose.position == Point(z=6.0)
-    board['verify_wall_recheck_deadline'] = None
+    controller._record_wall_observation(board, _qualified_wall(executive, 18.0, 102))
     assert controller._recover_fire_height(board)
     assert executive.odometry.pose.pose.position.z == pytest.approx(
         6.0 + math.copysign(0.5, angle))
@@ -2308,8 +2468,13 @@ def test_confirmed_wall_needs_two_new_near_readings_after_a_missing_probe(system
     assert controller._wall_action(board) == 'ready'
     controller._record_wall_observation(board, None)
     assert board['verify_smoke_boundary_reached']
+    deadline = board['verify_wall_recheck_deadline']
     controller._record_wall_observation(board, _qualified_wall(executive, 10.25, 103))
     assert controller._wall_action(board) == 'reacquire'
+    controller._record_wall_observation(board, None)
+    assert board['verify_wall_latest'] is None
+    assert board['verify_wall_near_count'] == 1
+    assert board['verify_wall_recheck_deadline'] == deadline
     controller._record_wall_observation(board, _qualified_wall(executive, 10.4, 104))
     assert controller._wall_action(board) == 'ready'
 

@@ -329,6 +329,10 @@ class SimulatedFcu(Node):
                 response.smoke_wall_nearest_range = response.surface_range
                 response.smoke_wall_uncertainty = 0.1
                 response.smoke_wall_samples = 25
+                if request.smoke_wall_extended_evidence:
+                    response.smoke_wall_evidence = response.WALL_EVIDENCE_FLICKER
+                    response.smoke_wall_mixed_samples = 25
+                    response.smoke_wall_rows = response.smoke_wall_columns = 5
         if request.ground_query.header.frame_id:
             response.ground_valid = True
             response.ground_surface.header = deepcopy(response.map_header)
@@ -613,9 +617,30 @@ def test_repeated_canceled_airborne_goals_with_simulated_clock(mission):
             goal = future.result()
             assert goal.accepted
             result_future = goal.get_result_async()
+
+            def cycle_completed():
+                completed = sum(text == 'EXECUTE_PATH: done' for _, text in fcu.statuses)
+                if result_future.done():
+                    outcome = result_future.result()
+                    with fcu.lock:
+                        losses = list(fcu.offboard_losses)
+                        setpoints = list(fcu.setpoints)
+                    gaps = []
+                    for before, after in zip(setpoints, setpoints[1:]):
+                        if before[1] != 'OFFBOARD':
+                            continue
+                        first, second = before[2].header.stamp, after[2].header.stamp
+                        source_gap = second.sec - first.sec + (
+                            second.nanosec - first.nanosec) / 1e9
+                        gaps.append((after[0] - before[0], source_gap))
+                    pytest.fail(
+                        f'Mission terminated before exploration cycle: {outcome.result.message}; '
+                        f'OFFBOARD watchdog losses={losses}; '
+                        f'largest receipt/source gaps={sorted(gaps, reverse=True)[:3]}')
+                return completed >= expected_paths
+
             wait_for(
-                lambda: sum(text == 'EXECUTE_PATH: done' for _, text in fcu.statuses)
-                >= expected_paths,
+                cycle_completed,
                 40.0, 'one complete exploration cycle',
             )
             assert not result_future.done()
