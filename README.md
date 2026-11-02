@@ -989,6 +989,24 @@ reported-fire Exploration goal exclusion. Battery tests cover depletion calculat
 recording, baseline and home handling, telemetry validity, and buffered return
 alerts. These tests do not replace SITL or vehicle flight validation.
 
+An opt-in smoke-wall benchmark runs the installed native estimator on known
+no-smoke terrain with seeded map-registration jitter. It measures per-probe
+candidates, per-episode false walls, retreat eligibility and the two-near-map
+gate. These are conditional synthetic stress-test rates, not a real mission
+false-positive percentage. The default test run skips this benchmark.
+After sourcing ROS and the built workspace, run from the workspace root:
+
+```bash
+KV_RUN_WALL_FALSE_POSITIVE_BENCHMARK=1 \
+  install/kv_executive/lib/kv_executive/python_shared_runtime --python /usr/bin/python3 -- \
+  -m pytest -q -s src/kv_executive/test/test_smoke_wall_false_positives.py
+```
+
+The benchmark writes a [readable report](test/reports/smoke_wall_false_positives_20261102.md)
+and [raw measurements](test/reports/smoke_wall_false_positives_20261102.json).
+Set `KV_WALL_FALSE_POSITIVE_REPORT_DIR` to keep a rerun's output elsewhere.
+No live mission or detector thresholds are changed by these tests.
+
 Detection monitor tests cover either detector independently, confirmed-status
 gating, stale/future/zero source stamps, goal and phase boundaries, duplicate
 observations, idle suppression and rearming on each

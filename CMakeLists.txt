@@ -129,6 +129,9 @@ if(BUILD_TESTING)
   ament_add_pytest_test(
     battery_monitor_constant_ros test/test_battery_monitor_constant_ros.py TIMEOUT 120)
   ament_add_pytest_test(planner_inputs test/test_planner_inputs.py TIMEOUT 90)
+  # Statistical native-planner benchmark; skipped unless explicitly enabled.
+  ament_add_pytest_test(
+    smoke_wall_false_positives test/test_smoke_wall_false_positives.py TIMEOUT 600)
   ament_add_pytest_test(
     smoke_navigation_sparse_terrain test/test_smoke_navigation_sparse_terrain.py TIMEOUT 45)
   ament_add_pytest_test(source_localization test/test_source_localization.py TIMEOUT 45)
