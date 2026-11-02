@@ -601,6 +601,8 @@ class MissionExecutive(
         blackboard['verify_search_active'] = False
         blackboard['verify_search_recovery_required'] = False
         blackboard['verify_search_failures'] = 0
+        blackboard['verify_fire_loss_failures'] = 0
+        blackboard['verify_fire_loss_after_ns'] = 0
         blackboard['verify_localization_steps'] = 0
         blackboard['verify_localization_origin'] = None
         blackboard['verify_navigation_start_refreshes'] = 0

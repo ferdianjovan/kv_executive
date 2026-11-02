@@ -435,6 +435,19 @@ inspection clock continues through alignment, settling and observation waits.
 Publication still remeasures the boundary: cached observations cannot authorize
 a completed report, and no fire report is inferred from proximity alone.
 
+Fire-loss retries and blocked movement use independent counters, each bounded by
+`verify_search_recovery_max` (3 by default). A newly accepted persistent fire
+image resets only the fire-loss counter when the vehicle is physically settled
+and the image is newer than the loss, arrival and settling cutoffs. An image
+from before the loss, remembered confirmation or in-flight sighting cannot reset
+that budget. Blocked
+movement still requires the existing useful-motion recovery; visible fire does
+not forgive a blocked path. The inspection clock, wall recheck deadline, map
+recovery and settling limits continue independently. Logs distinguish
+`fire-loss recovery` from movement's `blocked recovery`.
+The [counter validation report](test/reports/fire_loss_counter_validation_20261102.md)
+records the regression coverage and rollback commit.
+
 Fire centering attempts one bounded yaw correction. Fresh confirmed thermal
 guidance also biases the next goal upward or downward by at most
 `verify_vertical_step` (0.5 m), with observed terrain clearance taking priority.

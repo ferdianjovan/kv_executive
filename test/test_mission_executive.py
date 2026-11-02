@@ -1755,6 +1755,9 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     blackboard['verify_descent_deferred'] = True
     blackboard['verify_height_only_attempted'] = True
     blackboard['verify_settle_failures'] = 2
+    blackboard['verify_search_failures'] = 2
+    blackboard['verify_fire_loss_failures'] = 2
+    blackboard['verify_fire_loss_after_ns'] = 123_000_000_000
     blackboard['verify_wall_recheck_after_settle'] = True
     harness._verify_heading_state = {'sources': {'old fire': 123}}
     harness._verify_wall_observation_context = {'settled_ns': 123}
@@ -1765,6 +1768,9 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     assert harness._verify_heading_state['sources'] == {}
     assert harness._verify_wall_observation_context is None
     assert blackboard['verify_settle_failures'] == 0
+    assert blackboard['verify_search_failures'] == 0
+    assert blackboard['verify_fire_loss_failures'] == 0
+    assert blackboard['verify_fire_loss_after_ns'] == 0
     assert not blackboard['verify_wall_recheck_after_settle']
     assert not blackboard['verify_entered']
     assert blackboard['verify_approaches'] == 0

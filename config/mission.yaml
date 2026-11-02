@@ -129,7 +129,8 @@ mission_executive:
     # Keep the aircraft level; these position setpoints cannot safely request tilt.
     verify_search_hold: 5.0
     verify_search_center_timeout: 15.0  # Best effort; partial smoke remains usable.
-    verify_search_recovery_max: 3  # Consecutive blocked metric approaches per inspection.
+    # Independent limits for movement failures, fire-loss retries and settling failures.
+    verify_search_recovery_max: 3
     verify_localization_max_steps: 6  # Legacy; fire range never gates navigation.
     # Short smoke-guided goals in both APPROACH_SMOKE and SEARCH_FIRE.
     # Inspection paths retain occupied-obstacle and measured terrain checks.

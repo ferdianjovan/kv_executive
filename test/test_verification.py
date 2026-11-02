@@ -1467,10 +1467,13 @@ def test_lost_confirmed_fire_with_smoke_eventually_holds_without_false_negative(
     fire(executive, controller, detected=False)
     feed_smoke(executive, controller, coverage=0.3, regions=[1, 2, 3, 4])
     _enable_wall_probes(executive)
-    for _ in range(controller.config['verify_search_recovery_max'] - 1):
+    for index in range(controller.config['verify_search_recovery_max'] - 1):
         assert controller.center_fire(board) == 'reacquire'
+        assert board['verify_fire_loss_failures'] == index + 1
+        assert verification._bb_get(board, 'verify_search_failures', 0) == 0
     with pytest.raises(RuntimeError, match='Verify blocked'):
         controller.center_fire(board)
+    assert board['verify_fire_loss_failures'] == controller.config['verify_search_recovery_max']
     assert not any(e[0] == 'inspection_report' for e in executive.events)
 
 

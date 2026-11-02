@@ -1024,10 +1024,14 @@ class VerifyController:
         after_ns = max(after_ns, self._settled_observation_after_ns())
         fire = self.stable_fire()
         if fire is not None and self._stamp_ns(fire) > after_ns:
+            if _bb_get(blackboard, 'verify_fire_loss_failures', 0):
+                self._recover_fire_loss(blackboard, fire)
             return fire, 'fire'
         smoke = self._smoke_guidance(after_ns=after_ns)
         fire = self.stable_fire()
         if fire is not None and self._stamp_ns(fire) > after_ns:
+            if _bb_get(blackboard, 'verify_fire_loss_failures', 0):
+                self._recover_fire_loss(blackboard, fire)
             return fire, 'fire'
         return smoke, 'smoke'
 
@@ -1199,7 +1203,11 @@ class VerifyController:
         """Use current confirmed images, including before the first smoke leg."""
         fire = self.stable_fire()
         after_ns = max(after_ns, _bb_get(blackboard, 'verify_inspection_after_ns', 0))
-        return fire if fire is not None and self._stamp_ns(fire) > after_ns else None
+        if fire is not None and self._stamp_ns(fire) > after_ns:
+            if _bb_get(blackboard, 'verify_fire_loss_failures', 0):
+                self._recover_fire_loss(blackboard, fire)
+            return fire
+        return None
 
     def reacquire(self, blackboard):
         """Wait for post-stop guidance without discarding a confirmed fire target."""
@@ -1263,7 +1271,8 @@ class VerifyController:
                 return self._reacquire_result(blackboard, smoke)
         if (_bb_get(blackboard, 'verify_fire_observed', False) or self.had_fire_confirmation()
                 or _bb_get(blackboard, 'verify_smoke_boundary_reached', False)):
-            return self._search_blocked(blackboard, 'confirmed fire guidance has not recovered')
+            return self._search_blocked(
+                blackboard, 'confirmed fire guidance has not recovered', fire_loss=True)
         blackboard['verify_exploration_required'] = True
         self.executive._report('Verify: no fresh smoke or fire after bounded reacquisition')
         return 'explore'
@@ -1315,8 +1324,28 @@ class VerifyController:
                        _bb_get(blackboard, 'verify_smoke_approach_after_ns', 0),
                        self._settled_observation_after_ns())
         if fire is not None and self._stamp_ns(fire) > after_ns:
+            if _bb_get(blackboard, 'verify_fire_loss_failures', 0):
+                self._recover_fire_loss(blackboard, fire)
             return fire
         return None
+
+    def _recover_fire_loss(self, blackboard, fire):
+        """End a fire-loss episode using newly accepted, settled fire guidance only."""
+        if fire is None:
+            return False
+        after_ns = max(_bb_get(blackboard, 'verify_fire_loss_after_ns', 0),
+                       _bb_get(blackboard, 'verify_inspection_after_ns', 0),
+                       _bb_get(blackboard, 'verify_smoke_approach_after_ns', 0),
+                       _bb_get(blackboard, 'verify_arrival_after_ns', 0),
+                       self._settled_observation_after_ns())
+        if (self._stamp_ns(fire) <= after_ns
+                or not self.executive._verify_wall_observation_ready()):
+            return False
+        if _bb_get(blackboard, 'verify_fire_loss_failures', 0):
+            blackboard['verify_fire_loss_failures'] = 0
+            self.executive._report(
+                'Verify: fresh settled fire guidance recovered; fire-loss recovery count reset')
+        return True
 
     def _inspection_fire_event(self, blackboard):
         """Retain confirmation intent briefly, without reusing old guidance."""
@@ -1360,6 +1389,8 @@ class VerifyController:
             fire = self.stable_fire()
             smoke = self.fresh_smoke()
             if fire is not None and self._stamp_ns(fire) > after_ns:
+                if _bb_get(blackboard, 'verify_fire_loss_failures', 0):
+                    self._recover_fire_loss(blackboard, fire)
                 self._route_fire(blackboard)
                 return fire, 'fire'
             if smoke is not None and self._stamp_ns(smoke) > after_ns:
@@ -1790,7 +1821,8 @@ class VerifyController:
                 return 'explore'
             if _bb_get(blackboard, 'verify_fire_observed', False) or self.had_fire_confirmation():
                 return self._search_blocked(
-                    blackboard, 'confirmed fire guidance has not recovered at the near wall')
+                    blackboard, 'confirmed fire guidance has not recovered at the near wall',
+                    fire_loss=True)
             self._inspection_begin(blackboard)
             origin = _bb_get(blackboard, 'verify_inspection_origin', None) or self._pose()
             blackboard['verify_inspection_origin'] = origin
@@ -1850,11 +1882,25 @@ class VerifyController:
         except VerificationObservationLost:
             return 'reacquire'
 
-    def _search_blocked(self, blackboard, reason):
+    def _search_blocked(self, blackboard, reason, *, fire_loss=False):
         """Retain a blocked target and finish in LOITER rather than normal exploration."""
-        failures = _bb_get(blackboard, 'verify_search_failures', 0) + 1
-        blackboard['verify_search_failures'] = failures
-        self.executive._report(f'Verify: {reason}; blocked recovery '
+        if fire_loss:
+            # A new frame may have arrived since the caller observed the loss.
+            # Resolve that race before charging or exhausting a fire-only retry.
+            fire = self.stable_fire()
+            if self._recover_fire_loss(blackboard, fire):
+                return (self._route_fire(blackboard) if self._at_known_wall(blackboard)
+                        else 'reacquire')
+            with self._lock:
+                last_stamp = self._last_stamps['fire']
+            blackboard['verify_fire_loss_after_ns'] = max(
+                _bb_get(blackboard, 'verify_fire_loss_after_ns', 0),
+                self._now_ns(), last_stamp)
+        key = 'verify_fire_loss_failures' if fire_loss else 'verify_search_failures'
+        failures = _bb_get(blackboard, key, 0) + 1
+        blackboard[key] = failures
+        category = 'fire-loss recovery' if fire_loss else 'blocked recovery'
+        self.executive._report(f'Verify: {reason}; {category} '
                                f'{failures}/{self.config["verify_search_recovery_max"]}')
         if failures >= self.config['verify_search_recovery_max']:
             raise self.error_type(f'Verify blocked: {reason}; holding for operator')

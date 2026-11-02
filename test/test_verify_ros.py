@@ -1856,6 +1856,18 @@ def test_blocked_fire_approach_holds_without_reporting_success(
     with sensors.lock:
         sensors.trusted_source = False
         sensors.smoke_wall_range = mission.executive.config['verify_smoke_standoff'] + 10.0
+    controller = mission.executive._verify
+    original_blocked = controller._search_blocked
+    counters = []
+
+    def observed_blocked(board, reason, *, fire_loss=False):
+        try:
+            return original_blocked(board, reason, fire_loss=fire_loss)
+        finally:
+            if not fire_loss:
+                counters.append((board['verify_search_failures'],
+                                 board['verify_fire_loss_failures'],
+                                 controller.stable_fire() is not None))
 
     def occupied(request, response):
         with fcu.lock:
@@ -1866,22 +1878,141 @@ def test_blocked_fire_approach_holds_without_reporting_success(
         return response
 
     fcu.inspection_planning_service.callback = occupied
+    controller._search_blocked = observed_blocked
     goal = _start_visible_fire(mission, sensors)
     wait_for(lambda: any('simulated occupied approach corridor' in text
                          for _, text in fcu.statuses),
              15.0, 'blocked fire approach to withhold successful inspection')
     result = mission_result(goal)
+    controller._search_blocked = original_blocked
     with sensors.lock:
         sensors.source = None
     assert result.status == GoalStatus.STATUS_ABORTED
     assert not result.result.success
     assert 'Verify blocked:' in result.result.message
     assert not sensors.inspection_snapshot()
+    assert [count for count, _, _ in counters] == [1, 2, 3]
+    assert all(fire_losses == 0 and fire_visible for _, fire_losses, fire_visible in counters)
     with fcu.lock:
         assert fcu.inspection_planning_requests and not fcu.target_requests
         assert math.dist(_point_position(fcu.pose.position), _point_position(origin)) < 0.03
         assert any('blocked recovery 3/3' in text for _, text in fcu.statuses)
     _assert_same_goal_phases(sensors, goal)
+    _assert_airborne_safety(mission)
+
+
+def test_settled_fire_recovery_restarts_only_fire_loss_retries(
+    mission, monitoring_sensors,
+):
+    """Real detector recovery starts a new loss episode without forgiving blocked motion."""
+    sensors, fcu, executive = monitoring_sensors, mission.fcu, mission.executive
+    controller = executive._verify
+    original_report = executive._report
+    original_blocked = controller._search_blocked
+    original_recovered = controller._recover_fire_loss
+    original_geometry = fcu.geometry_service.callback
+    first_hidden, final_loss = threading.Event(), threading.Event()
+    boards, losses, recoveries = [], [], []
+
+    def hide_fire():
+        with sensors.lock:
+            sensors.source = 'smoke'
+        wait_for(lambda: controller.stable_fire() is None, 3.0,
+                 'negative thermal frames to reach the executive')
+
+    def observed_blocked(board, reason, *, fire_loss=False):
+        if fire_loss and not boards:
+            board['verify_search_failures'] = 2
+            boards.append(board)
+        return original_blocked(board, reason, fire_loss=fire_loss)
+
+    def observed_recovered(board, fire):
+        before = board['verify_fire_loss_failures']
+        cutoff = board['verify_fire_loss_after_ns']
+        deadlines = board['verify_inspection_started'], board['verify_wall_recheck_deadline']
+        result = original_recovered(board, fire)
+        if before and board['verify_fire_loss_failures'] == 0:
+            assert (board['verify_inspection_started'],
+                    board['verify_wall_recheck_deadline']) == deadlines
+            recoveries.append((before, controller._stamp_ns(fire), cutoff,
+                               board['verify_search_failures'],
+                               board['verify_inspection_started'],
+                               board['verify_wall_recheck_deadline']))
+            if len(recoveries) == 1:
+                hide_fire()
+        return result
+
+    def observe_report(message, error=False):
+        if message == 'Verify/CENTER_FIRE: started' and not first_hidden.is_set():
+            first_hidden.set()
+            hide_fire()
+        if ('; fire-loss recovery ' in message
+                and message.endswith(f'/{controller.config["verify_search_recovery_max"]}')):
+            board = boards[0]
+            count = board['verify_fire_loss_failures']
+            losses.append((count, board['verify_search_failures'],
+                           board['verify_inspection_started'],
+                           board['verify_wall_recheck_deadline']))
+            if len(losses) == 2:
+                with sensors.lock:
+                    sensors.source = 'smoke_fire'
+            elif len(losses) == 3:
+                final_loss.set()
+                # Keep a fourth loss from racing the test observer; wall
+                # revalidation remains unavailable so no report can slip out.
+                with sensors.lock:
+                    sensors.source = 'smoke_fire'
+        original_report(message, error=error)
+
+    def final_wall_unavailable(request, response):
+        response = original_geometry(request, response)
+        if final_loss.is_set() and request.smoke_wall_width:
+            response.smoke_wall_valid = False
+        return response
+
+    controller._search_blocked = observed_blocked
+    controller._recover_fire_loss = observed_recovered
+    executive._report = observe_report
+    fcu.geometry_service.callback = final_wall_unavailable
+    with sensors.lock:
+        # The physical wall remains nearby when only thermal fire is hidden.
+        # The default fixture otherwise supplies RGB wall range from fire mode.
+        sensors.approach_wall_range = sensors.smoke_wall_range
+    goal = _start_visible_fire(mission, sensors)
+    result = goal.get_result_async()
+
+    def active_until_last_loss():
+        assert not result.done(), result.result().result.message if result.done() else ''
+        return final_loss.is_set()
+
+    try:
+        config = executive.config
+        wait_for(active_until_last_loss,
+                 config['verify_settle_timeout'] + config['verify_settle_map_timeout']
+                 + 4 * config['verify_navigation_map_wait'] + 2 * config['mode_timeout'],
+                 'two fire-loss retries, qualified recovery, then a fresh first loss')
+        assert [entry[0] for entry in losses] == [1, 2, 1]
+        assert recoveries and recoveries[0][0] == 2
+        assert recoveries[0][1] > recoveries[0][2]
+        assert all(entry[1] == 2 for entry in losses)
+        assert all(entry[3] == 2 for entry in recoveries)
+        started, deadline = losses[0][2:]
+        assert started is not None
+        assert all(entry[2:] == (started, deadline) for entry in losses)
+        assert recoveries[0][4:] == (started, deadline)
+        assert boards[0]['verify_search_failures'] == 2
+        assert not sensors.inspection_snapshot()
+        assert not result.done()
+        _assert_same_goal_phases(sensors, goal)
+    finally:
+        with sensors.lock:
+            sensors.source = None
+        if not result.done():
+            cancel_goal(goal)
+        controller._search_blocked = original_blocked
+        controller._recover_fire_loss = original_recovered
+        executive._report = original_report
+        fcu.geometry_service.callback = original_geometry
     _assert_airborne_safety(mission)
 
 
