@@ -79,6 +79,10 @@ class Harness(InspectionNavigationMixin):
         self.odometry = Odometry(header=header())
         self.odometry.pose.pose = Pose(
             position=Point(z=20.0), orientation=quaternion_from_yaw(0.0))
+        # These protocol/navigation units start at an already prepared viewpoint.
+        # Physical motion and clock validation are exercised by settling tests.
+        self.wall_observation_ready = True
+        self._verify_wall_observation_context = {'settled_ns': 0}
         self._data_lock = threading.Lock()
         self._site_sequence = 0
         self._global_position_received = self.now
@@ -118,6 +122,9 @@ class Harness(InspectionNavigationMixin):
 
     def _verify_control_pose(self):
         return SimpleNamespace(mode='AUTO.LOITER'), deepcopy(self.odometry.pose.pose)
+
+    def _verify_wall_observation_ready(self):
+        return self.wall_observation_ready
 
     def _snapshot(self, require_armed=False):
         assert require_armed
@@ -442,6 +449,7 @@ def test_directly_below_fire_can_be_inspected_without_undefined_yaw(executive):
 
 
 def test_in_place_plan_keeps_existing_yaw_for_target_directly_below(executive):
+    executive.smoke = None  # Exercise geometry/fallback yaw without a camera observation.
     executive.odometry.pose.pose.orientation = quaternion_from_yaw(1.2)
     geometry = target_geometry(x=0, y=0, z=2)
     target = deepcopy(executive.odometry.pose.pose)
@@ -579,6 +587,7 @@ def test_terrain_escape_revalidation_latches_current_clearance_even_if_future_pa
 
 
 def test_ground_and_corridor_queries_convert_px4_local_coordinates_to_map(executive):
+    executive.smoke = None
     executive.conversion.translation.x = 10.0
     executive.conversion.translation.y = 20.0
     executive.odometry.pose.pose.position.x = 10.0
@@ -670,6 +679,7 @@ def test_fire_keepout_radius_never_blocks_a_terrain_safe_lateral_view(executive)
 
 
 def test_local_standoff_tolerates_only_submicrometre_roundoff(executive):
+    executive.smoke = None
     geometry = target_geometry()
     target = executive._verify_inspection_pose(geometry)
     target.position.x += 1e-12
@@ -1485,8 +1495,22 @@ def test_a_later_plan_refusal_cannot_reuse_a_previous_height_floor_rejection(exe
     assert executive._verify_height_rejection == ''
 
 
-def test_live_heading_prefers_fresh_fire_then_smoke_and_holds_the_last_view_through_gaps(
+def _historical_heading_camera(executive):
+    from geometry_msgs.msg import TransformStamped
+    poses = {}
+
+    def camera(frame, camera, stamp, timeout):
+        assert frame == 'map'
+        return TransformStamped(transform=Transform(rotation=quaternion_from_yaw(
+            poses.get(stamp.nanoseconds, 0.0))))
+
+    executive._tf_buffer = SimpleNamespace(lookup_transform=camera)
+    return poses
+
+
+def test_live_heading_prefers_fresh_fire_then_smoke_after_bounded_fire_gap(
         executive):
+    _historical_heading_camera(executive)
     executive.fire = _persistent_fire()
     executive.fire.yaw_correction_rad = -0.4
     executive.smoke.yaw_correction_rad = 0.3
@@ -1494,7 +1518,11 @@ def test_live_heading_prefers_fresh_fire_then_smoke_and_holds_the_last_view_thro
     pose = executive.odometry.pose.pose
 
     assert heading(pose) == pytest.approx(-math.radians(5.0))
-    executive.fire.header = header(executive.now - 3.0, 'thermal_camera')
+    executive.fire = None
+    executive.now += 1.0
+    assert heading(pose) == pytest.approx(-math.radians(5.0))
+    executive.now += 1.1
+    executive.smoke.header = header(executive.now, 'rgb_camera')
     assert heading(pose) == pytest.approx(math.radians(5.0))
     executive.smoke = None
     assert heading(pose) == pytest.approx(math.radians(5.0))
@@ -1502,15 +1530,18 @@ def test_live_heading_prefers_fresh_fire_then_smoke_and_holds_the_last_view_thro
 
 
 def test_same_image_does_not_accumulate_yaw_corrections_during_a_path(executive):
+    history = _historical_heading_camera(executive)
     executive.fire = _persistent_fire()
     heading = executive._verify_live_source_heading(0.0)
     pose = executive.odometry.pose.pose
     first = heading(pose)
     executive.odometry.pose.pose.orientation = quaternion_from_yaw(first)
 
-    assert heading(pose) == first
+    assert heading(pose) == pytest.approx(first)
 
-    executive.fire.header = header(executive.now + 0.01, 'thermal_camera')
+    executive.now += 0.5
+    executive.fire.header = header(executive.now, 'thermal_camera')
+    history[round(executive.now * 1e9)] = first
     assert heading(pose) == pytest.approx(first + math.radians(5.0))
 
 
@@ -1983,6 +2014,8 @@ def test_fire_loss_after_legacy_preparation_prevents_both_reports(executive):
 
 
 def test_center_fire_wall_queries_physical_camera_aperture_and_preserves_mean(executive):
+    executive.fire = _persistent_fire()
+
     def wall(request, response):
         assert request.smoke_wall_width == 4.5
         assert request.direction.vector.x == 1.0
@@ -2691,6 +2724,7 @@ def _wall_evidence(response, evidence=1, samples=6, mixed=1, rows=3, columns=3):
 ])
 def test_extended_wall_routes_retain_typed_support_and_camera_proof(
         executive, evidence, samples, mixed, associated):
+    executive.fire = _persistent_fire()
     executive.smoke_wall_valid = True
     if associated:
         _smoke_camera_roi(executive)

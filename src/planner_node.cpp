@@ -1232,6 +1232,8 @@ private:
           std::vector<double> ranges;
           std::set<int> rows, columns;
           std::vector<ApertureReturn> hits;
+          std::vector<size_t> support;
+          std::set<size_t> mixed_support;
           size_t occupied_hits = 0, flicker_hits = 0, terrain_hits = 0, associated_hits = 0;
           double voxel_uncertainty = 0.0;
           const int grid_radius = request->smoke_wall_extended_evidence ? 3 : 2;
@@ -1334,34 +1336,99 @@ private:
             const bool mixed = occupied > 0 && free > 0;
             if (mixed) {++flicker_hits;}
             if (mixed || request->smoke_wall_extended_evidence) {
-              ranges.push_back(h.depth);
-              rows.insert(h.row);
-              columns.insert(h.column);
-              voxel_uncertainty = std::max(voxel_uncertainty,
-                  std::sqrt(3.0) * h.size * 0.5);
+              support.push_back(i);
+              if (mixed) {mixed_support.insert(i);}
             }
           }
-          response->smoke_wall_samples = ranges.size();
-          response->smoke_wall_mixed_samples = flicker_hits;
-          response->smoke_wall_rows = rows.size();
-          response->smoke_wall_columns = columns.size();
           const size_t coverage = request->smoke_wall_extended_evidence ? 3 : 2;
           const bool prior_context = std::any_of(history.begin(), history.end(),
               [&](const auto & previous) {
                 return previous.tree != latest.tree && stampSeconds(previous.header.stamp) <
                        stampSeconds(latest.header.stamp);
               });
-          if (ranges.size() >= 3 && rows.size() >= coverage && columns.size() >= coverage) {
-            if (!request->smoke_wall_extended_evidence || flicker_hits > 0) {
-              response->smoke_wall_evidence = Response::WALL_EVIDENCE_FLICKER;
-            } else if (ranges.size() >= 6 && request->smoke_wall_camera_roi &&
-              request->smoke_wall_reject_terrain && prior_context)
+          struct DepthGroup
+          {
+            std::vector<size_t> support;
+            std::set<int> rows, columns;
+            size_t mixed{0};
+            double median{0.0};
+            uint8_t evidence{Response::WALL_EVIDENCE_NONE};
+          };
+          std::vector<DepthGroup> groups;
+          if (request->smoke_wall_extended_evidence) {
+            std::sort(support.begin(), support.end(), [&](size_t a, size_t b) {
+                return hits[a].depth < hits[b].depth;
+                });
+            for (const auto index : support) {
+              // Anchor each group to its nearest depth. Adjacent small gaps
+              // cannot chain foreground and background into an unbounded group.
+              if (groups.empty() || hits[index].depth -
+                hits[groups.back().support.front()].depth > inspection_wall_cluster_span_ + 1e-6)
+              {
+                groups.emplace_back();
+              }
+              groups.back().support.push_back(index);
+            }
+          } else {
+            // Legacy measurements retain all mixed-history returns and their
+            // original accumulation order, without depth grouping.
+            groups.emplace_back();
+            groups.back().support = support;
+          }
+          size_t selected = groups.size(), qualified_groups = 0;
+          size_t largest_group = groups.size();
+          for (size_t i = 0; i < groups.size(); ++i) {
+            auto & group = groups[i];
+            std::vector<double> depths;
+            for (const auto index : group.support) {
+              const auto & h = hits[index];
+              group.rows.insert(h.row); group.columns.insert(h.column);
+              group.mixed += mixed_support.count(index);
+              depths.push_back(h.depth);
+            }
+            std::sort(depths.begin(), depths.end());
+            if (!depths.empty()) {
+              group.median = (depths[(depths.size() - 1) / 2] + depths[depths.size() / 2]) * 0.5;
+            }
+            if (largest_group == groups.size() ||
+              group.support.size() > groups[largest_group].support.size())
             {
-              // Static occupied support alone is only a candidate. The client
-              // must independently reconfirm it on a newly source-stamped map.
-              response->smoke_wall_evidence = Response::WALL_EVIDENCE_PERSISTENT;
+              largest_group = i;
+            }
+            if (group.support.size() >= 3 && group.rows.size() >= coverage &&
+              group.columns.size() >= coverage)
+            {
+              if (!request->smoke_wall_extended_evidence || group.mixed > 0) {
+                group.evidence = Response::WALL_EVIDENCE_FLICKER;
+              } else if (group.support.size() >= 6 && request->smoke_wall_camera_roi &&
+                request->smoke_wall_reject_terrain && prior_context)
+              {
+                group.evidence = Response::WALL_EVIDENCE_PERSISTENT;
+              }
+            }
+            if (group.evidence != Response::WALL_EVIDENCE_NONE) {
+              ++qualified_groups;
+              if (selected == groups.size() || group.median < groups[selected].median) {
+                selected = i;
+              }
             }
           }
+          if (!request->smoke_wall_extended_evidence) {selected = 0;}
+          if (selected < groups.size()) {
+            const auto & group = groups[selected];
+            response->smoke_wall_evidence = group.evidence;
+            response->smoke_wall_mixed_samples = group.mixed;
+            rows = group.rows; columns = group.columns;
+            for (const auto index : group.support) {
+              ranges.push_back(hits[index].depth);
+              voxel_uncertainty = std::max(voxel_uncertainty,
+                  std::sqrt(3.0) * hits[index].size * 0.5);
+            }
+          }
+          response->smoke_wall_samples = ranges.size();
+          response->smoke_wall_rows = rows.size();
+          response->smoke_wall_columns = columns.size();
+          double depth_spread = 0.0;
           if (response->smoke_wall_evidence != Response::WALL_EVIDENCE_NONE) {
             double sum = 0.0;
             for (const double range : ranges) {sum += range;}
@@ -1370,8 +1437,8 @@ private:
             for (const double range : ranges) {variance += (range - mean) * (range - mean);}
             response->smoke_wall_range = mean;
             response->smoke_wall_nearest_range = *std::min_element(ranges.begin(), ranges.end());
-            response->smoke_wall_uncertainty = voxel_uncertainty +
-              std::sqrt(variance / ranges.size());
+            depth_spread = std::sqrt(variance / ranges.size());
+            response->smoke_wall_uncertainty = voxel_uncertainty + depth_spread;
             response->smoke_wall_valid = true;
           }
           const char * evidence = "NONE";
@@ -1398,7 +1465,17 @@ private:
                      << ", prior terrain support=" << prior_support
                      << ", camera-associated rays=" << associated_hits;
           if (request->smoke_wall_extended_evidence) {
-            diagnostic << ", FLICKER requires >=1 mixed ray; PERSISTENT requires >=6 "
+            diagnostic << ", depth groups=" << groups.size()
+                       << ", qualified depth groups=" << qualified_groups
+                       << ", cluster span limit=" << inspection_wall_cluster_span_ << " m"
+                       << ", largest group rays=" << (largest_group < groups.size() ?
+            groups[largest_group].support.size() : 0)
+                       << ", largest group rows=" << (largest_group < groups.size() ?
+            groups[largest_group].rows.size() : 0)
+                       << ", largest group columns=" << (largest_group < groups.size() ?
+            groups[largest_group].columns.size() : 0)
+                       << ", selected mixed rays=" << response->smoke_wall_mixed_samples
+                       << ", FLICKER requires >=1 mixed ray; PERSISTENT requires >=6 "
                        << "current rays and prior map/camera/terrain guards";
           }
           if (terrain.valid) {
@@ -1408,7 +1485,12 @@ private:
           if (response->smoke_wall_valid) {
             diagnostic << ", mean=" << response->smoke_wall_range
                        << " m, nearest=" << response->smoke_wall_nearest_range
-                       << " m, uncertainty=" << response->smoke_wall_uncertainty << " m";
+                       << " m, uncertainty=" << response->smoke_wall_uncertainty << " m"
+                       << ", selected median=" << groups[selected].median
+                       << " m, selected depth span=" << *std::max_element(ranges.begin(),
+              ranges.end()) - *std::min_element(ranges.begin(), ranges.end())
+                       << " m, voxel uncertainty=" << voxel_uncertainty
+                       << " m, depth spread=" << depth_spread << " m";
           }
           wall_diagnostic = diagnostic.str();
           RCLCPP_INFO_THROTTLE(
@@ -2227,10 +2309,14 @@ private:
     inspection_max_range_ = this->declare_parameter<double>("inspection_max_range", 50.0);
     inspection_ground_patch_radius_ =
       this->declare_parameter<double>("inspection_ground_patch_radius", 0.5);
+    inspection_wall_cluster_span_ =
+      this->declare_parameter<double>("inspection_wall_cluster_span", 4.0);
     if (!std::isfinite(inspection_map_timeout_) || inspection_map_timeout_ <= 0.0 ||
       !std::isfinite(inspection_future_tolerance_) || inspection_future_tolerance_ < 0.0 ||
       !std::isfinite(inspection_max_range_) || inspection_max_range_ <= 0.0 ||
-      !std::isfinite(inspection_ground_patch_radius_) || inspection_ground_patch_radius_ <= 0.0)
+      !std::isfinite(inspection_ground_patch_radius_) || inspection_ground_patch_radius_ <= 0.0 ||
+      !std::isfinite(inspection_wall_cluster_span_) || inspection_wall_cluster_span_ <= 0.0 ||
+      inspection_wall_cluster_span_ > 10.0)
     {
       throw std::invalid_argument("Inspection query limits must be finite and positive");
     }
@@ -2475,6 +2561,7 @@ private:
   double inspection_future_tolerance_;
   double inspection_max_range_;
   double inspection_ground_patch_radius_;
+  double inspection_wall_cluster_span_;
   double maximum_target_distance_;
   double reported_site_exclusion_radius_;
   std::size_t maximum_reported_sites_;

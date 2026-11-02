@@ -92,6 +92,7 @@ class Harness:
     _verify_parent_entry = MissionExecutive._verify_parent_entry
     _exploration_parent_entry = MissionExecutive._exploration_parent_entry
     _verify_reset_source_localization = MissionExecutive._verify_reset_source_localization
+    _verify_reset_heading = MissionExecutive._verify_reset_heading
     _verify_request_is_completed = MissionExecutive._verify_request_is_completed
     _verify_defer_viewpoint = MissionExecutive._verify_defer_viewpoint
     _verify_request_is_deferred = MissionExecutive._verify_request_is_deferred
@@ -877,6 +878,29 @@ def test_height_convergence_cannot_succeed_without_actual_height_progress(motion
         node._wait_at_pose(target, height_tolerance=0.05)
 
     assert node.odometry.pose.pose.position.z == 5.7
+
+
+def test_stopped_fire_alignment_uses_its_own_tighter_yaw_tolerance(motion_harness):
+    node = motion_harness
+    node.state.mode = 'OFFBOARD'
+    target = deepcopy(node.odometry.pose.pose)
+    yaw = yaw_from_quaternion(target.orientation)
+    node.odometry.pose.pose.orientation = quaternion_from_yaw(yaw + math.radians(4.0))
+
+    def catch_up():
+        if node._stop.clock.now >= 1.0:
+            node.odometry.pose.pose.orientation = quaternion_from_yaw(yaw + math.radians(1.0))
+
+    node._stop.on_wait = catch_up
+    node._wait_at_pose(target, yaw_tolerance=math.radians(2.0))
+    assert node._stop.clock.now >= 1.5
+    assert node.config['yaw_tolerance'] == pytest.approx(math.radians(5.0))
+
+
+@pytest.mark.parametrize('tolerance', [0.0, -0.1, math.nan, True])
+def test_stopped_yaw_tolerance_requires_finite_positive_angle(motion_harness, tolerance):
+    with pytest.raises(MissionError, match='Yaw convergence tolerance'):
+        motion_harness._wait_at_pose(make_pose(), yaw_tolerance=tolerance)
 
 
 def planned_corner_path():
@@ -1730,10 +1754,18 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     blackboard['verify_height_hint_consumed'] = 42
     blackboard['verify_descent_deferred'] = True
     blackboard['verify_height_only_attempted'] = True
+    blackboard['verify_settle_failures'] = 2
+    blackboard['verify_wall_recheck_after_settle'] = True
+    harness._verify_heading_state = {'sources': {'old fire': 123}}
+    harness._verify_wall_observation_context = {'settled_ns': 123}
 
     harness._exploration_parent_entry(blackboard)
     harness._takeoff(blackboard)
 
+    assert harness._verify_heading_state['sources'] == {}
+    assert harness._verify_wall_observation_context is None
+    assert blackboard['verify_settle_failures'] == 0
+    assert not blackboard['verify_wall_recheck_after_settle']
     assert not blackboard['verify_entered']
     assert blackboard['verify_approaches'] == 0
     assert not blackboard['verify_smoke_approach_completed']

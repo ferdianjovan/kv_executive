@@ -58,6 +58,19 @@ mission_executive:
     verify_reacquire_observation_timeout: 5.0
     verify_reacquire_scan_step: 0.17453292519943295  # Missing-source scan +/-10 degrees.
     verify_reacquire_yaw_step: 0.08726646259971647  # Visible-source corrections <=5 degrees.
+    # Historical camera bearings retain fire priority briefly through missed detections.
+    verify_fire_heading_grace: 2.0
+    verify_heading_rate: 0.20943951023931956  # 12 degrees per source second.
+    verify_heading_clock_timeout: 5.0
+    verify_fire_heading_tolerance: 0.03490658503988659  # 2 degrees when stopped.
+    verify_fire_heading_align_timeout: 15.0
+    # A continuous dwell uses distinct fresh poses, low speed and low rotation.
+    verify_settle_dwell: 1.0
+    verify_settle_timeout: 15.0
+    verify_settle_map_timeout: 15.0
+    verify_settle_speed: 0.10
+    verify_settle_angular_rate: 0.05235987755982989  # 3 degrees per source second.
+    verify_settle_clock_timeout: 5.0
     # Failed Verify delays manual requests briefly. Automatic repeats of the
     # same blocked bearing wait for 2 m actual translation; a new bearing can
     # still interrupt the sweep. These are observer/bearing gates, not ranges.

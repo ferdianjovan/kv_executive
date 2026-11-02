@@ -1994,7 +1994,9 @@ def test_extended_wall_requires_three_rows_and_columns(planner_factory, samples,
     response = planner.query_geometry(_extended_wall_request(planner, frame))
     assert response.success, response.message
     assert response.smoke_wall_valid is accepted
-    assert response.smoke_wall_samples == response.smoke_wall_mixed_samples == len(samples)
+    expected_samples = len(samples) if accepted else 0
+    assert response.smoke_wall_samples == response.smoke_wall_mixed_samples == expected_samples
+    assert f'largest group rays={len(samples)}' in response.message
     assert response.smoke_wall_evidence == (
         response.WALL_EVIDENCE_FLICKER if accepted else response.WALL_EVIDENCE_NONE)
     assert 'required=3 rays/3 rows/3 columns' in response.message
@@ -2015,8 +2017,9 @@ def test_extended_wall_persistent_route_requires_six_current_hits(
     assert response.success, response.message
     assert response.smoke_wall_valid is accepted
     assert response.smoke_wall_mixed_samples == 0
-    assert response.smoke_wall_samples == len(samples)
-    assert response.smoke_wall_rows == response.smoke_wall_columns == 3
+    assert response.smoke_wall_samples == (len(samples) if accepted else 0)
+    assert response.smoke_wall_rows == response.smoke_wall_columns == (3 if accepted else 0)
+    assert f'largest group rays={len(samples)}' in response.message
     assert response.smoke_wall_evidence == (
         response.WALL_EVIDENCE_PERSISTENT if accepted else response.WALL_EVIDENCE_NONE)
 
@@ -2035,7 +2038,8 @@ def test_extended_wall_persistent_route_requires_both_classification_guards(
     response = planner.query_geometry(request)
     assert response.success and not response.smoke_wall_valid, response.message
     assert response.smoke_wall_evidence == response.WALL_EVIDENCE_NONE
-    assert response.smoke_wall_samples == 49 and response.smoke_wall_mixed_samples == 0
+    assert response.smoke_wall_samples == response.smoke_wall_mixed_samples == 0
+    assert 'largest group rays=49' in response.message
 
 
 def test_extended_wall_preserves_a_steady_vertical_front_without_mixed_history(planner_factory):
@@ -2049,7 +2053,8 @@ def test_extended_wall_preserves_a_steady_vertical_front_without_mixed_history(p
         assert response.smoke_wall_valid is (index > 0)
         assert response.smoke_wall_evidence == (
             response.WALL_EVIDENCE_PERSISTENT if index else response.WALL_EVIDENCE_NONE)
-        assert response.smoke_wall_samples == 49 and response.smoke_wall_mixed_samples == 0
+        assert response.smoke_wall_samples == (49 if index else 0)
+        assert response.smoke_wall_mixed_samples == 0
         assert 'stable terrain rays excluded=0' in response.message
         assert f'prior map context={int(index > 0)}' in response.message
 
@@ -2064,7 +2069,8 @@ def test_extended_wall_guard_rejects_persistent_jittering_terrain(
     initial = planner.query_geometry(_extended_wall_request(planner, frame))
     assert initial.success and not initial.smoke_wall_valid, initial.message
     assert initial.smoke_wall_evidence == initial.WALL_EVIDENCE_NONE
-    assert initial.smoke_wall_samples == 49
+    assert initial.smoke_wall_samples == 0
+    assert 'current occupied rays=49/49' in initial.message
     assert 'prior map context=0' in initial.message
     _publish_and_query(planner, frame, _extended_wall_scene(slope=slope, translation=-0.09))
     request = _extended_wall_request(planner, frame)
@@ -2116,3 +2122,164 @@ def test_extended_wall_width_limit_is_separate_from_legacy_measurement(planner_f
     request.smoke_wall_width = 4.5001
     oversized = planner.query_geometry(request)
     assert not oversized.success and oversized.error_code == oversized.INVALID_REQUEST
+
+
+def _wall_depth_scene(depths, *, free_samples=()):
+    """Map independently chosen depths without changing the aperture ray lanes."""
+    from test_smoke_wall_false_positives import ORIGIN, _encode_octomap, _float32, _key
+    free_samples = set(free_samples)
+    leaves = {}
+    for (row, column), depth in depths.items():
+        y = _float32(_float32(ORIGIN[1]) + column * 0.75)
+        z = _float32(_float32(ORIGIN[2]) + row * 0.75)
+        hit = _key(ORIGIN[0] + depth)
+        for x in range(hit - 2, hit + 1):
+            leaves[(x, _key(y), _key(z))] = (
+                2 if x == hit and (row, column) not in free_samples else 1)
+    return _encode_octomap(leaves)
+
+
+def _observe_wall_depths(planner, frame, depths, *, mixed_samples=()):
+    from test_smoke_wall_false_positives import _publish_and_query
+    _publish_and_query(planner, frame, _wall_depth_scene(depths, free_samples=mixed_samples))
+    _publish_and_query(planner, frame, _wall_depth_scene(depths))
+    return planner.query_geometry(_extended_wall_request(planner, frame))
+
+
+@pytest.mark.parametrize('route', ['flicker', 'persistent'])
+def test_wall_depth_groups_separate_near_front_from_far_background(planner_factory, route):
+    from test_smoke_wall_false_positives import _request
+    planner = planner_factory()
+    frame = 'wall_front_and_background'
+    front = {(row, column) for row in range(-1, 2) for column in range(-1, 2)}
+    depths = {sample: 18.0 if sample in front else 30.0 for sample in EXTENDED_WALL_GRID}
+    mixed = ((0, 0),) if route == 'flicker' else ()
+    response = _observe_wall_depths(planner, frame, depths, mixed_samples=mixed)
+    assert response.success and response.smoke_wall_valid, response.message
+    assert response.smoke_wall_evidence == (
+        response.WALL_EVIDENCE_FLICKER if mixed else response.WALL_EVIDENCE_PERSISTENT)
+    assert response.smoke_wall_samples == 9
+    assert response.smoke_wall_mixed_samples == len(mixed)
+    assert response.smoke_wall_rows == response.smoke_wall_columns == 3
+    assert response.smoke_wall_range == pytest.approx(18.0, abs=0.2)
+    assert response.smoke_wall_nearest_range == pytest.approx(18.0, abs=0.2)
+    assert response.smoke_wall_uncertainty < 0.3
+    assert 'depth groups=2, qualified depth groups=2' in response.message
+    assert 'selected depth span=0 m, voxel uncertainty=' in response.message
+    assert 'depth spread=0 m' in response.message
+    if mixed:
+        # Legacy history-only pooling still uses its original 25-ray aperture.
+        legacy_request = _request(frame)
+        legacy_request.smoke_wall_reject_terrain = True
+        legacy = planner.query_geometry(legacy_request)
+        assert not legacy.smoke_wall_valid and legacy.smoke_wall_samples == 1
+
+
+def test_wall_depth_groups_do_not_use_an_isolated_nearest_return(planner_factory):
+    planner = planner_factory()
+    frame = 'wall_front_with_sparse_outlier'
+    depths = {sample: 18.0 for sample in EXTENDED_WALL_GRID}
+    depths[(-3, -3)] = 8.0
+    response = _observe_wall_depths(planner, frame, depths, mixed_samples=((0, 0),))
+    assert response.success and response.smoke_wall_valid, response.message
+    assert response.smoke_wall_evidence == response.WALL_EVIDENCE_FLICKER
+    assert response.smoke_wall_samples == 48
+    assert response.smoke_wall_nearest_range > 17.5
+    assert response.smoke_wall_range == pytest.approx(18.0, abs=0.2)
+    assert 'depth groups=2, qualified depth groups=1' in response.message
+
+
+def test_wall_depth_groups_cannot_combine_coverage_across_fronts(planner_factory):
+    planner = planner_factory()
+    frame = 'wall_fronts_with_separate_partial_coverage'
+    depths = {(row, column): 18.0 for row in (-1, 0) for column in (-1, 0)}
+    depths.update({(row, column): 30.0 for row in (1, 2) for column in (1, 2)})
+    response = _observe_wall_depths(planner, frame, depths, mixed_samples=depths)
+    assert response.success and not response.smoke_wall_valid, response.message
+    assert response.smoke_wall_samples == response.smoke_wall_mixed_samples == 0
+    assert response.smoke_wall_rows == response.smoke_wall_columns == 0
+    assert 'depth groups=2, qualified depth groups=0' in response.message
+    assert ('largest group rays=4, largest group rows=2, largest group columns=2'
+            in response.message)
+
+
+def test_wall_depth_groups_cannot_borrow_a_distant_groups_mixed_history(planner_factory):
+    planner = planner_factory()
+    frame = 'wall_fronts_with_separate_history_evidence'
+    near = ((-1, -1), (0, 0), (1, 1))
+    far = ((-3, -3), (0, 3), (3, 0))
+    depths = {sample: 18.0 for sample in near}
+    depths.update({sample: 30.0 for sample in far})
+    response = _observe_wall_depths(planner, frame, depths, mixed_samples=far)
+    assert response.success and response.smoke_wall_valid, response.message
+    assert response.smoke_wall_evidence == response.WALL_EVIDENCE_FLICKER
+    assert response.smoke_wall_samples == response.smoke_wall_mixed_samples == 3
+    assert response.smoke_wall_nearest_range > 29.5
+    assert 'depth groups=2, qualified depth groups=1' in response.message
+
+
+def test_wall_depth_groups_cannot_pool_persistent_sample_counts(planner_factory):
+    planner = planner_factory()
+    frame = 'wall_fronts_with_separate_persistent_support'
+    near = ((-1, -1), (-1, 0), (0, -1), (0, 1), (1, 1))
+    depths = {sample: 18.0 for sample in near}
+    depths[(3, 3)] = 30.0
+    response = _observe_wall_depths(planner, frame, depths)
+    assert response.success and not response.smoke_wall_valid, response.message
+    assert response.smoke_wall_samples == 0
+    assert 'depth groups=2, qualified depth groups=0' in response.message
+    assert 'largest group rays=5' in response.message
+
+
+@pytest.mark.parametrize('span, accepted', [(4.0, True), (2.0, False)])
+def test_wall_depth_groups_bound_chains_independently_of_neighbor_gaps(
+        planner_factory, span, accepted):
+    planner = planner_factory(planner_parameters={'inspection_wall_cluster_span': span})
+    frame = 'wall_depth_chain'
+    depths = {(index - 3, index - 3): 18.0 + index * 2.0 for index in range(7)}
+    response = _observe_wall_depths(planner, frame, depths, mixed_samples=depths)
+    assert response.success, response.message
+    assert response.smoke_wall_valid is accepted
+    if accepted:
+        assert response.smoke_wall_evidence == response.WALL_EVIDENCE_FLICKER
+        assert response.smoke_wall_samples == 3
+        assert response.smoke_wall_range == pytest.approx(20.0, abs=0.2)
+        assert response.smoke_wall_uncertainty < 2.0
+        assert 'depth groups=3, qualified depth groups=2' in response.message
+        assert 'selected depth span=4 m' in response.message
+    else:
+        assert response.smoke_wall_samples == 0
+        assert 'depth groups=4, qualified depth groups=0' in response.message
+
+
+def test_wall_depth_groups_do_not_trim_support_to_make_uncertainty_pass(planner_factory):
+    planner = planner_factory()
+    frame = 'wall_depth_group_uncertainty_is_retained'
+    near = ((-1, -1), (0, 0), (1, 1))
+    far = ((-1, 0), (0, 1), (1, -1))
+    depths = {sample: 18.0 for sample in near}
+    depths.update({sample: 22.0 for sample in far})
+    response = _observe_wall_depths(planner, frame, depths, mixed_samples=depths)
+    assert response.success and response.smoke_wall_valid, response.message
+    assert response.smoke_wall_samples == response.smoke_wall_mixed_samples == 6
+    assert response.smoke_wall_range == pytest.approx(20.0, abs=0.2)
+    assert response.smoke_wall_uncertainty > 2.0  # The unchanged client cap must reject it.
+    assert 'depth groups=1, qualified depth groups=1' in response.message
+    assert 'depth spread=2 m' in response.message
+
+
+def test_wall_depth_groups_leave_legacy_range_pooling_unchanged(planner_factory):
+    from test_smoke_wall_false_positives import _request
+    planner = planner_factory()
+    frame = 'wall_depth_groups_legacy_compatibility'
+    front = {(row, column) for row in range(-1, 2) for column in range(-1, 2)}
+    depths = {sample: 18.0 if sample in front else 30.0 for sample in EXTENDED_WALL_GRID}
+    extended = _observe_wall_depths(planner, frame, depths, mixed_samples=depths)
+    assert extended.smoke_wall_valid and extended.smoke_wall_samples == 9
+    legacy = planner.query_geometry(_request(frame))
+    assert legacy.success and legacy.smoke_wall_valid, legacy.message
+    assert legacy.smoke_wall_evidence == legacy.WALL_EVIDENCE_FLICKER
+    assert legacy.smoke_wall_samples == legacy.smoke_wall_mixed_samples == 25
+    assert legacy.smoke_wall_range == pytest.approx((9 * 18.0 + 16 * 30.0) / 25, abs=0.2)
+    assert legacy.smoke_wall_uncertainty > 5.0
+    assert 'depth groups=' not in legacy.message

@@ -618,6 +618,8 @@ class MissionExecutive(
         blackboard['verify_wall_near_count'] = 0
         blackboard['verify_wall_close_count'] = 0
         blackboard['verify_wall_recheck_deadline'] = None
+        blackboard['verify_wall_recheck_after_settle'] = False
+        blackboard['verify_settle_failures'] = 0
         blackboard['verify_height_hint'] = None
         blackboard['verify_height_hint_consumed'] = 0
         blackboard['verify_height_hint_epoch'] = 0
@@ -635,6 +637,8 @@ class MissionExecutive(
         blackboard['verify_fire_standoff_established'] = False
         self._verify.discard_fire_confirmation()
         self._verify_reset_source_localization()
+        self._verify_reset_heading()
+        self._verify_wall_observation_context = None
         self._verify_parent_entry('Exploration')
 
     def _report(self, message, error=False):
@@ -933,12 +937,17 @@ class MissionExecutive(
         self._change_mode('OFFBOARD')
 
     def _wait_at_pose(self, target, hold_duration=None, *, height_tolerance=None,
-                      pose_validator=None):
+                      pose_validator=None, yaw_tolerance=None):
         """Require continuous measured stability for the requested dwell time."""
         if height_tolerance is not None and (
                 isinstance(height_tolerance, bool)
                 or not math.isfinite(height_tolerance) or height_tolerance <= 0.0):
             raise MissionError('Height convergence tolerance must be finite and positive')
+        if yaw_tolerance is None:
+            yaw_tolerance = self.config['yaw_tolerance']
+        if (isinstance(yaw_tolerance, bool) or not math.isfinite(yaw_tolerance)
+                or yaw_tolerance <= 0.0):
+            raise MissionError('Yaw convergence tolerance must be finite and positive')
         if hold_duration is None:
             hold_duration = self.config['hold_duration']
         stable_since = None
@@ -959,7 +968,7 @@ class MissionExecutive(
             ))
             if (
                 distance > self.config['position_tolerance']
-                or yaw_error > self.config['yaw_tolerance']
+                or yaw_error > yaw_tolerance
                 or (height_tolerance is not None
                     and abs(current.position.z - target.position.z) > height_tolerance)
             ):
@@ -971,7 +980,7 @@ class MissionExecutive(
 
         self._wait_until(arrived, self.config['waypoint_timeout'], 'target convergence')
 
-    def _ramp(self, start, target, duration, hold_duration=None):
+    def _ramp(self, start, target, duration, hold_duration=None, *, yaw_tolerance=None):
         """Stream an interpolated move, then wait for a stable measured pose."""
         started = time.monotonic()
         while True:
@@ -984,7 +993,9 @@ class MissionExecutive(
             if fraction >= 1.0:
                 break
             self._stop.wait(min(1.0 / self.config['setpoint_rate'], duration - elapsed))
-        self._wait_at_pose(target, hold_duration=hold_duration)
+        self._wait_at_pose(
+            target, hold_duration=hold_duration,
+            **({'yaw_tolerance': yaw_tolerance} if yaw_tolerance is not None else {}))
 
     def _fly_to(self, start, target):
         """Face the local XY travel direction before translating to a waypoint."""

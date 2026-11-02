@@ -50,6 +50,8 @@ class VerifyNavigationMixin:
 
     def _verify_offboard(self):
         state, current = self._verify_control_pose()
+        # No wall observation remains settled once a movement/turn is prepared.
+        self._verify_wall_observation_context = None
         if state.mode == 'AUTO.LOITER':
             self._enter_offboard(current, allowed_modes=('AUTO.LOITER',))
         return deepcopy(self._snapshot('OFFBOARD', require_armed=True)[1].pose.pose)
@@ -85,7 +87,7 @@ class VerifyNavigationMixin:
         finally:
             self._motion_guard = previous_guard
 
-    def _verify_rotate(self, yaw, guard=None, hold_duration=None):
+    def _verify_rotate(self, yaw, guard=None, hold_duration=None, *, yaw_tolerance=None):
         """Rotate about local Z at the current position and finish in LOITER."""
         target_orientation = quaternion_from_yaw(yaw)
         with self._verify_guarded(guard):
@@ -97,6 +99,7 @@ class VerifyNavigationMixin:
                 current, target,
                 max(0.001, turn * self.config['path_turn_step_duration'] / (math.tau / 6.0)),
                 hold_duration=hold_duration,
+                **({'yaw_tolerance': yaw_tolerance} if yaw_tolerance is not None else {}),
             )
             self._loiter()
 

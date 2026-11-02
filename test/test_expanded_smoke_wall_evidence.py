@@ -109,6 +109,7 @@ def test_expanded_routes_reject_known_terrain_with_and_without_registration_jitt
         'maps_per_episode': FRAMES_PER_EPISODE,
         'queries_per_mode': len(durations),
         'grid': [7, 7], 'rays': len(EXTENDED_WALL_GRID), 'width_m': 4.5,
+        'wall_front_selection': 'Nearest independently qualified depth group, maximum 4 m span',
         'resolution_m': RESOLUTION,
         'reference': _summary(episodes, 'reference_candidate'),
         'guarded': _summary(episodes, 'guarded_candidate'),
@@ -129,7 +130,7 @@ def test_expanded_routes_reject_known_terrain_with_and_without_registration_jitt
     directory = Path(os.environ.get(
         'KV_WALL_FALSE_POSITIVE_REPORT_DIR', str(Path(__file__).parent / 'reports')))
     directory.mkdir(parents=True, exist_ok=True)
-    report = directory / 'smoke_wall_expanded_evidence_20261102.json'
+    report = directory / 'smoke_wall_grouped_evidence_20261102.json'
     report.write_text(json.dumps(
         {'summary': summary, 'episodes': episodes}, indent=2, allow_nan=False) + '\n')
     record_testsuite_property('expanded_probe_p95_seconds', summary['query_p95_seconds'])

@@ -63,6 +63,18 @@ class Harness:
     def _check_running(self):
         return None
 
+    def _verify_prepare_wall_observation(self, guard=None, *, align_fire=True):
+        if guard:
+            guard()
+        return True
+
+    def _verify_wall_observation_ready(self):
+        return True
+
+    def _verify_image_bearing(self, message):
+        return verification.yaw_from_quaternion(
+            self.odometry.pose.pose.orientation) + message.yaw_correction_rad
+
     def _verify_parent_entry(self, name):
         self.events.append(('parent', name))
 
@@ -2109,6 +2121,258 @@ def _qualified_wall(executive, distance, stamp=None):
             'map_stamp_ns': int(executive.now * 1e9) if stamp is None else stamp}
 
 
+@pytest.mark.parametrize('operation', ['approach_smoke', 'search_fire', 'center_fire'])
+def test_unsettled_preparation_cannot_probe_translate_or_report_and_has_a_bound(system, operation):
+    executive, controller = system
+    smoke(executive, controller)
+    board = Blackboard()
+    executive._verify_wall_settle_reason = 'still braking'
+    executive._verify_prepare_wall_observation = lambda **kwargs: False
+    for _ in range(2):
+        assert getattr(controller, operation)(board) == 'reacquire'
+    with pytest.raises(RuntimeError, match='stationary observation preparation exhausted'):
+        getattr(controller, operation)(board)
+    assert board['verify_settle_failures'] == 3
+    blocked = {'geometry', 'wall_probe', 'plan', 'navigation', 'inspection_report'}
+    assert not any(event[0] in blocked
+                   for event in executive.events)
+
+
+def test_preparation_rechecks_post_settle_image_before_geometry_or_navigation(system):
+    executive, controller = system
+    old = smoke(executive, controller)
+    board = Blackboard()
+    settled = []
+
+    def prepare(guard=None, *, align_fire=True):
+        executive.now += 0.4
+        if guard:
+            guard()
+        settled.append(int(executive.now * 1e9))
+        executive._verify_wall_observation_context = {'settled_ns': settled[-1]}
+        return True
+
+    executive._verify_prepare_wall_observation = prepare
+    executive.on_wait = lambda: smoke(executive, controller)
+    assert controller.approach_smoke(board) == 'reacquire'
+    images = [event[2] for event in executive.events if event[0] == 'geometry']
+    assert images and images[0].header.stamp != old.header.stamp
+    assert controller._stamp_ns(images[0]) > settled[0]
+    assert any(event[0] == 'navigation' for event in executive.events)
+
+
+def test_pre_settle_camera_frame_cannot_start_a_new_approach_leg(system):
+    executive, controller = system
+    smoke(executive, controller)
+    board = Blackboard()
+
+    def prepare(guard=None, *, align_fire=True):
+        executive._verify_wall_observation_context = {'settled_ns': int(executive.now * 1e9)}
+        return True
+
+    executive._verify_prepare_wall_observation = prepare
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert not any(event[0] in {'geometry', 'wall_probe', 'navigation', 'inspection_report'}
+                   for event in executive.events)
+
+
+def test_unready_physical_context_cannot_count_a_wall_vote_or_reuse_arrival(system):
+    executive, controller = system
+    board = Blackboard()
+    executive._verify_wall_observation_ready = lambda: False
+    controller._record_wall_observation(board, _qualified_wall(executive, 10.4, 101))
+    assert board['verify_wall_latest'] is None
+    assert board['verify_wall_near_count'] == 0
+    executive._verify_wall_observation_ready = lambda: True
+    controller._record_wall_observation(board, _qualified_wall(executive, 10.4, 102))
+    controller._record_wall_observation(board, _qualified_wall(executive, 10.3, 103))
+    assert controller._at_known_wall(board)
+    executive._verify_wall_observation_ready = lambda: False
+    assert not controller._at_known_wall(board)
+    assert controller._wall_action(board) == 'reacquire'
+    assert not any(event[0] == 'inspection_report' for event in executive.events)
+
+
+def test_preparation_cannot_reset_near_deadline_or_main_inspection_clock(system):
+    executive, controller = system
+    board = Blackboard()
+    board['verify_inspection_started'] = executive.now - 5.0
+    started = board['verify_inspection_started']
+    controller._record_wall_observation(board, _qualified_wall(executive, 10.4, 101))
+    deadline = board['verify_wall_recheck_deadline']
+
+    def expire(guard=None, *, align_fire=True):
+        executive.now = deadline
+        guard()
+        return True
+
+    executive._verify_prepare_wall_observation = expire
+    with pytest.raises(RuntimeError, match='near-wall revalidation exhausted'):
+        controller.approach_smoke(board)
+    assert board['verify_wall_recheck_deadline'] == deadline
+    assert board['verify_inspection_started'] == started
+    assert not any(event[0] in {'geometry', 'wall_probe', 'navigation', 'inspection_report'}
+                   for event in executive.events)
+
+
+def test_first_fresh_fire_starts_main_clock_before_heading_and_settling_wait(system):
+    executive, controller = system
+    feed_fire(executive, controller)
+    board = Blackboard()
+    before = executive.now
+
+    def unavailable(guard=None, *, align_fire=True):
+        executive.now += 2.0
+        guard()
+        return False
+
+    executive._verify_prepare_wall_observation = unavailable
+    assert controller.approach_smoke(board) == 'reacquire'
+    assert board['verify_inspection_started'] == before
+    assert executive.now - board['verify_inspection_started'] >= 2.0
+
+
+def test_fire_arriving_during_stationary_preparation_starts_clock_without_renewing_it(system):
+    executive, controller = system
+    board = Blackboard()
+    first_seen = []
+
+    def prepare(guard=None, *, align_fire=True):
+        executive.now += 0.4
+        feed_fire(executive, controller)
+        first_seen.append(executive.now)
+        guard()
+        for _ in range(3):
+            executive.now += 0.2
+            guard()
+        return True
+
+    executive._verify_prepare_wall_observation = prepare
+    assert controller._prepare_wall_observation(board)
+    assert board['verify_inspection_started'] == first_seen[0]
+    assert executive.now - board['verify_inspection_started'] >= 0.6 - 1e-6
+
+
+@pytest.mark.parametrize('phase', ['pending_vote', 'post_retreat'])
+def test_missing_sources_during_wall_recheck_never_scan_or_move_height(system, phase):
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 3
+    _qualified_fire(executive, controller, vertical_correction_rad=-0.2)
+    board = Blackboard()
+    controller._capture_height_hint(board)
+    fire(executive, controller, detected=False)
+    started = executive.now - 2.0
+    board['verify_inspection_started'] = started
+    if phase == 'pending_vote':
+        controller._record_wall_observation(board, _qualified_wall(executive, 10.4, 101))
+        deadline = board['verify_wall_recheck_deadline']
+    else:
+        board['verify_smoke_boundary_reached'] = True
+        board['verify_wall_recheck_after_settle'] = True
+        deadline = executive.now + 1.0 + controller.config['verify_wall_recheck_timeout']
+
+        def settle(guard=None, *, align_fire=True):
+            assert not align_fire
+            executive.now += 1.0
+            guard()
+            return True
+
+        executive._verify_prepare_wall_observation = settle
+    assert controller.reacquire(board) == 'reacquire'
+    assert board['verify_wall_recheck_deadline'] == pytest.approx(deadline)
+    assert board['verify_inspection_started'] == started
+    assert not any(event[0] in {'rotate', 'recovery_plan', 'navigation', 'inspection_report'}
+                   for event in executive.events)
+    assert verification._bb_get(board, 'verify_height_hint_consumed', 0) == 0
+    executive.now = deadline
+    with pytest.raises(RuntimeError, match='near-wall revalidation exhausted'):
+        controller.reacquire(board)
+
+
+def test_pre_arrival_image_disappearing_during_wall_recheck_cannot_trigger_scan(system):
+    executive, controller = system
+    image = smoke(executive, controller)
+    board = Blackboard()
+    controller._record_wall_observation(board, _qualified_wall(executive, 10.4, 101))
+    deadline = board['verify_wall_recheck_deadline']
+    board['verify_arrival_after_ns'] = controller._stamp_ns(image) + 1
+
+    def no_guidance_wait(**kwargs):
+        raise AssertionError('Pending wall recheck must not enter source grace or yaw scans')
+
+    controller._smoke_guidance = no_guidance_wait
+    executive.on_wait = lambda: smoke(executive, controller, detected=False)
+    assert controller.reacquire(board) == 'reacquire'
+    assert board['verify_wall_recheck_deadline'] == deadline
+    assert board['verify_wall_near_count'] == 1
+    assert not any(event[0] in {'rotate', 'recovery_plan', 'navigation', 'inspection_report'}
+                   for event in executive.events)
+
+
+def test_pending_wall_vote_keeps_heading_and_its_original_deadline_during_preparation(system):
+    executive, controller = system
+    board = Blackboard()
+    controller._record_wall_observation(board, _qualified_wall(executive, 10.4, 101))
+    deadline = board['verify_wall_recheck_deadline']
+    align = []
+
+    def prepare(guard=None, *, align_fire=True):
+        align.append(align_fire)
+        guard()
+        return True
+
+    executive._verify_prepare_wall_observation = prepare
+    assert controller._prepare_wall_observation(board)
+    assert align == [False]
+    assert board['verify_wall_recheck_deadline'] == deadline
+    assert board['verify_wall_near_count'] == 1
+
+
+def test_inspection_guard_polls_settling_without_resetting_either_deadline(system):
+    executive, controller = system
+    board = Blackboard()
+    board['verify_inspection_started'] = executive.now - 3.0
+    board['verify_wall_recheck_deadline'] = executive.now + 20.0
+    started, deadline = board['verify_inspection_started'], board['verify_wall_recheck_deadline']
+    executive._verify_wall_observation_context = {'settled_ns': 0}
+    polls = []
+
+    def lost_settling():
+        polls.append(executive.now)
+        executive._verify_wall_observation_context = None
+        return False
+
+    executive._verify_wall_observation_ready = lost_settling
+    controller._inspection_guard(board)
+    assert polls == [executive.now]
+    assert executive._verify_wall_observation_context is None
+    assert board['verify_inspection_started'] == started
+    assert board['verify_wall_recheck_deadline'] == deadline
+
+
+def test_braking_after_confirmed_arrival_does_not_start_a_sensor_recheck_clock(system):
+    executive, controller = system
+    board = _confirmed_wall_board(executive, controller)
+    started = board['verify_inspection_started']
+    executive._verify_prepare_wall_observation = lambda **kwargs: False
+    assert not controller._prepare_wall_observation(board)
+    assert board['verify_wall_latest'] is None
+    assert board['verify_wall_near_count'] == 2
+    assert board['verify_wall_recheck_deadline'] is None
+    assert board['verify_inspection_started'] == started
+
+
+def test_fire_navigation_bearing_uses_transformed_image_geometry(system):
+    executive, controller = system
+    message = _qualified_fire(executive, controller, yaw_correction_rad=0.7)
+    bearing, geometry = controller._approach_bearing(
+        Blackboard(), message, 'fire', {'navigation_bearing': -0.3})
+    assert bearing == geometry['navigation_bearing'] == -0.3
+    executive._verify_image_bearing = lambda image: None
+    bearing, _ = controller._approach_bearing(Blackboard(), message, 'fire', {})
+    assert bearing == pytest.approx(0.0)
+
+
 def test_one_distant_probe_followed_by_missing_returns_never_latches_arrival(system):
     executive, controller = system
     controller.config['verify_smoke_standoff'] = executive.config['verify_smoke_standoff'] = 15.0
@@ -2382,8 +2646,11 @@ def test_two_new_close_observations_authorize_one_checked_retreat_then_reconfirm
     assert board['verify_wall_latest'] is None
     assert board['verify_wall_near_count'] == 0
     assert board['verify_wall_close_count'] == 0
-    assert board['verify_wall_recheck_deadline'] > executive.now
+    assert board['verify_wall_recheck_deadline'] is None
+    assert board['verify_wall_recheck_after_settle']
     assert board['verify_inspection_started'] == started
+    assert controller._prepare_wall_observation(board)
+    assert board['verify_wall_recheck_deadline'] > executive.now
     assert controller._wall_action(board) == 'reacquire'
     assert len([event for event in executive.events if event[0] == 'recovery_plan']) == 1
 
@@ -2413,6 +2680,10 @@ def test_required_retreat_does_not_consume_stationary_reconfirmation_budget(syst
 
     executive._verify_recovery_plan_to = slow_recovery
     assert controller._wall_action(board) == 'reacquire'
+    assert board['verify_wall_recheck_deadline'] is None
+    assert board['verify_wall_recheck_after_settle']
+    executive.now += 10.0  # Braking/settling is separate from stationary sensor rechecking.
+    assert controller._prepare_wall_observation(board)
     assert board['verify_wall_recheck_deadline'] == pytest.approx(executive.now + 20.0)
     assert board['verify_inspection_started'] == started
     controller._record_wall_observation(board, None)

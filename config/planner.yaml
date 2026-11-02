@@ -41,3 +41,6 @@ motion_planner:
     inspection_future_tolerance: 0.25
     inspection_max_range: 50.0
     inspection_ground_patch_radius: 0.5
+    # Extended smoke-wall candidates group front/background returns separately.
+    # Each group's complete depth span stays bounded; legacy probes are unchanged.
+    inspection_wall_cluster_span: 4.0

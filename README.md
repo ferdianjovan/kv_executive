@@ -361,6 +361,15 @@ Neither route can replay an old hit when the latest map no longer supports it.
 Both produce candidates requiring independent reconfirmation. This remains a
 suspected smoke boundary, not proof of the physical object's identity. A vertical
 background object inside the smoke rectangle can still mimic persistent smoke.
+After terrain/image filtering, extended returns are partitioned by depth using
+`inspection_wall_cluster_span` (4 m by default). Each group must independently
+satisfy its evidence route and three-row/three-column coverage. The nearest
+qualifying group, ranked by median depth, supplies the mean, nearest distance and
+uncertainty. Separated near/far surfaces cannot borrow support from one another;
+groups cannot grow through a chain of small gaps. All occupied cells remain in
+collision checking. An isolated nearer return within the selected depth span
+still contributes to its conservative nearest distance. Logs show total support,
+selected-group support, voxel uncertainty and depth spread separately.
 Legacy service requests retain the 25-ray, 3 m mixed-history-only measurement for
 compatibility and historical benchmark comparisons.
 Throttled diagnostics report current occupied hits, changing-occupancy hits,
@@ -373,7 +382,23 @@ be inside the configured inspection band, 15–20 m by default. The maximum
 accepted uncertainty remains 2 m.
 
 `APPROACH_SMOKE` probes along the next approach bearing. `SEARCH_FIRE` revalidates
-the nearby wall before entering inspection. `verify_wall_probe_timeout` limits
+the nearby wall before entering inspection. Trusted wall observations first
+require physical settling in LOITER: at least three distinct fresh odometry
+samples and one continuous wall second below 0.10 m/s translation and 3 degrees/s
+rotation. Pose-derived rates include roll/pitch; stable nonzero tilt is allowed.
+Repeated/stale data, frozen clocks and a LOITER acknowledgement alone cannot
+certify rest. An odometry observation gap of one dwell or more requires a new
+settling proof. Settling is bounded by `verify_settle_timeout` (15 s), with a
+separate bounded post-settle map wait (15 s). Current body-clearance checks run
+during that map wait. A missing optional map update leaves wall range unavailable
+while physically settled distant approach can still proceed safely.
+
+Camera observations and the map used for qualification must have source stamps
+after the settled viewpoint. A newer fused map can still retain older cells;
+its timestamp does not establish that every return was reobserved. Motion or a
+turn invalidates the viewpoint, and flight validators never wait for settling.
+Retained qualified planes and ordinary map collision checks continue protecting
+committed movements. `verify_wall_probe_timeout` limits
 the service request to 0.5 seconds by default. Missing returns, insufficient samples and a
 probe timeout leave the ordinary checked forward approach available, including
 when smoke lies beyond the 40 m measurement range. They do not increment a
@@ -403,6 +428,10 @@ ordinary checked approach again, including when smoke moves away after arrival.
 The inspection clock is not restarted by these transitions. A closer observation
 withholds forward motion immediately, without waiting for a second reading;
 two independently observed close readings are required for a checked retreat.
+The viewpoint keeps its heading while a first near vote awaits confirmation.
+After confirmed retreat, the new 20-second recheck starts after physical
+settling, rather than while the vehicle is braking. The overall 600-second
+inspection clock continues through alignment, settling and observation waits.
 Publication still remeasures the boundary: cached observations cannot authorize
 a completed report, and no fire report is inferred from proximity alone.
 
@@ -489,8 +518,9 @@ through detector gaps or tracking-ID changes. Each actual planned route is limit
 to `verify_fire_leg_max_length` (12 m), with `verify_fire_leg_timeout` (60 s)
 starting after OFFBOARD preparation. Terrain, wall clearance, vehicle health and
 operator cancellation remain authoritative during motion. The original observed
-wall boundary remains enforced through flicker, and newer closer returns tighten
-it. The five-second detector wait starts after stopping and cannot cut a climb.
+wall boundary remains enforced through flicker; fresh measurements after the next
+settled stop can tighten it. The five-second detector wait starts after stopping
+and cannot cut a climb.
 Ordinary fire-guided legs and successful arrival reports require fresh post-stop
 fire guidance; the one-shot edge-recovery search is the bounded exception above.
 The approach is bounded by 64 legs and a 600-second real-time inspection deadline.
@@ -527,7 +557,21 @@ Each new Verify episode starts with the current smoke bearing; it does not
 average a new site's direction with the previous site's bearing. Once a smoke leg
 is selected, fire appearing or disappearing and broad smoke coverage do not cancel
 its planning or execution. Fresh confirmed fire has priority for bounded live yaw
-corrections, then fresh smoke; gaps retain the last heading. The planned position
+corrections, followed by a two-source-second fire-heading grace period before
+smoke can take over. The five-wall-second clock watchdog expires memory only
+when the source clock stops progressing; slow progressing simulation retains
+its source-time grace. A camera ray is transformed at image acquisition time,
+including the camera mount, and yields an absolute bearing/body-yaw target.
+Body yaw is solved to center the image horizontally, including the effect of
+camera roll on a fire above or below the image center. A ray that cannot be
+centered by yaw alone leaves the correction unavailable.
+Successfully consumed images are cached across source switches and legs, so an
+old relative error cannot be applied again. Commands retain a 5-degree lead cap
+and a 12-degree/source-second slew limit; the total turn can exceed 5 degrees.
+Stopped fire alignment uses its own 2-degree image/yaw tolerance and a bounded
+15-second alignment budget. Any turn requires a new settling proof before wall
+qualification. Heading ownership changes and actual/desired/commanded yaw are
+logged. Gaps without a usable source retain the last heading. The planned position
 path remains unchanged. Terrain, obstacle, map, telemetry and mission-interrupt
 checks remain active. Arrival enters `REACQUIRE` and requires new post-stop images;
 confirmed fire guides heading and altitude during distant approach. Final
@@ -1079,6 +1123,14 @@ The measured 95th-percentile service time was about 90 ms, with a 185 ms maximum
 on this test machine; the optional production probe budget is 500 ms. Native
 tests separately cover both smoke evidence routes and their refusal cases.
 
+The [grouped-depth rerun](test/reports/smoke_wall_grouped_evidence_20261102.json)
+uses the current estimator on the same 240 terrain episodes: zero candidates
+across 1,920 guarded queries, versus candidates in 180 reference episodes.
+The measured 95th-percentile service time was 84 ms, with a 100 ms maximum.
+Separate positive-control tests verify that a supported near surface remains
+measurable when distant background returns occupy the rest of the aperture.
+These synthetic results do not establish an operational false-positive rate.
+
 The package repositories are tagged
 `checkpoint-before-wall-validation-motion-limits-20261102` before these changes.
 Rollback of the executive and perception must be paired and followed by a rebuild
@@ -1087,6 +1139,13 @@ The checkpoint immediately before the expanded probe and confirmation-memory
 changes is `checkpoint-before-expanded-wall-evidence-20261102` in each package
 repository. This change updates the executive service interface; rebuild and
 restart the autonomy nodes together when applying it or rolling it back.
+
+The checkpoint before physical settling, image-time heading and depth-group
+selection is `checkpoint-before-settled-wall-heading-20261102` in all three
+package repositories. These changes add no ROS interface fields; rebuild the
+executive and restart autonomy after applying them or restoring this checkpoint.
+The [validation report](test/reports/settled_wall_validation_20261102.md) records
+automated results, the remaining post-query settling guard, and flight checks.
 
 Detection monitor tests cover either detector independently, confirmed-status
 gating, stale/future/zero source stamps, goal and phase boundaries, duplicate

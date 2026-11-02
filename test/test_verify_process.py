@@ -24,7 +24,7 @@ from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 
 from test_mission_action import cancel_goal, send_goal, SimulatedFcu, wait_for
-from test_verify_ros import MonitoringSensors
+from test_verify_ros import _install_camera_transforms, MonitoringSensors
 
 
 def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch, tmp_path):
@@ -103,6 +103,7 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
             fcu.offboard_loss_timeout = 2.0
             fcu.heartbeat_interval = 0.2
         sensors = MonitoringSensors()
+        _install_camera_transforms(sensors)
         original_geometry = fcu.query_inspection_geometry
 
         def near_smoke_wall(request, response):
@@ -218,6 +219,7 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
             with sensors.lock:
                 sensors.source = None
                 report = deepcopy(sensors.inspection_reports[first_report])
+                report_time = sensors.inspection_report_times[first_report]
             alive_wait(lambda: time.monotonic() - fire_started >= 9.0,
                        12.0, 'process survival beyond the reported motion-crash window')
             with fcu.lock:
@@ -225,8 +227,25 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
                 statuses = list(fcu.statuses[first_status:])
             assert report.fire_found and report.source_count == 2
             assert abs(report.observer_local_pose.pose.position.z - source['z']) < 0.03
+            observed_yaw = yaw_from_quaternion(report.observer_local_pose.pose.orientation)
+            assert abs(angular_distance(source['yaw'], observed_yaw)) <= (
+                VERIFY_DEFAULTS['verify_fire_heading_tolerance'])
             assert targets  # Terrain-checked smoke translation still precedes yaw centering.
-            assert any('one bounded fire-heading correction' in text for _, text in statuses)
+            before_report = [(stamp, text) for stamp, text in statuses if stamp <= report_time]
+            assert any(text.startswith('Verify: stopped fire heading alignment;')
+                       for _, text in before_report)
+            assert any(text.startswith('Verify: stopped fire heading aligned;')
+                       for _, text in before_report)
+            stationary = [stamp for stamp, text in before_report
+                          if stamp >= fire_started
+                          and text.startswith('Verify: stationary observation ready;')]
+            post_stop_maps = [stamp for stamp, text in before_report
+                              if stamp >= fire_started
+                              and text.startswith('Verify: post-settle map update received;')]
+            last_loiter = max(stamp for stamp, text in before_report
+                              if text.startswith('FCU: OFFBOARD -> AUTO.LOITER'))
+            assert stationary and last_loiter <= max(stationary) <= report_time
+            assert post_stop_maps and max(stationary) <= max(post_stop_maps) <= report_time
             with fcu.lock:
                 strict = deepcopy(fcu.inspection_planning_requests)
             assert strict and all(request.terrain_envelope and request.minimum_radius == 0.0

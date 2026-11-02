@@ -10,6 +10,8 @@ import math
 import time
 
 from geometry_msgs.msg import Point, PointStamped, Pose, PoseStamped, Vector3Stamped
+from kv_executive.inspection_heading import InspectionHeadingMixin
+from kv_executive.inspection_settling import InspectionSettlingMixin
 from kv_executive.mission_geometry import quaternion_from_yaw, transform_pose, yaw_from_quaternion
 from nav_msgs.msg import Path
 from sensor_msgs.msg import NavSatFix, NavSatStatus
@@ -94,7 +96,7 @@ def enu_offset_to_fix(reference, east, north, up, uncertainty=0.0):
     return result
 
 
-class InspectionNavigationMixin:
+class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin):
     """Support the smoke standoff and three-viewpoint thermal inspection."""
 
     def _verify_reset_source_localization(self):
@@ -166,6 +168,51 @@ class InspectionNavigationMixin:
         response = self._inspection_query(
             QueryInspectionGeometry.Request(), timeout=timeout, report_unavailable=False)
         return _stamp_ns(response.map_header) if response is not None else 0
+
+    def _verify_wait_for_wall_map(self, context, guard=None):
+        """Await a post-settle map update while preserving current-body clearance."""
+        from kv_executive.mission_navigation import _inverse
+        from kv_executive.srv import QueryInspectionGeometry
+        from kv_executive.verification import VerificationStartUnavailable
+        timeout = self.config.get('verify_settle_map_timeout', 15.0)
+        deadline = time.monotonic() + timeout
+        context['map_after_epoch'] = False
+        try:
+            while time.monotonic() < deadline:
+                if guard:
+                    guard()
+                if not self._verify_wall_observation_ready():
+                    return False
+                _, pose = self._verify_control_pose()
+                request = QueryInspectionGeometry.Request()
+                request.corridor.header.frame_id = self.config['verify_planning_frame']
+                request.corridor.poses = [PoseStamped(
+                    header=deepcopy(request.corridor.header),
+                    pose=transform_pose(pose, _inverse(self._path_frame_transform(
+                        self.config['verify_planning_frame']))))]
+                response = self._inspection_query(
+                    request, require_map=True,
+                    timeout=min(0.5, max(0.001, deadline - time.monotonic())),
+                    allow_timeout=True, report_unavailable=False)
+                if response is not None:
+                    if not response.corridor_safe:
+                        raise VerificationStartUnavailable(
+                            'Current body clearance failed while waiting for wall data: '
+                            + response.message)
+                    stamp = _stamp_ns(response.map_header)
+                    if stamp > context['settled_ns']:
+                        context['map_after_epoch'] = True
+                        self._report(
+                            'Verify: post-settle map update received; '
+                            f'settled_ns={context["settled_ns"]}, map_stamp_ns={stamp}')
+                        return True
+                self._stop.wait(min(0.05, max(0.0, deadline - time.monotonic())))
+            self._report(
+                'Verify: no post-settle map update within observation wait; '
+                'wall range remains unavailable at this viewpoint')
+            return False
+        finally:
+            context['map_wait_complete'] = True
 
     def _inspection_detection_valid(self, message, source):
         if message is None:
@@ -498,33 +545,6 @@ class InspectionNavigationMixin:
         """Compatibility entry point; terrain, never fire range, constrains flight."""
         return self._verify_recovery_plan_to(pose, smoke_geometry, guard)
 
-    def _verify_live_source_heading(self, fallback):
-        """Use fresh image error during short legs without constructing a target point."""
-        last_image = None
-        last_heading = fallback
-
-        def heading(_pose):
-            nonlocal last_image, last_heading
-            controller = getattr(self, '_verify', None)
-            if controller is None:
-                return last_heading
-            for source, getter in (('fire', controller.stable_fire),
-                                   ('smoke', controller.fresh_smoke)):
-                message = getter()
-                if not self._inspection_detection_valid(message, source):
-                    continue
-                identity = (source, message.header.frame_id, _stamp_ns(message))
-                if identity == last_image:
-                    return last_heading  # One image must not accumulate repeated yaw corrections.
-                _, actual = self._verify_control_pose()
-                cap = self.config.get('verify_reacquire_yaw_step', math.radians(5.0))
-                correction = max(-cap, min(cap, message.yaw_correction_rad))
-                last_image = identity
-                last_heading = yaw_from_quaternion(actual.orientation) + correction
-                return last_heading
-            return last_heading
-        return heading
-
     def _verify_current_terrain_hazard(self, current):
         """Recognize below-floor clearance from fresh terrain below the actual body."""
         cached = getattr(self, '_verify_current_terrain', None)
@@ -787,6 +807,13 @@ class InspectionNavigationMixin:
                 return None
             return values
 
+        # Flight validators call this helper too. They may retain an earlier
+        # plane, but must never block motion waiting for a settled observation.
+        if not self._verify_wall_observation_ready():
+            return unavailable('vehicle has no current settled observation viewpoint')
+        context = self._verify_wall_observation_context
+        settled_ns = context['settled_ns']
+
         smoke = self._verify.fresh_smoke()
         roi_source, roi_bounds = None, None
         if smoke is not None and getattr(smoke, 'angular_bounds_valid', False):
@@ -797,6 +824,18 @@ class InspectionNavigationMixin:
             # A thermal observation may guide flight, but wall identity is
             # associated with the confirmed RGB smoke region in its own frame.
             camera_frame = smoke.header.frame_id
+
+        image = roi_source
+        image_source = 'smoke'
+        if image is None:
+            for candidate, source in ((smoke, 'smoke'), (self._verify.stable_fire(), 'fire')):
+                if (self._inspection_detection_valid(candidate, source)
+                        and candidate.header.frame_id == camera_frame):
+                    image = candidate
+                    image_source = source
+                    break
+        if image is None or _stamp_ns(image.header) <= settled_ns:
+            return unavailable('a new camera observation after settling is required')
 
         request = QueryInspectionGeometry.Request()
         request.origin.header.frame_id = request.direction.header.frame_id = camera_frame
@@ -835,6 +874,10 @@ class InspectionNavigationMixin:
             report_unavailable=timeout is None, allow_transform_failure=roi_source is not None)
         if response is None:
             return unavailable('geometry query or camera association returned no measurement')
+        if (_stamp_ns(response.map_header) <= settled_ns
+                or not self._verify_wall_observation_ready()
+                or self._verify_wall_observation_context is not context):
+            return unavailable('map predates settling or the observation viewpoint moved')
         if not response.smoke_wall_valid:
             return unavailable(
                 f'aperture not qualified ({response.smoke_wall_samples} rays); '
@@ -909,6 +952,14 @@ class InspectionNavigationMixin:
                     or max(roi_bounds[2], current_bounds[2]) > min(
                         roi_bounds[3], current_bounds[3])):
                 return unavailable('confirmed smoke-camera association changed during wall query')
+        current_image = (self._verify.fresh_smoke() if image_source == 'smoke'
+                         else self._verify.stable_fire())
+        if (not self._inspection_detection_valid(current_image, image_source)
+                or current_image.header.frame_id != image.header.frame_id
+                or _stamp_ns(current_image.header) <= settled_ns
+                or not self._verify_wall_observation_ready()
+                or self._verify_wall_observation_context is not context):
+            return unavailable('camera observation or settled viewpoint changed during query')
         now = time.monotonic()
         signature = (evidence, roi_source is not None)
         if (getattr(self, '_verify_wall_evidence_reported', None) != signature
