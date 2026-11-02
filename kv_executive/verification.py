@@ -573,7 +573,6 @@ class VerifyController:
         pending = (_bb_get(blackboard, 'verify_wall_recheck_deadline', None) is not None
                    or _bb_get(blackboard, 'verify_wall_recheck_after_settle', False))
         if self.executive._verify_prepare_wall_observation(guard=guard, align_fire=not pending):
-            blackboard['verify_settle_failures'] = 0
             if _bb_get(blackboard, 'verify_wall_recheck_after_settle', False):
                 blackboard['verify_wall_recheck_deadline'] = (
                     time.monotonic() + self.config['verify_wall_recheck_timeout'])
@@ -582,7 +581,17 @@ class VerifyController:
                     'Verify: retreat settled; starting stationary wall recheck '
                     f'for {self.config["verify_wall_recheck_timeout"]:g} s')
             return True
-        self._check_wall_recheck_deadline(blackboard)
+        return self._settling_unavailable(blackboard)
+
+    def _settling_unavailable(self, blackboard):
+        """Bound losses before and after a query without treating them as sensor misses."""
+        def guard():
+            if self.stable_fire() is not None:
+                self._inspection_begin(blackboard)
+            self._check_inspection_deadline(blackboard)
+            self._check_wall_recheck_deadline(blackboard)
+
+        guard()
         blackboard['verify_wall_latest'] = None
         failures = _bb_get(blackboard, 'verify_settle_failures', 0) + 1
         blackboard['verify_settle_failures'] = failures
@@ -620,10 +629,11 @@ class VerifyController:
     def _record_wall_observation(self, blackboard, wall):
         """Confirm proximity using two newly supported near measurements."""
         self._check_wall_recheck_deadline(blackboard)
-        if wall is not None and not self.executive._verify_wall_observation_ready():
+        if not self.executive._verify_wall_observation_ready():
+            blackboard['verify_wall_latest'] = None
             self.executive._report(
                 'Verify: wall evidence withheld because the vehicle is not settled')
-            wall = None
+            return
         if wall is None:
             blackboard['verify_wall_latest'] = None
             pending = _bb_get(blackboard, 'verify_wall_recheck_deadline', None) is not None
@@ -743,6 +753,11 @@ class VerifyController:
 
     def _wall_action(self, blackboard):
         """Keep clearance immediately; reserve inspection for confirmed arrival."""
+        if not self.executive._verify_wall_observation_ready():
+            self._settling_unavailable(blackboard)
+            return 'reacquire'
+        # Preparation alone is not progress if its proof is lost during ranging.
+        blackboard['verify_settle_failures'] = 0
         wall = _bb_get(blackboard, 'verify_wall_latest', None)
         limit = self.config['verify_smoke_inspection_max_distance']
         if wall is not None:
@@ -1550,12 +1565,12 @@ class VerifyController:
             if current_fire is None:
                 return None
             wall = self.executive._verify_center_fire_wall(current_fire.header.frame_id)
-            if wall is None:
-                self._record_wall_observation(blackboard, None)
-                self._wait_for_wall(blackboard)
-                return None
             self._record_wall_observation(blackboard, wall)
             action = self._wall_action(blackboard)
+            if wall is None:
+                if action == 'approach':
+                    self._wait_for_wall(blackboard)
+                return None
             if action != 'ready':
                 return None
             # A geometry query or observation hold may consume the remaining
@@ -1747,7 +1762,8 @@ class VerifyController:
             if action != 'ready':
                 # A missing wall can withhold forward motion, never an otherwise
                 # safe fire-height correction while the range is revalidated.
-                if action == 'reacquire' and fire is not None:
+                if (action == 'reacquire' and fire is not None
+                        and self.executive._verify_wall_observation_ready()):
                     vertical = self._fire_vertical_preference(blackboard, fire)
                     attempts = _bb_get(blackboard, 'verify_vertical_attempts', 0)
                     if vertical and (not _bb_get(

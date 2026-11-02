@@ -2310,9 +2310,9 @@ def test_two_qualified_maps_across_wall_gap_route_without_stale_success(
         preparation_timeout = config['verify_settle_timeout'] + config['verify_settle_map_timeout']
         initial_timeout = (preparation_timeout + config['verify_fire_leg_timeout']
                            + 2 * config['mode_timeout'])
-        # Untrusted native candidates can be discarded before the first vote,
-        # permitting a normal checked leg. The bounded stationary gap begins
-        # only once a real near vote is accepted by the controller.
+        # Initial preparation can take longer than a subsequent stationary
+        # gap. Its confirmation window begins only once a real near vote is
+        # accepted by the controller.
         wait_for(lambda: active_until(len(accepted) == 1), initial_timeout,
                  'the first accepted near-wall vote after bounded preparation')
 
@@ -2428,6 +2428,99 @@ def test_loiter_braking_finishes_before_stationary_wall_evidence(
         cancel_goal(goal)
         executive._verify_parent_entry = original_entry
         fcu.telemetry_timer.callback = original_telemetry
+    _assert_airborne_safety(mission)
+
+
+@pytest.mark.parametrize('evidence', ['flicker', 'persistent'])
+def test_motion_during_wall_query_holds_until_a_new_settled_viewpoint(
+    mission, monitoring_sensors, evidence,
+):
+    """A lost stationary proof cannot become permission for a forward leg."""
+    sensors, fcu, executive = monitoring_sensors, mission.fcu, mission.executive
+    original_geometry = fcu.geometry_service.callback
+    original_telemetry = fcu.telemetry_timer.callback
+    original_report = executive._report
+    release = threading.Event()
+    query_started, held = threading.Event(), threading.Event()
+    coast, probes = {}, []
+
+    def coast_then_publish():
+        now = time.monotonic()
+        with fcu.lock:
+            if coast and not release.is_set() and fcu.state.mode == 'AUTO.LOITER':
+                fcu.pose.position.x += max(0.0, now - coast['last']) * 0.35
+                coast['last'] = now
+        original_telemetry()
+
+    def query_then_move(request, response):
+        if request.smoke_wall_width and not query_started.is_set():
+            context = executive._verify_wall_observation_context
+            assert context is not None
+            coast.update(last=time.monotonic(), settled_ns=context['settled_ns'])
+            query_started.set()
+            # The first query starts from a proved stationary pose. Real
+            # odometry then observes motion before its response is validated.
+            threading.Event().wait(0.25)
+        response = original_geometry(request, response)
+        if request.smoke_wall_width:
+            context = executive._verify_wall_observation_context
+            probes.append((time.monotonic(), context['settled_ns'] if context else None))
+            response.smoke_wall_samples = 6
+            response.smoke_wall_mixed_samples = 1 if evidence == 'flicker' else 0
+            response.smoke_wall_rows = response.smoke_wall_columns = 3
+            response.smoke_wall_evidence = (response.WALL_EVIDENCE_FLICKER
+                                            if evidence == 'flicker'
+                                            else response.WALL_EVIDENCE_PERSISTENT)
+        return response
+
+    def report_hold(message, error=False):
+        if query_started.is_set() and 'stationary observation withheld;' in message:
+            held.set()
+        original_report(message, error=error)
+
+    fcu.geometry_service.callback = query_then_move
+    fcu.telemetry_timer.callback = coast_then_publish
+    executive._report = report_hold
+    goal = _start_airborne_exploration(mission)
+    with sensors.lock:
+        sensors.approach_wall_range = 18.1
+        sensors.source = 'smoke'
+    result = goal.get_result_async()
+
+    def active_until(condition):
+        assert not result.done(), result.result().result.message if result.done() else ''
+        return condition
+
+    try:
+        config = executive.config
+        preparation_timeout = config['verify_settle_timeout'] + config['verify_settle_map_timeout']
+        wait_for(lambda: active_until(query_started.is_set()), preparation_timeout,
+                 'a wall query from a proved stationary viewpoint')
+        wait_for(lambda: active_until(held.is_set()), 5.0,
+                 'loss of physical proof to enter the bounded stationary hold')
+        threading.Event().wait(0.4)
+        with fcu.lock:
+            assert fcu.state.mode == 'AUTO.LOITER'
+            assert not fcu.target_requests and not fcu.inspection_planning_requests
+            assert not any('wall confirmation 1/2' in text for _, text in fcu.statuses)
+        assert not sensors.inspection_snapshot()
+        released_at = time.monotonic()
+        release.set()
+        wait_for(lambda: active_until(any(text == 'Verify/SEARCH_FIRE: started'
+                                          for _, text in fcu.statuses)),
+                 preparation_timeout,
+                 'fresh maps after a new stationary dwell to confirm the nearby wall')
+        renewed = [(when, epoch) for when, epoch in probes
+                   if epoch is not None and epoch > coast['settled_ns']]
+        assert renewed
+        assert renewed[0][0] >= released_at + config['verify_settle_dwell'] - 0.1
+    finally:
+        release.set()
+        if not result.done():
+            cancel_goal(goal)
+        fcu.geometry_service.callback = original_geometry
+        fcu.telemetry_timer.callback = original_telemetry
+        executive._report = original_report
     _assert_airborne_safety(mission)
 
 

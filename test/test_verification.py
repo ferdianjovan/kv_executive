@@ -2182,7 +2182,7 @@ def test_unready_physical_context_cannot_count_a_wall_vote_or_reuse_arrival(syst
     executive._verify_wall_observation_ready = lambda: False
     controller._record_wall_observation(board, _qualified_wall(executive, 10.4, 101))
     assert board['verify_wall_latest'] is None
-    assert board['verify_wall_near_count'] == 0
+    assert verification._bb_get(board, 'verify_wall_near_count', 0) == 0
     executive._verify_wall_observation_ready = lambda: True
     controller._record_wall_observation(board, _qualified_wall(executive, 10.4, 102))
     controller._record_wall_observation(board, _qualified_wall(executive, 10.3, 103))
@@ -2191,6 +2191,145 @@ def test_unready_physical_context_cannot_count_a_wall_vote_or_reuse_arrival(syst
     assert not controller._at_known_wall(board)
     assert controller._wall_action(board) == 'reacquire'
     assert not any(event[0] == 'inspection_report' for event in executive.events)
+
+
+def _query_loses_settling(system, *, available=True, after_record=False):
+    executive, controller = system
+    ready = [True]
+    original_prepare = executive._verify_prepare_wall_observation
+    original_record = controller._record_wall_observation
+
+    def prepare(**kwargs):
+        ready[0] = True
+        return original_prepare(**kwargs)
+
+    def probe(*args):
+        executive.events.append(('wall_probe',))
+        ready[0] = after_record
+        return _qualified_wall(executive, 10.4) if available else None
+
+    def record(board, wall):
+        original_record(board, wall)
+        ready[0] = False
+
+    executive._verify_prepare_wall_observation = prepare
+    executive._verify_wall_observation_ready = lambda: ready[0]
+    executive._verify_opportunistic_wall = probe
+    executive._verify_center_fire_wall = probe
+    if after_record:
+        controller._record_wall_observation = record
+    return ready
+
+
+@pytest.mark.parametrize('operation', ['approach_smoke', 'search_fire', 'center_fire'])
+@pytest.mark.parametrize('available', [False, True])
+@pytest.mark.parametrize('after_record', [False, True])
+def test_query_time_settling_loss_holds_before_any_movement_or_report(
+        system, operation, available, after_record):
+    executive, controller = system
+    smoke(executive, controller)
+    board = Blackboard()
+    _query_loses_settling(system, available=available, after_record=after_record)
+    assert getattr(controller, operation)(board) == 'reacquire'
+    assert board['verify_settle_failures'] == 1
+    assert board['verify_wall_latest'] is None
+    assert executive.odometry.pose.pose.position == Point(z=6.0)
+    assert not any(event[0] in {'plan', 'navigation', 'recovery_plan', 'inspection_report'}
+                   for event in executive.events)
+    assert any(event[0] == 'hold' for event in executive.events)
+    if not (available and after_record):
+        assert verification._bb_get(board, 'verify_wall_recheck_deadline', None) is None
+
+
+def test_successful_preparation_cannot_hide_repeated_post_query_settling_losses(system):
+    executive, controller = system
+    board = Blackboard()
+    _query_loses_settling(system)
+    for expected in (1, 2):
+        smoke(executive, controller)
+        assert controller.approach_smoke(board) == 'reacquire'
+        assert board['verify_settle_failures'] == expected
+    smoke(executive, controller)
+    with pytest.raises(RuntimeError, match='stationary observation preparation exhausted'):
+        controller.approach_smoke(board)
+    assert board['verify_settle_failures'] == 3
+    assert not any(event[0] in {'plan', 'navigation', 'inspection_report'}
+                   for event in executive.events)
+
+
+@pytest.mark.parametrize('available', [False, True])
+def test_unsettled_query_preserves_history_and_both_original_deadlines(system, available):
+    executive, controller = system
+    board = Blackboard()
+    controller._record_wall_observation(board, _qualified_wall(executive, 9.9, 101))
+    board['verify_inspection_started'] = executive.now - 7.0
+    history = {key: deepcopy(board[key]) for key in (
+        'verify_wall_last_stamp_ns', 'verify_wall_near_count', 'verify_wall_close_count',
+        'verify_wall_recheck_deadline', 'verify_inspection_started', 'verify_smoke_walls')}
+    executive._verify_wall_observation_ready = lambda: False
+    controller._record_wall_observation(
+        board, _qualified_wall(executive, 10.3, 102) if available else None)
+    assert controller._wall_action(board) == 'reacquire'
+    assert board['verify_wall_latest'] is None
+    assert all(board[key] == value for key, value in history.items())
+    assert not any(event[0] in {'plan', 'recovery_plan', 'inspection_report'}
+                   for event in executive.events)
+
+
+@pytest.mark.parametrize('distance', [None, 10.4, 50.0])
+def test_only_a_physically_valid_wall_decision_resets_settling_failure_budget(system, distance):
+    executive, controller = system
+    board = Blackboard()
+    board['verify_settle_failures'] = 2
+    assert controller._prepare_wall_observation(board)
+    assert board['verify_settle_failures'] == 2
+    controller._record_wall_observation(
+        board, None if distance is None else _qualified_wall(executive, distance))
+    assert controller._wall_action(board) == ('reacquire' if distance == 10.4 else 'approach')
+    assert board['verify_settle_failures'] == 0
+
+
+@pytest.mark.parametrize('vertical', [-0.2, 0.2])
+def test_unsettled_wall_decision_blocks_center_fire_height_fallback(system, vertical):
+    executive, controller = system
+    controller.config['verify_fire_approach_max_steps'] = 3
+    feed_fire(executive, controller, vertical_correction_rad=vertical)
+    _query_loses_settling(system)
+    board = Blackboard()
+    assert controller.center_fire(board) == 'reacquire'
+    assert board['verify_settle_failures'] == 1
+    assert executive.odometry.pose.pose.position == Point(z=6.0)
+    assert not any(event[0] in {'recovery_plan', 'plan', 'navigation', 'inspection_report'}
+                   for event in executive.events)
+
+
+def test_inner_fire_approach_missing_result_uses_settling_hold_before_sensor_recheck(system):
+    executive, controller = system
+    feed_fire(executive, controller)
+    _query_loses_settling(system, available=False)
+    board = Blackboard()
+    assert controller._approach_visible_fire(board, controller.stable_fire()) is None
+    assert board['verify_settle_failures'] == 1
+    assert verification._bb_get(board, 'verify_wall_recheck_deadline', None) is None
+    assert not any(event[0] in {'recovery_plan', 'plan', 'navigation', 'inspection_report'}
+                   for event in executive.events)
+
+
+@pytest.mark.parametrize('clock', ['near', 'inspection'])
+def test_settling_loss_hold_enforces_the_original_deadlines(system, clock):
+    executive, controller = system
+    board = Blackboard()
+    if clock == 'near':
+        board['verify_wall_recheck_deadline'] = executive.now + 0.1
+        message = 'near-wall revalidation exhausted'
+    else:
+        board['verify_inspection_started'] = (
+            executive.now - controller.config['verify_inspection_timeout'] + 0.1)
+        message = 'inspection time budget exhausted'
+    executive._verify_wall_observation_ready = lambda: False
+    with pytest.raises(RuntimeError, match=message):
+        controller._wall_action(board)
+    assert executive.now == pytest.approx(100.1)
 
 
 def test_preparation_cannot_reset_near_deadline_or_main_inspection_clock(system):

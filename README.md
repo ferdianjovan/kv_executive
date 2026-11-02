@@ -1145,7 +1145,7 @@ selection is `checkpoint-before-settled-wall-heading-20261102` in all three
 package repositories. These changes add no ROS interface fields; rebuild the
 executive and restart autonomy after applying them or restoring this checkpoint.
 The [validation report](test/reports/settled_wall_validation_20261102.md) records
-automated results, the remaining post-query settling guard, and flight checks.
+automated results, the post-query settling guard, and flight checks.
 
 Detection monitor tests cover either detector independently, confirmed-status
 gating, stale/future/zero source stamps, goal and phase boundaries, duplicate
