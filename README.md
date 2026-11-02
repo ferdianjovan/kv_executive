@@ -325,7 +325,7 @@ Entering Verify stops Exploration and confirms `AUTO.LOITER`. Every translation,
 including altitude centering and observation viewpoints, uses
 `plan_inspection_path`: inflated-body obstacle checks, recent occupied-cell
 history, home altitude bounds and terrain-envelope clearance remain mandatory.
-The default terrain floor is 5 m; navigation prefers 7.5 m and considers up to
+The default terrain floor is 3 m; navigation considers higher clearance up to
 10 m clearance. The planner's configured unknown-air policy applies throughout
 planning and in-flight corridor revalidation; terrain heights are never invented.
 
@@ -345,11 +345,14 @@ blocked recovery -> wait in LOITER for newer fresh maps -> bounded retry or expl
 Distance is measured to the observed smoke wall, never to an estimated fire
 position. An opt-in geometry query samples 25 parallel rays across a 3 m by 3 m
 patch perpendicular to the measurement direction: five rows and five columns,
-spaced 0.75 m apart. A candidate requires at least six qualifying rays covering
-at least three rows and three columns. Hits must be occupied in the latest map
+spaced 0.75 m apart. A candidate requires at least three qualifying rays covering
+at least two rows and two columns. Hits must be occupied in the latest map
 and have occupied/free changes in recent history. History alone cannot replay
 an old occupied hit when the latest map no longer supports it. This remains a
 suspected smoke boundary, not proof of the physical object's identity.
+Throttled diagnostics report current occupied hits, changing-occupancy hits,
+qualifying rows/columns, range uncertainty and unavailable query results, so a
+missing measurement can be distinguished from insufficient ray coverage.
 The mean range is logged, while the nearest sampled range, measurement
 uncertainty and tracking margin limit approach to `verify_smoke_standoff` (15 m).
 A positive report's conservative distance (nearest range minus uncertainty) must
@@ -473,7 +476,7 @@ wall boundary remains enforced through flicker, and newer closer returns tighten
 it. The five-second detector wait starts after stopping and cannot cut a climb.
 Ordinary fire-guided legs and successful arrival reports require fresh post-stop
 fire guidance; the one-shot edge-recovery search is the bounded exception above.
-The approach is bounded by 64 legs and a 300-second real-time inspection deadline.
+The approach is bounded by 64 legs and a 600-second real-time inspection deadline.
 A positive report requires fresh confirmed fire and a fresh wall measurement at
 the configured standoff, checked again before publication. Blocked movement,
 step exhaustion and timeout do not authorize success. A zero step limit permits
@@ -485,10 +488,13 @@ or broad image coverage alone does not start it.
 
 `APPROACH_SMOKE` remembers a smoothed smoke bearing and follows it in short
 terrain-aware forward steps (`verify_navigation_step`, 3 m by default). It tries
-straight 3 m, 1.5 m and 0.75 m candidates, preferring level motion before a
-terrain-required climb. An upper-image smoke cue does not command a separate
-altitude correction. There are no lateral/retreating fallbacks for ordinary smoke
-pursuit; the separate checked retreat applies only inside a measured boundary.
+straight 3 m, 1.5 m and 0.75 m candidates and bounded forward-oblique candidates
+to both sides. Level destinations across the fan precede terrain-required climbs,
+so a high straight-ahead terrain estimate cannot preempt a lower side route.
+Every route still requires full corridor validation. An upper-image smoke cue
+does not command a separate altitude correction. Ordinary pursuit retains
+positive forward progress; the separate checked retreat applies only inside a
+measured boundary.
 Each new Verify episode starts with the current smoke bearing; it does not
 average a new site's direction with the previous site's bearing. Once a smoke leg
 is selected, fire appearing or disappearing and broad smoke coverage do not cancel
@@ -515,7 +521,7 @@ loss permits a bounded yaw scan around the remembered bearing. Fire and mission
 interrupts take priority throughout the hold.
 
 The inconsistent smoke wall guides smoke-only approach. A single plume-ray hit
-may supply obstacle or location metadata, but does not satisfy the six-ray
+may supply obstacle or location metadata, but does not satisfy the three-ray
 qualification or authorize arrival. Coverage in all
 four image regions is observation information: it neither stops smoke navigation
 nor independently starts timed inspection. A static first-hit obstacle alone
@@ -540,7 +546,7 @@ Sparse ground returns do not prevent a short forward leg under the default
 occupied-voxel policy. The aircraft retains altitude when no ground height is
 available; it never invents a ground height or descends on that basis. Native
 planning and flight-time validation check the whole path against occupied body
-clearance and the 5 m buffer above mapped terrain. The highest occupied voxel
+clearance and the 3 m buffer above mapped terrain. The highest occupied voxel
 under the footprint, including recent observations, sets that terrain buffer;
 holes between lidar returns do not invalidate it. Observed rising terrain still
 raises the destination. Optional strict observed-free mode continues to require

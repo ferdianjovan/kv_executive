@@ -1033,6 +1033,7 @@ private:
     using Response = kv_executive::srv::QueryInspectionGeometry::Response;
     response->success = false;
     response->error_code = Response::MAP_UNAVAILABLE;
+    std::string wall_diagnostic;
     InspectionMap latest;
     std::vector<InspectionMap> history;
     std::string rejected_input;
@@ -1131,6 +1132,7 @@ private:
           vertical.normalize();
           std::vector<double> ranges;
           std::set<int> rows, columns;
+          size_t occupied_hits = 0, flicker_hits = 0;
           double voxel_uncertainty = 0.0;
           for (int row = -2; row <= 2; ++row) {
             for (int column = -2; column <= 2; ++column) {
@@ -1146,9 +1148,11 @@ private:
               {
                 continue;
               }
+              ++occupied_hits;
               uint32_t occupied = 0, free = 0;
               occupancyEvidence(history, wall_hit, occupied, free);
               const double depth = (wall_hit - sample).dot(ray_direction);
+              if (occupied > 0 && free > 0) {++flicker_hits;}
               if (occupied > 0 && free > 0 && depth > 0.0 && depth <= request->max_range) {
                 ranges.push_back(depth);
                 rows.insert(row);
@@ -1159,7 +1163,7 @@ private:
             }
           }
           response->smoke_wall_samples = ranges.size();
-          if (ranges.size() >= 6 && rows.size() >= 3 && columns.size() >= 3) {
+          if (ranges.size() >= 3 && rows.size() >= 2 && columns.size() >= 2) {
             double sum = 0.0;
             for (const double range : ranges) {sum += range;}
             const double mean = sum / ranges.size();
@@ -1171,6 +1175,21 @@ private:
               std::sqrt(variance / ranges.size());
             response->smoke_wall_valid = true;
           }
+          std::ostringstream diagnostic;
+          diagnostic << "Smoke wall aperture: current occupied rays=" << occupied_hits << "/25"
+                     << ", occupied/free history rays=" << flicker_hits
+                     << ", qualifying rays=" << ranges.size()
+                     << ", rows=" << rows.size() << ", columns=" << columns.size()
+                     << ", required=3 rays/2 rows/2 columns"
+                     << ", fresh history maps=" << history.size();
+          if (response->smoke_wall_valid) {
+            diagnostic << ", mean=" << response->smoke_wall_range
+                       << " m, nearest=" << response->smoke_wall_nearest_range
+                       << " m, uncertainty=" << response->smoke_wall_uncertainty << " m";
+          }
+          wall_diagnostic = diagnostic.str();
+          RCLCPP_INFO_THROTTLE(
+            this->get_logger(), *this->get_clock(), 5000, "%s", wall_diagnostic.c_str());
         }
         octomap::point3d hit;
         if (latest.tree->castRay(ray_origin, ray_direction, hit, false, request->max_range)) {
@@ -1235,6 +1254,9 @@ private:
             request->terrain_escape_complete || response->current_clearance_reached);
       } else {
         response->message = "Inspection geometry queried; support may be canopy, not bare ground";
+      }
+      if (!wall_diagnostic.empty()) {
+        response->message += "; " + wall_diagnostic;
       }
       if (!inspectionMapFresh(latest)) {
         response->surface_valid = response->ground_valid = response->corridor_safe = false;

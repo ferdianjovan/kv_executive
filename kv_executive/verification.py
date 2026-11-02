@@ -67,11 +67,11 @@ VERIFY_DEFAULTS = {
     'verify_fire_standoff': 10.0,
     'verify_navigation_no_progress_max': 2,
     'verify_smoke_standoff': 15.0,
-    'verify_inspection_altitude': 5.0,
+    'verify_inspection_altitude': 3.0,
     'verify_inspection_lateral_step': 5.0,
     'verify_inspection_max_attempts': 3,
     'verify_inspection_yaw_step': math.radians(5.0),
-    'verify_inspection_timeout': 300.0,
+    'verify_inspection_timeout': 600.0,
     'verify_inspection_max_range': 40.0,
     'verify_inspection_max_uncertainty': 2.0,
     'verify_geometry_timeout': 5.0,
@@ -968,7 +968,7 @@ class VerifyController:
                     f'requested height change={vertical:+.2f} m')
                 moved = self.executive._verify_navigation_viewpoint(
                     bearing, geometry=geometry, guard=guard, forward_only=True,
-                    maximum_forward=forward_limit, vertical_offset=vertical)
+                    maximum_forward=forward_limit, vertical_offset=vertical, allow_oblique=True)
                 if moved is not False:
                     actual_height = self._pose().position.z - before.position.z
                     self.executive._report(
@@ -1011,13 +1011,13 @@ class VerifyController:
                     geometry = self._wall_geometry(blackboard, geometry)
                     moved = self.executive._verify_navigation_viewpoint(
                         bearing, geometry=geometry, guard=guard, forward_only=True,
-                        vertical_offset=0.0)
+                        vertical_offset=0.0, allow_oblique=True)
             else:
                 self.executive._report(
                     'Verify: source visible; following a short terrain-aware approach leg')
                 moved = self.executive._verify_navigation_viewpoint(
                     bearing, geometry=geometry, guard=guard, forward_only=True,
-                    vertical_offset=0.0)
+                    vertical_offset=0.0, allow_oblique=True)
             if moved is False:
                 reason = getattr(self.executive, '_verify_navigation_failure_reason',
                                  'no validated forward smoke path')

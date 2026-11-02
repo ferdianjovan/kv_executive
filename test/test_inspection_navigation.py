@@ -1020,6 +1020,97 @@ def test_forward_only_tries_a_shorter_level_leg_before_a_higher_long_leg(executi
     assert executive.odometry.pose.pose.position == Point(x=1.5, z=6.0)
 
 
+@pytest.mark.parametrize('lower_side', [-1.0, 1.0])
+def test_approach_fan_prefers_a_level_downslope_side_before_a_high_straight_goal(
+        executive, lower_side):
+    executive.config['verify_inspection_altitude'] = 3.0
+    executive.odometry.pose.pose.position.z = 5.0
+
+    def slope_and_tree(request, response):
+        point = request.ground_query.point
+        if point.x > 0.0:
+            # Straight and the tree side are high, while the opposite side
+            # admits the present altitude. Every route would otherwise be safe.
+            response.ground_surface.point.z = 0.0 if point.y * lower_side > 0.1 else 7.0
+        else:
+            response.ground_surface.point.z = 0.0
+
+    executive.on_query = slope_and_tree
+    assert executive._verify_navigation_viewpoint(
+        0.0, forward_only=True, allow_oblique=True)
+
+    assert executive.odometry.pose.pose.position == Point(x=3.0, y=lower_side * 1.5, z=5.0)
+    requests = [event[1] for event in executive.events if event[0] == 'inspection_plan']
+    assert len(requests) == 1
+    assert requests[0].minimum_agl == 3.0
+    assert requests[0].target.pose.position.z == 5.0
+
+
+@pytest.mark.parametrize('vertical', [-0.5, 0.0, 0.5])
+def test_approach_fan_checks_both_sides_when_straight_and_left_corridors_are_blocked(
+        executive, vertical):
+    executive.config['verify_inspection_altitude'] = 3.0
+    executive.odometry.pose.pose.position.z = 6.0
+
+    def block_straight_and_left(request, response):
+        response.ground_surface.point.z = 0.0
+        if len(request.corridor.poses) > 1:
+            endpoint = request.corridor.poses[-1].pose.position
+            response.corridor_safe = endpoint.y < -0.1
+
+    executive.on_query = block_straight_and_left
+    assert executive._verify_navigation_viewpoint(
+        0.0, forward_only=True, allow_oblique=True, vertical_offset=vertical)
+    assert executive.odometry.pose.pose.position == Point(x=3.0, y=-1.5, z=6.0 + vertical)
+    requests = [event[1] for event in executive.events if event[0] == 'inspection_plan']
+    assert len(requests) == 3
+    assert all(request.minimum_agl == 3.0 and request.terrain_envelope for request in requests)
+
+
+def test_approach_fan_keeps_the_bounded_candidate_budget_and_positive_forward_progress(executive):
+    executive.config['verify_navigation_candidate_limit'] = 5
+
+    def block_all_routes(request, response):
+        if len(request.corridor.poses) > 1:
+            response.corridor_safe = False
+
+    executive.on_query = block_all_routes
+    assert not executive._verify_navigation_viewpoint(
+        0.0, forward_only=True, allow_oblique=True)
+    requests = [event[1] for event in executive.events if event[0] == 'inspection_plan']
+    assert len(requests) == 5
+    assert all(request.target.pose.position.x > 0.0 for request in requests)
+    assert executive.odometry.pose.pose.position == Point(z=20.0)
+
+
+def test_approach_fan_oblique_routes_preserve_the_fifteen_metre_wall_boundary(executive):
+    executive.config['verify_smoke_standoff'] = 15.0
+    executive.config['verify_inspection_altitude'] = 3.0
+    executive.odometry.pose.pose.position.z = 6.0
+    axis = (math.sqrt(0.5), math.sqrt(0.5), 0.0)
+    wall = _measured_navigation_wall(executive, nearest=17.7, axis=axis)
+    geometry = {'wall_probe_only': True, 'smoke_navigation_wall': wall}
+
+    def block_straight(request, response):
+        response.ground_surface.point.z = 0.0
+        if len(request.corridor.poses) > 1:
+            response.corridor_safe = abs(request.corridor.poses[-1].pose.position.y) > 0.1
+
+    executive.on_query = block_straight
+    assert executive._verify_navigation_viewpoint(
+        0.0, geometry=geometry, forward_only=True, allow_oblique=True)
+
+    # The positive lateral endpoint would cross the diagonal wall. The
+    # negative lateral route must still be checked against the whole plane.
+    target = executive.odometry.pose.pose.position
+    assert target.y < 0.0
+    displacement = sum((getattr(target, a) - getattr(wall['origin'], a)) * axis[i]
+                       for i, a in enumerate('xyz'))
+    assert wall['nearest'] - wall['uncertainty'] - displacement >= 15.0
+    assert any('smoke-wall boundary' in event[1] for event in executive.events
+               if event[0] == 'status')
+
+
 @pytest.mark.parametrize('unavailable', ['unverified_clearance', 'occupied'])
 def test_forward_only_never_replaces_blocked_progress_with_lateral_motion(
         executive, unavailable):
@@ -2515,12 +2606,38 @@ def test_fresh_plume_hit_tightens_an_older_retained_aperture_plane(executive):
     assert not validate(crossing)
 
 
-@pytest.mark.parametrize('samples, accepted', [(5, False), (6, True)])
-def test_wall_probe_python_guard_requires_at_least_six_samples(executive, samples, accepted):
+@pytest.mark.parametrize('samples, accepted', [(2, False), (3, True), (6, True)])
+def test_wall_probe_python_guard_requires_at_least_three_samples(executive, samples, accepted):
     executive.smoke_wall_valid = True
     executive.on_query = lambda request, response: setattr(response, 'smoke_wall_samples', samples)
     wall = executive._verify_opportunistic_wall('rgb_camera', 0.0)
     assert (wall is not None) is accepted
+
+
+def test_wall_probe_explains_native_rejection_and_bounds_repeated_diagnostics(executive):
+    def no_flicker(request, response):
+        response.message = ('Smoke wall aperture: current occupied rays=25/25, '
+                            'occupied/free history rays=0, qualifying rays=0')
+
+    executive.on_query = no_flicker
+    assert executive._verify_opportunistic_wall('rgb_camera', 0.0) is None
+    assert executive._verify_opportunistic_wall('rgb_camera', 0.0) is None
+    diagnostics = [event[1] for event in executive.events
+                   if event[0] == 'status' and 'measurement rejected' in event[1]]
+    assert len(diagnostics) == 1
+    assert 'occupied/free history rays=0' in diagnostics[0]
+    executive.now += 5.0
+    assert executive._verify_opportunistic_wall('rgb_camera', 0.0) is None
+    assert len([event for event in executive.events
+                if event[0] == 'status' and 'measurement rejected' in event[1]]) == 2
+
+
+def test_wall_probe_explains_excessive_range_spread(executive):
+    executive.smoke_wall_valid = True
+    executive.on_query = lambda request, response: setattr(response, 'smoke_wall_uncertainty', 2.5)
+    assert executive._verify_opportunistic_wall('rgb_camera', 0.0) is None
+    assert any('uncertainty=2.50 m exceeds' in event[1] for event in executive.events
+               if event[0] == 'status')
 
 
 def test_legacy_single_ray_cannot_authorize_a_negative_report_without_aperture(executive):

@@ -1669,6 +1669,8 @@ def test_center_fire_wall_aperture_does_not_label_static_or_unknown_as_smoke(
     assert response.success, response.message
     assert not response.smoke_wall_valid
     assert response.smoke_wall_samples == 0
+    assert 'occupied/free history rays=0' in response.message
+    assert 'qualifying rays=0' in response.message
 
 
 def test_wall_aperture_is_opt_in_and_bounded(planner_factory):
@@ -1692,6 +1694,8 @@ def test_wall_aperture_does_not_treat_unknown_to_occupied_as_flicker(planner_fac
     request.smoke_wall_width = 3.0
     response = planner.query_geometry(request)
     assert response.success and not response.smoke_wall_valid
+    assert 'current occupied rays=25/25' in response.message
+    assert 'occupied/free history rays=0' in response.message
 
 
 def test_wall_aperture_remains_transverse_for_navigation_along_map_y(planner_factory):
@@ -1715,12 +1719,14 @@ def test_wall_aperture_remains_transverse_for_navigation_along_map_y(planner_fac
 
 
 @pytest.mark.parametrize('samples, accepted', [
-    (((-1, -1), (-1, 0), (0, 0), (0, 1), (1, 1)), False),
-    (((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 0), (0, 1)), False),
-    (((-1, -1), (-1, 0), (0, -1), (0, 0), (1, -1), (1, 0)), False),
+    (((-1, -1), (0, 0)), False),
+    (((-1, -1), (-1, 0), (-1, 1)), False),
+    (((-1, -1), (0, -1), (1, -1)), False),
+    (((-1, -1), (-1, 0), (0, 0)), True),
+    (((-1, -1), (-1, 0), (0, 0), (0, 1), (1, 1)), True),
     (((-1, -1), (-1, 0), (0, 0), (0, 1), (1, 1), (1, -1)), True),
 ])
-def test_wall_aperture_requires_six_returns_across_three_rows_and_columns(
+def test_wall_aperture_requires_three_returns_across_two_rows_and_columns(
         planner_factory, samples, accepted):
     planner = planner_factory()
     _publish_inspection_map(planner, wall=False)
@@ -1735,6 +1741,8 @@ def test_wall_aperture_requires_six_returns_across_three_rows_and_columns(
     assert response.success, response.message
     assert response.smoke_wall_samples == len(samples)
     assert response.smoke_wall_valid is accepted
+    assert f'qualifying rays={len(samples)}' in response.message
+    assert 'required=3 rays/2 rows/2 columns' in response.message
 
 
 def test_wall_aperture_observation_identity_tracks_new_current_support(planner_factory):

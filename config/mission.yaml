@@ -133,12 +133,12 @@ mission_executive:
     # Proximity to a fresh observed plume/smoke-wall proxy, never fire distance.
     verify_smoke_standoff: 15.0
     # Clearance above a validated observed support surface; unknown means no descent.
-    verify_inspection_altitude: 5.0
+    verify_inspection_altitude: 3.0
     verify_inspection_lateral_step: 5.0
     verify_inspection_max_attempts: 3
     verify_inspection_yaw_step: 0.08726646259971647  # +/-5 degree inspection checks.
     # Starts with confirmed fire or measured boundary inspection, not broad coverage.
-    verify_inspection_timeout: 300.0
+    verify_inspection_timeout: 600.0
     verify_inspection_max_range: 40.0
     verify_inspection_max_uncertainty: 2.0
     verify_geometry_timeout: 5.0

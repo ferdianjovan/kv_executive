@@ -161,7 +161,7 @@ class Harness:
 
     def _verify_navigation_viewpoint(self, bearing, index=0, guard=None,
                                      geometry=None, maximum_forward=None, forward_only=False,
-                                     vertical_offset=0.0):
+                                     vertical_offset=0.0, allow_oblique=False):
         self.events.append(('navigation', bearing, deepcopy(geometry)))
         target = deepcopy(self.odometry.pose.pose)
         forward = 3.0 if maximum_forward is None else min(3.0, maximum_forward)
@@ -2391,4 +2391,25 @@ def test_memory_waits_for_post_arrival_smoke_before_selecting_combined_leg(syste
     assert controller.approach_smoke(board) == 'reacquire'
     assert executive.odometry.pose.pose.position.x > 3.3
     assert executive.odometry.pose.pose.position.z == pytest.approx(6.5)
+    assert not any(event[0] == 'inspection_report' for event in executive.events)
+
+
+def test_default_inspection_budget_runs_past_five_minutes_and_expires_at_ten(
+        system, monkeypatch):
+    executive, controller = system
+    wall_time = [1000.0]
+    monkeypatch.setattr(verification.time, 'monotonic', lambda: wall_time[0])
+    board = Blackboard()
+    controller._inspection_begin(board)
+    assert controller.config['verify_inspection_timeout'] == 600.0
+
+    for elapsed in (300.0, 599.9):
+        wall_time[0] = 1000.0 + elapsed
+        controller._check_inspection_deadline(board)
+        controller._inspection_begin(board)
+        assert board['verify_inspection_started'] == 1000.0
+
+    wall_time[0] = 1600.0
+    with pytest.raises(RuntimeError, match='inspection time budget exhausted'):
+        controller._check_inspection_deadline(board)
     assert not any(event[0] == 'inspection_report' for event in executive.events)

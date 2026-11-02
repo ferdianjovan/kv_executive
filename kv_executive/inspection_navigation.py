@@ -389,7 +389,7 @@ class InspectionNavigationMixin:
             target.position.z = max(current.position.z, target.position.z)
             self._report('Verify: ground height unavailable; retaining inspection altitude')
         else:
-            floor = (terrain[0] + self.config.get('verify_inspection_altitude', 5.0)
+            floor = (terrain[0] + self.config.get('verify_inspection_altitude', 3.0)
                      + terrain[1] + self.config.get('position_tolerance', 0.3))
             target.position.z = (max(self.config['verify_minimum_altitude'], floor)
                                  if phase == 'ground' else max(current.position.z, floor))
@@ -528,7 +528,7 @@ class InspectionNavigationMixin:
         if target is None:
             return False
         target = deepcopy(target)
-        minimum_agl = self.config.get('verify_inspection_altitude', 5.0)
+        minimum_agl = self.config.get('verify_inspection_altitude', 3.0)
         _, current = self._verify_control_pose()
         requested_height = target.position.z - current.position.z
         minimum_height = self.config.get('verify_vertical_minimum_change', 0.1)
@@ -661,6 +661,16 @@ class InspectionNavigationMixin:
     def _verify_measure_wall(self, camera_frame, *, bearing=None, timeout=None):
         """Measure one aperture, optionally oriented along a local navigation bearing."""
         from kv_executive.srv import QueryInspectionGeometry
+
+        def unavailable(reason):
+            now = time.monotonic()
+            if (not getattr(self, '_verify_wall_rejection', '')
+                    or now - getattr(self, '_verify_wall_rejection_at', -math.inf) >= 5.0):
+                self._report(f'Verify: smoke-wall measurement rejected: {reason}')
+                self._verify_wall_rejection = reason
+                self._verify_wall_rejection_at = now
+            return None
+
         request = QueryInspectionGeometry.Request()
         request.origin.header.frame_id = request.direction.header.frame_id = camera_frame
         # Latest camera TF: this is a current map measurement, not an old image ray.
@@ -687,16 +697,24 @@ class InspectionNavigationMixin:
         response = self._inspection_query(
             request, require_map=True, timeout=timeout, allow_timeout=timeout is not None,
             report_unavailable=timeout is None)
-        if response is None or not response.smoke_wall_valid:
-            return None
+        if response is None:
+            return unavailable('geometry query returned no measurement before its deadline')
+        if not response.smoke_wall_valid:
+            return unavailable(
+                f'aperture not qualified ({response.smoke_wall_samples} rays); '
+                + getattr(response, 'message', 'native qualification details unavailable'))
         mean, nearest, uncertainty = (
             response.smoke_wall_range, response.smoke_wall_nearest_range,
             response.smoke_wall_uncertainty)
-        if (response.smoke_wall_samples < 6
-                or not all(math.isfinite(v) for v in (mean, nearest, uncertainty))
-                or not 0.0 < nearest <= mean <= request.max_range
-                or not 0.0 <= uncertainty <= self.config['verify_inspection_max_uncertainty']):
-            return None
+        if response.smoke_wall_samples < 3:
+            return unavailable(f'only {response.smoke_wall_samples} qualifying rays; required=3')
+        if (not all(math.isfinite(v) for v in (mean, nearest, uncertainty))
+                or not 0.0 < nearest <= mean <= request.max_range):
+            return unavailable(f'invalid range statistics: mean={mean}, nearest={nearest}')
+        if not 0.0 <= uncertainty <= self.config['verify_inspection_max_uncertainty']:
+            return unavailable(
+                f'uncertainty={uncertainty:.2f} m exceeds the permitted '
+                f'{self.config["verify_inspection_max_uncertainty"]:.2f} m')
         if conversion is None:
             conversion = self._path_frame_transform(self.config['verify_planning_frame'])
         origin = response.ray_origin.point
@@ -704,7 +722,7 @@ class InspectionNavigationMixin:
         if (response.ray_origin.header.frame_id != self.config['verify_planning_frame']
                 or response.ray_direction.header.frame_id != self.config['verify_planning_frame']
                 or not _finite_point(origin) or not _finite_point(direction)):
-            return None
+            return unavailable('invalid map-frame ray origin or direction')
         local = transform_pose(Pose(position=deepcopy(origin),
                                     orientation=quaternion_from_yaw(0.0)), conversion).position
         end = transform_pose(Pose(position=Point(**{
@@ -713,12 +731,13 @@ class InspectionNavigationMixin:
         axis = tuple(getattr(end, a) - getattr(local, a) for a in 'xyz')
         norm = math.hypot(*axis)
         if norm < 1e-6:
-            return None
+            return unavailable('transformed ray direction has no usable length')
         # TF lookup can wait after the query's initial map freshness check.
         age = (self.get_clock().now().nanoseconds - _stamp_ns(response.map_header)) / 1e9
         if not -self.config['verify_future_tolerance'] <= age <= self.config.get(
                 'verify_geometry_timeout', 5.0):
-            return None
+            return unavailable(f'map aged during transform: {age:.2f} source seconds')
+        self._verify_wall_rejection = ''
         return {'origin': local, 'axis': tuple(v / norm for v in axis), 'mean': mean,
                 'nearest': nearest, 'uncertainty': uncertainty, 'camera_frame': camera_frame,
                 'bearing': bearing, 'map_header': deepcopy(response.map_header),
@@ -886,7 +905,7 @@ class InspectionNavigationMixin:
             header=deepcopy(request.corridor.header), pose=transform_pose(current, conversion))]
         probe = deepcopy(current)
         probe.position.z += (self.config.get('verify_navigation_max_agl', 10.0)
-                             + self.config.get('verify_inspection_altitude', 5.0))
+                             + self.config.get('verify_inspection_altitude', 3.0))
         request.ground_query.header.frame_id = frame
         request.ground_query.header.stamp = self.get_clock().now().to_msg()
         request.ground_query.point = transform_pose(probe, conversion).position
@@ -916,7 +935,7 @@ class InspectionNavigationMixin:
 
     def _verify_navigation_viewpoint(
         self, bearing, index=0, guard=None, geometry=None, maximum_forward=None,
-        forward_only=False, vertical_offset=0.0,
+        forward_only=False, vertical_offset=0.0, allow_oblique=False,
     ):
         """Advance along a source bearing with terrain clearance and parallax.
 
@@ -929,6 +948,7 @@ class InspectionNavigationMixin:
         if (not isinstance(index, int) or isinstance(index, bool) or index < 0
                 or not isinstance(bearing, (float, int)) or not math.isfinite(bearing)
                 or not isinstance(forward_only, bool)
+                or not isinstance(allow_oblique, bool)
                 or isinstance(vertical_offset, bool)
                 or not isinstance(vertical_offset, (float, int))
                 or not math.isfinite(vertical_offset)
@@ -973,7 +993,7 @@ class InspectionNavigationMixin:
                 return False
             if projection > 1e-6:
                 step = min(step, remaining / projection)
-        minimum_agl = self.config.get('verify_inspection_altitude', 5.0)
+        minimum_agl = self.config.get('verify_inspection_altitude', 3.0)
         preferred_agl = self.config.get('verify_navigation_preferred_agl', 7.5)
         maximum_agl = self.config.get('verify_navigation_max_agl', 10.0)
         limit = self.config.get('verify_navigation_candidate_limit', 18)
@@ -995,6 +1015,11 @@ class InspectionNavigationMixin:
             (step * 0.5, sign * step * 0.25),
             (step * 0.5, -sign * step * 0.25), (step * 0.25, 0.0),
         ]
+        approach_offsets = [
+            (step, 0.0), (step, sign * step * 0.5), (step, -sign * step * 0.5),
+            (step * 0.5, 0.0), (step * 0.5, sign * step * 0.25),
+            (step * 0.5, -sign * step * 0.25), (step * 0.25, 0.0),
+        ]
         # Tangential and slightly retreating views can follow a convex terrain
         # boundary even when every direct/oblique advance is blocked.
         fallback_offsets = [(0.0, sign * step * 0.5), (0.0, -sign * step * 0.5),
@@ -1012,7 +1037,7 @@ class InspectionNavigationMixin:
         reserved = min(5, limit // 3)
         forward_limit = limit - reserved
 
-        def candidates(offsets, clearances, vertical_bias):
+        def candidates(offsets, clearances, vertical_bias, level_only=False):
             for forward, lateral in offsets:
                 if guard:
                     guard()
@@ -1039,6 +1064,10 @@ class InspectionNavigationMixin:
                             target.position.z, ground_z + requested_agl + uncertainty,
                             ground_z + minimum_agl + uncertainty
                             + self.config.get('position_tolerance', 0.3))
+                    if level_only and target.position.z > current.position.z + 1e-6:
+                        # Examine lower oblique routes before accepting a
+                        # climb over a high straight destination.
+                        continue
                     if vertical_bias:
                         signed_height = ((target.position.z - current.position.z)
                                          * math.copysign(1.0, vertical_bias))
@@ -1070,26 +1099,33 @@ class InspectionNavigationMixin:
                     yield deepcopy(target), terrain, forward, lateral, clearance
 
         if vertical_offset:
-            offsets = ([(step, 0.0), (step * 0.5, 0.0), (step * 0.25, 0.0)]
+            offsets = (approach_offsets if forward_only and allow_oblique else
+                       [(step, 0.0), (step * 0.5, 0.0), (step * 0.25, 0.0)]
                        if forward_only else forward_offsets + fallback_offsets)
             # The fire selects a small change from the current altitude. The
             # preferred AGL bands must not replace it with an unrelated climb.
-            batches = ((offsets, (None,), limit),)
+            batches = ((offsets, (None,), limit, False),)
+        elif forward_only and allow_oblique:
+            # First examine both sides without extra climb. Then use minimum
+            # terrain-required rises before higher survey-altitude preferences.
+            batches = ((approach_offsets, (None,), limit, True),
+                       (approach_offsets, (None,), limit, False),
+                       (approach_offsets, (preferred_agl, maximum_agl), limit, False))
         elif forward_only:
             straight = [(step, 0.0), (step * 0.5, 0.0), (step * 0.25, 0.0)]
             # Try all straight distances near current altitude before requesting
             # extra height. The measured terrain floor can still require a climb.
-            batches = ((straight, (None,), limit),
-                       (straight, (preferred_agl, minimum_agl, maximum_agl), limit))
+            batches = ((straight, (None,), limit, False),
+                       (straight, (preferred_agl, minimum_agl, maximum_agl), limit, False))
         else:
             batches = (
-                (forward_offsets, (preferred_agl, minimum_agl, maximum_agl), forward_limit),
-                (fallback_offsets, (minimum_agl,), limit))
+                (forward_offsets, (preferred_agl, minimum_agl, maximum_agl), forward_limit, False),
+                (fallback_offsets, (minimum_agl,), limit, False))
 
-        def try_candidates(offsets, clearances, budget, vertical_bias):
+        def try_candidates(offsets, clearances, budget, vertical_bias, level_only):
             nonlocal attempts
             for target, terrain, forward, lateral, clearance in candidates(
-                    offsets, clearances, vertical_bias):
+                    offsets, clearances, vertical_bias, level_only):
                 if attempts >= budget:
                     break
                 self._check_running()
@@ -1113,8 +1149,8 @@ class InspectionNavigationMixin:
                     return True
             return False
 
-        for offsets, clearances, budget in batches:
-            if try_candidates(offsets, clearances, budget, vertical_offset):
+        for offsets, clearances, budget, level_only in batches:
+            if try_candidates(offsets, clearances, budget, vertical_offset, level_only):
                 return True
         mode = 'forward' if forward_only else 'terrain navigation'
         if attempts:

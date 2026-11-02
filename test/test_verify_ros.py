@@ -468,7 +468,9 @@ def _assert_terrain_planning(mission, *, fire_standoff=False):
     with mission.fcu.lock:
         requests = deepcopy(mission.fcu.inspection_planning_requests)
     assert requests
-    assert all(request.terrain_envelope and request.minimum_agl >= 5.0 for request in requests)
+    minimum = mission.executive.config['verify_inspection_altitude']
+    assert all(request.terrain_envelope and request.minimum_agl >= minimum
+               for request in requests)
     if fire_standoff:
         assert any(request.minimum_radius > 0.0 and request.keepout_center.header.frame_id
                    for request in requests)
@@ -1023,8 +1025,9 @@ def test_partial_descent_with_thirty_centimetre_navigation_tolerance_still_advan
                       mode_timeout=5.0, waypoint_timeout=8.0)
     with fcu.lock:
         initial = deepcopy(fcu.pose)
-        # The 5 m floor plus 30 cm position margin leaves only 40 cm descent.
-        fcu.inspection_terrain_z = initial.position.z - 5.7
+        # The configured clearance plus 30 cm margin leaves only 40 cm descent.
+        fcu.inspection_terrain_z = (
+            initial.position.z - executive.config['verify_inspection_altitude'] - 0.7)
     plans, stopped_heights = [], []
     original_plan, original_setpoint = fcu.plan_to_pose, fcu.receive_setpoint
     original_mode = fcu.set_mode
@@ -1088,6 +1091,102 @@ def test_partial_descent_with_thirty_centimetre_navigation_tolerance_still_advan
         assert not any('MISSION: aborted' in text for text in statuses)
         assert not sensors.inspection_snapshot()
         _assert_terrain_planning(mission)
+        _assert_same_goal_phases(sensors, goal)
+    finally:
+        cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
+@pytest.mark.parametrize('descent_available', [True, False],
+                         ids=['combined_down', 'level_fallback'])
+def test_approach_uses_lower_right_slope_when_straight_and_left_are_higher(
+    mission, monitoring_sensors, descent_available,
+):
+    """A checked right-side route wins over climbing toward the higher tree side."""
+    sensors, fcu, executive = monitoring_sensors, mission.fcu, mission.executive
+    assert executive.config['verify_inspection_altitude'] == 3.0
+    for config in (executive.config, executive._verify.config):
+        config.update(verify_navigation_step=3.0, verify_motion_speed=3.0,
+                      verify_fire_approach_max_steps=8, mode_timeout=5.0,
+                      verify_reacquire_observation_timeout=0.5)
+    anchor, sampled, plans = {}, [], []
+    minimum = executive.config['verify_inspection_altitude']
+    initial_clearance = minimum + (0.4 if descent_available else 0.03)
+
+    def relative_xy(x, y):
+        origin, yaw = anchor['origin'], anchor['yaw']
+        dx, dy = x - origin.x, y - origin.y
+        return (dx * math.cos(yaw) + dy * math.sin(yaw),
+                -dx * math.sin(yaw) + dy * math.cos(yaw))
+
+    def sloping_terrain(x, y):
+        if not anchor:
+            anchor.update(origin=deepcopy(fcu.pose.position),
+                          yaw=yaw_from_quaternion(fcu.pose.orientation))
+        forward, lateral = relative_xy(x, y)
+        sampled.append((forward, lateral))
+        base = anchor['origin'].z - initial_clearance
+        if forward > 0.2:
+            if lateral < -0.25 * forward:
+                return base - (1.0 if descent_available else 0.0)
+            # Occupancy cannot distinguish canopy from terrain. Model the
+            # left tree side and straight ridge as higher support envelopes.
+            return anchor['origin'].z - (1.0 if lateral > 0.25 * forward else 2.0)
+        return base
+
+    original_geometry = fcu.geometry_service.callback
+    original_plan = fcu.plan_to_pose
+    with fcu.lock:
+        fcu.inspection_terrain_height = sloping_terrain
+
+    def checked_geometry(request, response):
+        response = original_geometry(request, response)
+        if request.terrain_envelope and request.corridor.poses:
+            for vertex in request.corridor.poses:
+                point = vertex.pose.position
+                if point.z - sloping_terrain(point.x, point.y) < request.minimum_agl - 1e-6:
+                    response.corridor_safe = False
+                    response.message = 'The sampled ridge/tree-side corridor lacks clearance'
+        return response
+
+    def recorded_plan(request, response):
+        with fcu.lock:
+            origin = deepcopy(fcu.pose)
+        response = original_plan(request, response)
+        plans.append((origin, deepcopy(request.target.pose)))
+        return response
+
+    fcu.geometry_service.callback = checked_geometry
+    fcu.fake_services[-1].callback = recorded_plan
+    with sensors.lock:
+        sensors.smoke_wall_range = None
+        sensors.fire_guidance = lambda: (0.0, -0.25)
+    goal = _start_visible_fire(mission, sensors)
+    result = goal.get_result_async()
+    try:
+        wait_for(lambda: bool(plans) or result.done(), 30.0,
+                 'an oblique right-side route around higher ground and a tree')
+        assert not result.done(), result.result().result.message if result.done() else ''
+        with sensors.lock:
+            sensors.source = None
+        origin, target = plans[0]
+        forward, lateral = relative_xy(target.position.x, target.position.y)
+        assert forward > 0.3 and lateral < -0.1
+        assert any(f > 0.2 and abs(side) < 0.01 for f, side in sampled)
+        assert any(f > 0.2 and side > 0.1 for f, side in sampled)
+        assert target.position.z == pytest.approx(
+            origin.position.z - 0.5 if descent_available else origin.position.z, abs=0.03)
+        wait_for(lambda: math.dist(_position(fcu.pose), _position(target)) < 0.05
+                 and received_state(mission, mode='AUTO.LOITER'),
+                 25.0, 'the checked right-side route to arrive')
+        requests = _assert_terrain_planning(mission)
+        assert all(request.minimum_agl == 3.0 for request in requests)
+        assert not sensors.inspection_snapshot()
+        with fcu.lock:
+            statuses = [text for _, text in fcu.statuses]
+        assert not any('MISSION: aborted' in text for text in statuses)
+        if not descent_available:
+            assert any('height-only fire correction' in text for text in statuses)
         _assert_same_goal_phases(sensors, goal)
     finally:
         cancel_goal(goal)
@@ -1270,7 +1369,8 @@ def test_slow_floor_blocked_height_recovery_advances_then_descends_after_cliff(
                       verify_navigation_step=3.0, verify_fire_approach_max_steps=3,
                       verify_reacquire_observation_timeout=5.0)
     with fcu.lock:
-        ground_z = fcu.pose.position.z - 5.03
+        ground_z = (fcu.pose.position.z - executive.config['verify_inspection_altitude']
+                    - executive.config['position_tolerance'])
     cliff = {}
 
     def ground_height(x, y):
@@ -1742,7 +1842,8 @@ def test_visible_fire_adjusts_altitude_at_fifteen_metre_standoff(
     with fcu.lock:
         requests = deepcopy(fcu.inspection_planning_requests)
         assert requests
-        assert all(request.terrain_envelope and request.minimum_agl >= 5.0
+        assert all(request.terrain_envelope and request.minimum_agl
+                   >= mission.executive.config['verify_inspection_altitude']
                    for request in requests)
         assert any(request.target.pose.position.z == pytest.approx(desired_z, abs=0.03)
                    for request in requests)
@@ -1914,7 +2015,7 @@ def test_fire_post_motion_miss_requires_fresh_guidance_before_reporting(
 def test_opportunistic_wall_arrival_searches_and_reports_without_broad_smoke(
     mission, monitoring_sensors,
 ):
-    """A fresh aperture measurement permits bounded inspection of a small plume."""
+    """Three qualifying rays on new maps permit bounded inspection of a small plume."""
     sensors, fcu = monitoring_sensors, mission.fcu
     for config in (mission.executive.config, mission.executive._verify.config):
         config['verify_viewpoint_lateral_step'] = 0.4
@@ -1925,6 +2026,8 @@ def test_opportunistic_wall_arrival_searches_and_reports_without_broad_smoke(
 
     def moving_near_wall(request, response):
         response = original_geometry(request, response)
+        if request.smoke_wall_width:
+            response.smoke_wall_samples = 3
         if request.smoke_wall_width and request.origin.header.frame_id == 'test_rgb_camera':
             probes.append(deepcopy(response.map_header.stamp))
             # Both observations are near, but the plume moves independently
