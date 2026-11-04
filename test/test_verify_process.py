@@ -5,6 +5,7 @@ Only a private simulated FCU is used; every MAVROS endpoint is remapped.
 """
 
 from copy import deepcopy
+import math
 import os
 from pathlib import Path
 import shlex
@@ -17,7 +18,10 @@ from types import SimpleNamespace
 
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
-from kv_executive.mission_geometry import angular_distance, yaw_from_quaternion
+from geometry_msgs.msg import Point
+from kv_executive.mission_geometry import (
+    angular_distance, quaternion_from_yaw, yaw_from_quaternion,
+)
 from kv_executive.verification import VERIFY_DEFAULTS
 import rclpy
 from rclpy.duration import Duration
@@ -71,6 +75,11 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
         'planning_timeout': 5.0,
         'mode_timeout': 5.0,
         'telemetry_timeout': 3.0,
+        # Keep real mode handoffs while bounding three full departure cycles.
+        'offboard_warmup': 1.0,
+        'hold_duration': 0.05,
+        'setpoint_rate': 30.0,
+        'verify_departure_step': 12.0,
     }
     for name, value in settings.items():
         arguments.extend(['-p', f'{name}:={value}'])
@@ -103,6 +112,9 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
             fcu.offboard_loss_timeout = 2.0
             fcu.heartbeat_interval = 0.2
         sensors = MonitoringSensors()
+        # Model processing after exposure so image-time odometry brackets are
+        # available when the target binding first consumes a detector frame.
+        sensors.detection_latency = 0.08
         _install_camera_transforms(sensors)
         original_geometry = fcu.query_inspection_geometry
 
@@ -130,6 +142,13 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
                     0.2 if pose.position.z < source['z'] - 0.03 else 0.0)
 
         sensors.fire_guidance = fire_guidance
+
+        def smoke_guidance():
+            with fcu.lock:
+                yaw = yaw_from_quaternion(fcu.pose.orientation)
+            return angular_distance(source.get('smoke_yaw', yaw), yaw), 0.0
+
+        sensors.smoke_guidance = smoke_guidance
         original_plan = fcu.plan_to_pose
         recovery_targets = []
 
@@ -202,6 +221,12 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
             alive_wait(lambda: any(text == 'SWEEP: started'
                                    for _, text in fcu.statuses[first_status:]),
                        6.0, 'new Exploration phase')
+            with fcu.lock:
+                yaw = yaw_from_quaternion(fcu.pose.orientation)
+                source['smoke_yaw'] = yaw
+                fcu.inspection_target = Point(
+                    x=fcu.pose.position.x + 20.0 * math.cos(yaw),
+                    y=fcu.pose.position.y + 20.0 * math.sin(yaw), z=fcu.pose.position.z)
             with sensors.lock:
                 sensors.source = 'smoke'
             alive_wait(lambda: any(
@@ -209,7 +234,7 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
                 for _, text in fcu.statuses[first_status:]),
                        25.0, 'short terrain-aware smoke approach arrival')
             with fcu.lock:
-                source.update(yaw=yaw_from_quaternion(fcu.pose.orientation) + 0.2,
+                source.update(yaw=source['smoke_yaw'] + 0.2,
                               z=fcu.pose.position.z + 0.5)
             fire_started = time.monotonic()
             with sensors.lock:
@@ -263,6 +288,24 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
                                   for request in strict)
             assert any(text == 'Verify/REACQUIRE: started' for _, text in statuses)
             assert any(text == 'Verify/CENTER_FIRE: started' for _, text in statuses)
+            alive_wait(lambda: any(
+                text == 'Verify/DEPART_SITE: handoff complete; resuming Exploration'
+                for _, text in fcu.statuses[first_status:]),
+                90.0, 'checked outward departure before the next Exploration phase')
+            alive_wait(lambda: bool(sensors.cluster_snapshots)
+                       and len(sensors.cluster_snapshots[-1].clusters) == repetition + 1,
+                       5.0, 'retained completed locations across mission requests')
+            with fcu.lock:
+                departed = deepcopy(fcu.pose.position)
+                statuses = list(fcu.statuses[first_status:])
+            center = report.smoke_planning_position.point
+            assert ((departed.x - center.x)**2 + (departed.y - center.y)**2)**0.5 >= 26.0
+            departure_at = next(stamp for stamp, text in statuses
+                                if text == 'Verify/DEPART_SITE: started')
+            handoff_at = next(stamp for stamp, text in statuses
+                              if text == 'Verify/DEPART_SITE: handoff complete; '
+                              'resuming Exploration')
+            assert report_time <= departure_at <= handoff_at
             with sensors.lock:
                 sensors.source = None
             cancel_goal(active)
@@ -272,6 +315,15 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
                 assert not fcu.offboard_losses
                 assert not fcu.arming_requests
                 assert not {'AUTO.TAKEOFF', 'AUTO.RTL', 'AUTO.LAND'} & set(fcu.mode_requests)
+                # Each repeated goal models a genuinely different site. A
+                # mere 2 m translation must no longer reopen the old source.
+                fcu.pose.position.y += 100.0
+                fcu.pose.orientation = quaternion_from_yaw(0.0)
+                fcu.inspection_target = fcu.inspection_obstacle = None
+            # Let both executable subscribers receive the new simulated site's
+            # telemetry/TF before admitting another goal and source image.
+            fcu.publish_telemetry()
+            time.sleep(0.4)
             print(f'centering cycle {repetition + 1}/{repetitions} survived', flush=True)
         assert process.poll() is None
         assert monitor_process.poll() is None

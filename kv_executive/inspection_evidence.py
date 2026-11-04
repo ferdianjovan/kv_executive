@@ -172,7 +172,8 @@ class InspectionEvidenceMixin:
                     self._inspection_evidence_frames[oldest].pop(0).data)
             self._inspection_evidence_problem[source] = ''
 
-    def _inspection_evidence_detection_callback(self, message, source):
+    def _inspection_evidence_detection_callback(
+            self, message, source, *, replace_same_stamp=False):
         """Keep bounded source-stamped metadata, including negative thermal frames."""
         self._inspection_evidence_ensure()
         if source not in ('smoke', 'fire'):
@@ -189,7 +190,10 @@ class InspectionEvidenceMixin:
                 return
             detections = self._inspection_evidence_detections[source]
             if detections and stamp <= _stamp_ns(detections[-1]):
-                return
+                if (not replace_same_stamp or stamp != _stamp_ns(detections[-1])
+                        or detections[-1].header.frame_id != message.header.frame_id):
+                    return
+                detections.pop()
             names = ('status', 'detected', 'track_id', 'source_count', 'bbox_x', 'bbox_y',
                      'bbox_width', 'bbox_height', 'angular_bounds_valid', 'yaw_min_rad',
                      'yaw_max_rad', 'vertical_min_rad', 'vertical_max_rad')

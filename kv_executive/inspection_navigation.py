@@ -461,7 +461,8 @@ class InspectionNavigationMixin(
 
     def _inspection_map_corridor(self, path, minimum_agl=0.0, point=None,
                                  allow_initial_climb=False, terrain_envelope=False,
-                                 allow_terrain_escape=False, escape_state=None):
+                                 allow_terrain_escape=False, escape_state=None,
+                                 allow_completed_cluster_escape=False):
         """Check map collision/terrain clearance after explicit local alignment."""
         from kv_executive.mission_executive import MissionError
         from kv_executive.mission_navigation import _inverse
@@ -474,6 +475,7 @@ class InspectionNavigationMixin(
             self._report('Verify: inspection corridor has no finite path to validate')
             return False
         request = QueryInspectionGeometry.Request()
+        request.allow_completed_cluster_escape = allow_completed_cluster_escape
         # MAVROS local ENU is aligned to the planner map explicitly; no
         # map->px4_odom TF edge is assumed anywhere in this executive.
         frame = self.config['verify_planning_frame']
@@ -1800,6 +1802,22 @@ class InspectionNavigationMixin(
                 self._site_sequence += 1
                 report.site_id = self._site_sequence
         self._inspection_report_publisher.publish(report)
+        complete = getattr(self, '_verify_complete_site', None)
+        if complete is not None:
+            self._verify_report_completion_context = {
+                'smoke': deepcopy(self._verify.fresh_smoke()),
+                'fire': deepcopy(latest) if report.fire_found else None,
+                'planning_to_local': deepcopy(conversion)}
+            try:
+                saved = complete(report, message=latest if report.fire_found else current_smoke,
+                                 source='fire' if report.fire_found else 'smoke')
+            finally:
+                self._verify_report_completion_context = None
+            self._report(f'Verify: completed cluster recorded={bool(saved)}; '
+                         f'site_id={report.site_id}')
+            publish_clusters = getattr(self, '_publish_completed_clusters', None)
+            if publish_clusters is not None:
+                publish_clusters()
         self._report(f'Verify: inspection result {report.status}; '
                      f'smoke location valid={report.smoke_location_valid}, '
                      f'fire location valid={report.fire_location_valid}')

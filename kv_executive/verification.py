@@ -161,6 +161,9 @@ class VerifyController:
             self._epoch_ns = self._now_ns()
             self._observations = {'smoke': None, 'fire': None}
             self._last_stamps = {'smoke': 0, 'fire': 0}
+            self._raw_primary = {'smoke': None, 'fire': None}
+            self._candidate_arrays = {'smoke': None, 'fire': None}
+            self._active_target = None
             self._fire_start_ns = 0
             self._fire_frames = 0
             self._fire_reference = None
@@ -277,7 +280,12 @@ class VerifyController:
             >= self.config['verify_fire_min_frames']
         )
 
-    def _receive(self, message, source):
+    def _receive(self, message, source, *, replace_same_stamp=False, received_at=None):
+        if not self._candidate_eligible(message, source):
+            return
+        arrival = time.monotonic() if received_at is None else received_at
+        if not 0.0 <= time.monotonic() - arrival <= self.config['verify_observation_timeout']:
+            return
         with self._lock:
             info = self._observation_info[source]
             info.update(
@@ -292,7 +300,8 @@ class VerifyController:
             if source_ns is None:
                 info['reason'] = self._stamp_issue(message) or 'invalid image timestamp'
                 return
-            if source_ns <= self._last_stamps[source]:
+            if source_ns < self._last_stamps[source] or (
+                    source_ns == self._last_stamps[source] and not replace_same_stamp):
                 info['reason'] = 'duplicate or reordered image'
                 return  # Duplicate/reordered images cannot establish persistence.
             self._last_stamps[source] = source_ns
@@ -313,7 +322,7 @@ class VerifyController:
                     self._fire_reset_reason = info['reason']
                 return
             previous = self._observations[source]
-            now = time.monotonic()
+            now = arrival
             if source == 'fire':
                 continuous = (
                     previous is not None and self._fire_reference is not None
@@ -390,11 +399,109 @@ class VerifyController:
 
     def smoke_callback(self, message):
         """Accept confirmed smoke in any region; region is not a validity gate."""
-        self._receive(message, 'smoke')
+        self._primary_callback(message, 'smoke')
 
     def fire_callback(self, message):
         """Track one consistent fire across distinct, fresh source images."""
-        self._receive(message, 'fire')
+        self._primary_callback(message, 'fire')
+
+    def _candidate_eligible(self, message, source):
+        eligible = getattr(self.executive, '_verify_candidate_is_eligible', None)
+        if (self._confirmed(message, source) and eligible is not None
+                and not eligible(message, source)):
+            return False
+        if self._active_target is not None and self._confirmed(message, source):
+            ray = getattr(self.executive, '_completed_detection_ray', lambda *_: None)(
+                message, source)
+            if ray is None:
+                return False  # Wait for source-time association while a target is bound.
+            bearing = math.atan2(ray[1][1], ray[1][0])
+            if self._active_target['bearing'] is None:
+                self._active_target['bearing'] = bearing
+            difference = abs(math.remainder(bearing - self._active_target['bearing'], math.tau))
+            if difference > math.radians(30.0):
+                return False
+        return True
+
+    def bind_inspection_target(self):
+        """Keep later recovery attached to the eligible source that justified entry."""
+        regions = getattr(self.executive, '_completed_cluster_regions', lambda: [])()
+        if not regions:
+            return
+        source, message = 'fire', self.stable_fire()
+        if message is None:
+            source, message = 'smoke', self.fresh_smoke()
+        ray = getattr(self.executive, '_completed_detection_ray', lambda *_: None)(message, source)
+        if message is not None:
+            self._active_target = {'source': source, 'bearing': (
+                math.atan2(ray[1][1], ray[1][0]) if ray is not None else None)}
+
+    def release_inspection_target(self):
+        """Permit a new exploration sector after the previous handoff is finished."""
+        self._active_target = None
+
+    def _primary_callback(self, message, source):
+        with self._lock:
+            if self._valid_stamp(message) is not None:
+                previous = self._raw_primary[source]
+                if previous is None or self._stamp_ns(message) > self._stamp_ns(previous[0]):
+                    self._raw_primary[source] = (deepcopy(message), time.monotonic())
+            array = self._candidate_arrays[source]
+        if (array is None
+                or time.monotonic() - array[1] > self.config['verify_observation_timeout']):
+            self._receive(message, source)
+
+    def raw_candidates(self, source):
+        """Expose fresh observations for association without recursive target filtering."""
+        with self._lock:
+            array = self._candidate_arrays[source]
+            primary = self._raw_primary[source]
+            if array is not None and (
+                    time.monotonic() - array[1] <= self.config['verify_observation_timeout']):
+                messages = array[0]
+            else:
+                fresh = (primary is not None and time.monotonic() - primary[1]
+                         <= self.config['verify_observation_timeout'])
+                messages = [primary[0]] if fresh else []
+            return [deepcopy(m) for m in messages if self._valid_stamp(m) is not None
+                    and self._confirmed(m, source)]
+
+    def candidates_callback(self, array, source):
+        """Select an eligible component; a completed primary cannot hide its neighbours."""
+        if source not in ('smoke', 'fire') or len(array.detections) > 16:
+            return None
+        stamp = self._stamp_ns(array)
+        if self._valid_stamp(array) is None:
+            return None
+        with self._lock:
+            previous = self._candidate_arrays[source]
+            if previous is not None and (stamp < previous[2] or (
+                    stamp == previous[2] and array.detections)):
+                return None
+        candidates = [m for m in array.detections if m.header == array.header
+                      and self._confirmed(m, source)]
+        with self._lock:
+            self._candidate_arrays[source] = (deepcopy(candidates), time.monotonic(), stamp)
+            current = self._fresh_locked(source)
+        eligible = [m for m in candidates if self._candidate_eligible(m, source)]
+        if not eligible:
+            with self._lock:
+                self._observations[source] = None
+                if source == 'fire':
+                    self._fire_frames = 0
+                    self._fire_reference = None
+            return None
+        selected = eligible[0]
+        if current is not None:
+            selected = min(eligible, key=lambda m: (
+                0 if source == 'fire' and m.track_id == current.track_id else 1,
+                abs(m.yaw_correction_rad - current.yaw_correction_rad)))
+        with self._lock:
+            same = self._fresh_locked(source)
+            duplicate = same is not None and same == selected
+        if not duplicate:
+            self._receive(selected, source, replace_same_stamp=True)
+        return deepcopy(selected)
 
     def _fresh_locked(self, source):
         observation = self._observations[source]
@@ -406,18 +513,63 @@ class VerifyController:
             return None
         return deepcopy(message)
 
+    def _retry_source_candidates(self, source):
+        """Retry a still-fresh image once later odometry can associate its selected target."""
+        with self._lock:
+            previous_stamp = self._last_stamps[source]
+            current = self._fresh_locked(source)
+        candidates = [m for m in self.raw_candidates(source)
+                      if self._stamp_ns(m) > previous_stamp
+                      and self._candidate_eligible(m, source)]
+        if not candidates:
+            return
+        selected = candidates[0]
+        if current is not None:
+            selected = min(candidates, key=lambda m: (
+                0 if source == 'fire' and m.track_id == current.track_id else 1,
+                abs(m.yaw_correction_rad - current.yaw_correction_rad)))
+        with self._lock:
+            array = self._candidate_arrays[source]
+            primary = self._raw_primary[source]
+            arrival = (array[1] if array is not None and array[2] == self._stamp_ns(selected)
+                       else primary[1] if primary is not None
+                       and self._stamp_ns(primary[0]) == self._stamp_ns(selected) else None)
+        if arrival is None:
+            return
+        self._receive(selected, source, received_at=arrival)
+        record = getattr(self.executive, '_inspection_evidence_detection_callback', None)
+        if record is not None:
+            record(selected, source, replace_same_stamp=True)
+
     def fresh_smoke(self):
         """Return a private copy of the latest fresh, confirmed smoke image."""
+        self._retry_source_candidates('smoke')
         with self._lock:
-            return self._fresh_locked('smoke')
+            message = self._fresh_locked('smoke')
+        return (message if message is not None
+                and self._candidate_eligible(message, 'smoke') else None)
 
     def fresh_fire(self):
         """Return a private copy of the latest fresh, confirmed fire image."""
+        self._retry_source_candidates('fire')
         with self._lock:
-            return self._fresh_locked('fire')
+            message = self._fresh_locked('fire')
+        return (message if message is not None
+                and self._candidate_eligible(message, 'fire') else None)
+
+    def raw_fresh_smoke(self):
+        """Read confirmed source evidence independently of completion filtering."""
+        candidates = self.raw_candidates('smoke')
+        return candidates[0] if candidates else None
+
+    def raw_fresh_fire(self):
+        """Read confirmed source evidence independently of completion filtering."""
+        candidates = self.raw_candidates('fire')
+        return candidates[0] if candidates else None
 
     def stable_fire(self):
         """Return a fresh fire only after this consumer saw its persistence."""
+        self._retry_source_candidates('fire')
         with self._lock:
             message = self._fresh_locked('fire')
             observation = self._observations['fire']
@@ -428,7 +580,7 @@ class VerifyController:
                     or (observation[1] - self._fire_start_ns) / 1e9
                     < self.config['verify_fire_persistence'])):
                 return None
-            return message
+        return message if self._candidate_eligible(message, 'fire') else None
 
     def all_quadrants(self, smoke):
         """Require broad smoke coverage, not just a blob crossing image center."""
@@ -518,6 +670,7 @@ class VerifyController:
             # turn the five-second bearing memory into stale steering evidence.
             if (glimpse is not None and self._stamp_ns(glimpse) > max(after_ns, consumed)
                     and not self._stamp_issue(glimpse) and seen is not None
+                    and self._candidate_eligible(glimpse, 'smoke')
                     and time.monotonic() - seen <= self.config['verify_observation_timeout']):
                 return glimpse
             remaining = (started if seen is None else seen) + grace - time.monotonic()
@@ -881,6 +1034,8 @@ class VerifyController:
                     'verify_observation_timeout'] or self._stamp_issue(event[0]):
                 return
             fire = event[0]
+        if not self._candidate_eligible(fire, 'fire'):
+            return
         hint = _bb_get(blackboard, 'verify_height_hint', None)
         stamp = self._stamp_ns(fire)
         if stamp <= _bb_get(blackboard, 'verify_height_hint_consumed', 0):
@@ -1102,6 +1257,7 @@ class VerifyController:
         """Follow source guidance until two fresh observations qualify as near."""
         if not _bb_get(blackboard, 'verify_entered', False):
             self.executive._verify_parent_entry('Verify')
+            self.bind_inspection_target()
             with self._lock:
                 self._smoke_bearing = None
                 self._smoke_bearing_frame = None
@@ -1403,19 +1559,18 @@ class VerifyController:
     def _inspection_fire_event(self, blackboard):
         """Retain confirmation intent briefly, without reusing old guidance."""
         with self._lock:
-            event = self._fire_confirmation
-            if event is None:
-                return False
-            _, stamp_ns, received = event
-            age = (self._now_ns() - stamp_ns) / 1e9
-            timeout = self.config['verify_reacquire_observation_timeout']
-            return (
-                stamp_ns > max(_bb_get(blackboard, 'verify_fire_seen_ns', 0),
-                               _bb_get(blackboard, 'verify_smoke_approach_after_ns', 0),
-                               self._settled_observation_after_ns())
-                and -self.config['verify_future_tolerance'] <= age <= timeout
-                and 0.0 <= time.monotonic() - received <= timeout
-            )
+            event = deepcopy(self._fire_confirmation)
+        if event is None or not self._candidate_eligible(event[0], 'fire'):
+            return False
+        _, stamp_ns, received = event
+        age = (self._now_ns() - stamp_ns) / 1e9
+        timeout = self.config['verify_reacquire_observation_timeout']
+        return (
+            stamp_ns > max(_bb_get(blackboard, 'verify_fire_seen_ns', 0),
+                           _bb_get(blackboard, 'verify_smoke_approach_after_ns', 0),
+                           self._settled_observation_after_ns())
+            and -self.config['verify_future_tolerance'] <= age <= timeout
+            and 0.0 <= time.monotonic() - received <= timeout)
 
     def _route_fire(self, blackboard, after_motion=False):
         """Retain fire intent; source range never controls the fire branch."""
@@ -1874,8 +2029,8 @@ class VerifyController:
                     geometry, fire_message=centered,
                     attempts=max(1, _bb_get(blackboard, 'verify_inspection_attempts', 0)),
                     guard=lambda: self._inspection_guard(blackboard))
-                self.executive._verify_complete_site(report, message=centered, source='fire')
-                return 'explore'
+                blackboard['verify_completed_report'] = report
+                return 'depart'
             if _bb_get(blackboard, 'verify_fire_observed', False) or self.had_fire_confirmation():
                 return self._search_blocked(
                     blackboard, 'confirmed fire guidance has not recovered at the near wall',
@@ -1927,8 +2082,8 @@ class VerifyController:
             report = self.executive._verify_report_inspection(
                 geometry, attempts=blackboard['verify_inspection_attempts'], wall=wall,
                 guard=lambda: self._inspection_guard(blackboard))
-            self.executive._verify_complete_site(report, message=smoke, source='smoke')
-            return 'explore'
+            blackboard['verify_completed_report'] = report
+            return 'depart'
         except _FireFound:
             return self._route_fire(blackboard, after_motion=True)
         except (VerificationStartUnavailable, VerificationRecoveryUnavailable) as error:
@@ -2116,6 +2271,16 @@ class VerifyController:
         except VerificationObservationLost:
             return 'reacquire'
 
+    def depart_site(self, blackboard):
+        """Keep a published finding complete while independently leaving its cluster."""
+        report = _bb_get(blackboard, 'verify_completed_report', None)
+        if report is None:
+            raise self.error_type('DEPART_SITE: no completed inspection report')
+        self.release_inspection_target()
+        self.executive._verify_depart_completed_site(report, guard=self._check)
+        blackboard['verify_completed_report'] = None
+        return 'explore'
+
 
 _FINAL_OUTCOMES = ['explore', 'aborted', 'canceled', 'return_requested']
 
@@ -2171,10 +2336,11 @@ class VerifyStateMachine(StateMachine):
               'reacquire': 'REACQUIRE'}),
             ('CENTER_FIRE', controller.center_fire,
              {'reacquire': 'REACQUIRE', 'search': 'SEARCH_FIRE', 'fire': 'CENTER_FIRE',
-              'approach': 'APPROACH_SMOKE'}),
+              'approach': 'APPROACH_SMOKE', 'depart': 'DEPART_SITE'}),
             ('SEARCH_FIRE', controller.search_fire,
              {'reacquire': 'REACQUIRE', 'fire': 'CENTER_FIRE', 'inspect': 'CENTER_FIRE',
-              'search': 'SEARCH_FIRE', 'approach': 'APPROACH_SMOKE'}),
+              'search': 'SEARCH_FIRE', 'approach': 'APPROACH_SMOKE', 'depart': 'DEPART_SITE'}),
+            ('DEPART_SITE', controller.depart_site, {}),
         )
         for name, operation, routes in states:
             transitions = {outcome: outcome for outcome in _FINAL_OUTCOMES}

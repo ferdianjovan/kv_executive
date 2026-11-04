@@ -44,6 +44,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FireSourceReport.msg"
   "msg/InspectionReport.msg"
   "msg/InspectionImageEvidence.msg"
+  "msg/CompletedInspectionCluster.msg"
+  "msg/CompletedInspectionClusters.msg"
   DEPENDENCIES nav_msgs geometry_msgs sensor_msgs std_msgs unique_identifier_msgs
 )
 
@@ -125,6 +127,9 @@ if(BUILD_TESTING)
   ament_add_pytest_test(inspection_evidence test/test_inspection_evidence.py TIMEOUT 45)
   ament_add_pytest_test(inspection_report_view test/test_inspection_report_view.py TIMEOUT 45)
   ament_add_pytest_test(retained_wall_reporting test/test_retained_wall_reporting.py TIMEOUT 45)
+  ament_add_pytest_test(candidate_selection test/test_candidate_selection.py TIMEOUT 45)
+  ament_add_pytest_test(cluster_motion test/test_cluster_motion.py TIMEOUT 45)
+  ament_add_pytest_test(inspection_departure test/test_inspection_departure.py TIMEOUT 45)
   ament_add_pytest_test(motion_policy test/test_motion_policy.py TIMEOUT 45)
   # Real mode handoffs and the committed-climb case make this a long DDS suite.
   ament_add_pytest_test(verify_ros test/test_verify_ros.py TIMEOUT 3600)

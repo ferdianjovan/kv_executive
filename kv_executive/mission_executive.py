@@ -15,6 +15,7 @@ from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import Pose, PoseStamped
 from kv_executive.action import ExecuteMission
 from kv_executive.completed_sites import COMPLETED_SITE_DEFAULTS, CompletedSitesMixin
+from kv_executive.inspection_departure import DEPARTURE_DEFAULTS, InspectionDepartureMixin
 from kv_executive.inspection_evidence import EVIDENCE_DEFAULTS
 from kv_executive.inspection_navigation import InspectionNavigationMixin
 from kv_executive.mission_geometry import (
@@ -28,14 +29,17 @@ from kv_executive.mission_geometry import (
 )
 from kv_executive.mission_navigation import VerifyNavigationMixin
 from kv_executive.msg import (
-    BatteryReturnEstimate, FireSourceReport, InspectionReport, MissionPhase, MissionStateRequest,
+    BatteryReturnEstimate, CompletedInspectionClusters, FireSourceReport, InspectionReport,
+    MissionPhase, MissionStateRequest,
 )
 from kv_executive.srv import PlanInspectionPath, PlanPath, PlanToPose, QueryInspectionGeometry
 from kv_executive.verification import VERIFY_DEFAULTS, VerifyController, VerifyStateMachine
-from kv_perception.msg import FireDetection, SmokeDetection
+from kv_perception.msg import (
+    FireDetection, FireDetectionArray, SmokeDetection, SmokeDetectionArray,
+)
 from mavros_msgs.msg import State as VehicleState, StatusText
 from mavros_msgs.srv import CommandBool, ParamPull, SetMode
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from rcl_interfaces.srv import GetParameters
 import rclpy
@@ -180,7 +184,8 @@ def build_state_machine(executive, skip_takeoff=False):
 
 
 class MissionExecutive(
-        CompletedSitesMixin, InspectionNavigationMixin, VerifyNavigationMixin, Node):
+        CompletedSitesMixin, InspectionDepartureMixin,
+        InspectionNavigationMixin, VerifyNavigationMixin, Node):
     """Explore and verify detections within one cancelable mission goal."""
 
     def __init__(self):
@@ -189,6 +194,7 @@ class MissionExecutive(
             **VERIFY_DEFAULTS,
             **COMPLETED_SITE_DEFAULTS,
             **EVIDENCE_DEFAULTS,
+            **DEPARTURE_DEFAULTS,
             'inspection_report_history': 2,
             'auto_start_mission': False,
             'robot_base_frame': 'kv_drone/base_link',
@@ -347,6 +353,14 @@ class MissionExecutive(
             FireDetection, self.config['fire_detection_topic'], self._fire_detection_callback,
             1, callback_group=self._callbacks,
         )
+        self._smoke_candidates_subscription = self.create_subscription(
+            SmokeDetectionArray, self.config['smoke_detection_topic'] + '_candidates',
+            lambda message: self._detection_candidates_callback(message, 'smoke'),
+            1, callback_group=self._callbacks)
+        self._fire_candidates_subscription = self.create_subscription(
+            FireDetectionArray, self.config['fire_detection_topic'] + '_candidates',
+            lambda message: self._detection_candidates_callback(message, 'fire'),
+            1, callback_group=self._callbacks)
         self._global_position_subscription = self.create_subscription(
             NavSatFix, self.config['global_position_topic'], self._global_position_callback,
             qos_profile_sensor_data, callback_group=self._callbacks,
@@ -379,6 +393,10 @@ class MissionExecutive(
             QoSProfile(depth=self.config['inspection_report_history'],
                        durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
+        self._completed_clusters_publisher = self.create_publisher(
+            CompletedInspectionClusters, 'completed_inspection_clusters',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._completed_clusters_published_version = -1
         image_qos = QoSProfile(
             depth=1, reliability=qos_profile_sensor_data.reliability,
             durability=qos_profile_sensor_data.durability)
@@ -473,6 +491,21 @@ class MissionExecutive(
         self._inspection_evidence_detection_callback(message, 'fire')
         self._verify.fire_callback(message)
 
+    def _detection_candidates_callback(self, message, source):
+        selected = self._verify.candidates_callback(message, source)
+        if selected is not None:
+            self._inspection_evidence_detection_callback(
+                selected, source, replace_same_stamp=True)
+
+    def _publish_completed_clusters(self):
+        """Publish snapshots outside the telemetry lock, including clock-reset clears."""
+        publisher = getattr(self, '_completed_clusters_publisher', None)
+        version = getattr(self, '_completed_clusters_version', 0)
+        if (publisher is not None and self.get_clock().now().nanoseconds > 0
+                and version != getattr(self, '_completed_clusters_published_version', -1)):
+            publisher.publish(self._completed_cluster_snapshot())
+            self._completed_clusters_published_version = version
+
     def _odometry_callback(self, message):
         input_frame = message.header.frame_id
         is_alias = (
@@ -490,6 +523,7 @@ class MissionExecutive(
             if report_alias:
                 self._odometry_aliases_reported.add(input_frame)
         self._inspection_evidence_odom_callback(message)
+        MissionExecutive._publish_completed_clusters(self)
         if report_alias:
             self._report(
                 f'ODOMETRY: MAVROS local label {input_frame!r} uses '
@@ -598,6 +632,7 @@ class MissionExecutive(
 
     def _exploration_parent_entry(self, blackboard):
         """Publish the goal-scoped phase used by the detection monitor."""
+        self._verify.release_inspection_target()
         try:
             retry_delayed = bool(blackboard['verify_exploration_required'])
         except (KeyError, RuntimeError):
@@ -611,6 +646,7 @@ class MissionExecutive(
         if retry_delayed:
             self._report(f'Exploration: deferring repeat verification for {cooldown:.1f} s')
         blackboard['verify_entered'] = False
+        blackboard['verify_completed_report'] = None
         blackboard['verify_approaches'] = 0
         blackboard['verify_smoke_approach_completed'] = False
         blackboard['verify_smoke_approach_after_ns'] = 0
@@ -729,6 +765,28 @@ class MissionExecutive(
     def _check_motion_observation(self):
         if not self._recovering and not self._command_inflight and self._motion_guard is not None:
             self._motion_guard()
+        if not self._recovering and not self._command_inflight:
+            MissionExecutive._check_completed_motion(self)
+
+    def _check_completed_motion(self):
+        """Revalidate actual position and the remaining Exploration route against every cluster."""
+        regions = getattr(self, '_completed_cluster_regions', lambda: [])()
+        if (not regions or getattr(self, '_parent_state', None) != 'Exploration'
+                or not self._airborne_ready):
+            return
+        _, odometry = self._snapshot(require_armed=True)
+        remaining = getattr(self, '_exploration_remaining', None)
+        if remaining is None:
+            with self._data_lock:
+                target = deepcopy(self._target)
+            remaining = [target] if target is not None else []
+        corridor = Path()
+        corridor.header.frame_id = self.config['local_frame']
+        corridor.poses = [PoseStamped(pose=deepcopy(p))
+                          for p in (odometry.pose.pose, *remaining)]
+        if not self._verify_cluster_path(corridor):
+            raise MissionError(
+                'Exploration: remaining route enters a completed smoke cluster; holding')
 
     def _wait_until(self, predicate, timeout, description):
         deadline = time.monotonic() + timeout
@@ -1081,7 +1139,11 @@ class MissionExecutive(
         self._wait_at_pose(original)
         self._loiter()
 
-    def _path_frame_transform(self, frame):
+    def _completed_path_frame_transform(self, frame):
+        """Never wait for TF in detector callbacks; later polls retry unassociated images."""
+        return self._path_frame_transform(frame, timeout=0.0)
+
+    def _path_frame_transform(self, frame, *, timeout=None):
         _, odometry = self._snapshot(require_armed=True)
         if frame == self.config['local_frame']:
             # The relative transform of an identical pose is identity.
@@ -1092,7 +1154,8 @@ class MissionExecutive(
         try:
             body_in_source = self._tf_buffer.lookup_transform(
                 frame, self.config['robot_base_frame'], Time.from_msg(stamp),
-                timeout=Duration(seconds=self.config['transform_timeout']),
+                timeout=Duration(seconds=(self.config['transform_timeout']
+                                          if timeout is None else timeout)),
             )
         except TransformException as error:
             raise MissionError(f'Cannot align {frame} with PX4 local frame: {error}') from error
@@ -1130,23 +1193,33 @@ class MissionExecutive(
             (current.position.x, current.position.y, current.position.z),
         ) > self.config['position_tolerance']:
             raise MissionError('Vehicle moved too far from the planned start; replan required')
-        self._enter_offboard(current, allowed_modes=('AUTO.LOITER',))
-        # Recheck after priming: even LOITER may drift while the stream warms up.
-        _, odometry = self._snapshot('OFFBOARD', require_armed=True)
-        current = odometry.pose.pose
-        start_distance = math.dist(
-            (start.position.x, start.position.y, start.position.z),
-            (current.position.x, current.position.y, current.position.z),
-        )
-        if start_distance > self.config['position_tolerance']:
-            raise MissionError('Vehicle moved too far from the planned start; replan required')
-        previous = self._fly_to(current, start)
-        for index, leg in enumerate(self.sub_paths, start=1):
-            for stamped in leg.poses[1:]:
-                target = transform_pose(stamped.pose, conversion)
-                previous = self._fly_to(previous, target)
-            self._report(f'EXECUTE_PATH: sub-path {index}/3 done')
-        self._loiter()
+        self._exploration_remaining = [start, *[
+            transform_pose(stamped.pose, conversion)
+            for leg in self.sub_paths for stamped in leg.poses[1:]]]
+        try:
+            MissionExecutive._check_completed_motion(self)
+            self._enter_offboard(current, allowed_modes=('AUTO.LOITER',))
+            # Recheck after priming: even LOITER may drift while the stream warms up.
+            _, odometry = self._snapshot('OFFBOARD', require_armed=True)
+            current = odometry.pose.pose
+            start_distance = math.dist(
+                (start.position.x, start.position.y, start.position.z),
+                (current.position.x, current.position.y, current.position.z),
+            )
+            if start_distance > self.config['position_tolerance']:
+                raise MissionError('Vehicle moved too far from the planned start; replan required')
+            MissionExecutive._check_completed_motion(self)
+            previous = self._fly_to(current, start)
+            self._exploration_remaining.pop(0)
+            for index, leg in enumerate(self.sub_paths, start=1):
+                for stamped in leg.poses[1:]:
+                    target = transform_pose(stamped.pose, conversion)
+                    previous = self._fly_to(previous, target)
+                    self._exploration_remaining.pop(0)
+                self._report(f'EXECUTE_PATH: sub-path {index}/3 done')
+            self._loiter()
+        finally:
+            self._exploration_remaining = None
 
     def _goal_callback(self, _request):
         if self._stop.is_set() or not self._mission_lock.acquire(blocking=False):

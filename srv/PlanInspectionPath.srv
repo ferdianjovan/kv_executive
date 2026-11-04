@@ -13,6 +13,9 @@ bool terrain_envelope
 # Bounded monotonic lateral/diagonal/contour escape before full-clearance planning.
 # Requires terrain_envelope and minimum_agl>0; never waives occupied body clearance.
 bool allow_terrain_escape
+# Departure only: allow an outward-only prefix from a completed cluster buffer.
+# Collision and terrain checks remain mandatory; climbing cannot cross a cylinder.
+bool allow_completed_cluster_escape
 ---
 bool success
 uint8 OK=0

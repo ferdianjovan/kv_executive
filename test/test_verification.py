@@ -202,10 +202,17 @@ class Harness:
         self.events.append((
             'inspection_report', deepcopy(geometry), deepcopy(fire_message), attempts,
         ))
-        return SimpleNamespace(fire_found=fire_message is not None)
+        report = SimpleNamespace(fire_found=fire_message is not None)
+        self._verify_complete_site(report, message=fire_message, source='fire')
+        return report
 
     def _verify_complete_site(self, report, message=None, source=None):
         self.events.append(('completed_site', report))
+
+    def _verify_depart_completed_site(self, report, guard=None):
+        if guard:
+            guard()
+        self.events.append(('departure', report))
 
 
 @pytest.fixture
@@ -288,7 +295,7 @@ def _run_verify_controller(executive, controller, board=None, start='approach'):
     for _ in range(80):
         operation = {'approach': controller.approach_smoke, 'reacquire': controller.reacquire,
                      'search': controller.search_fire, 'inspect': controller.center_fire,
-                     'fire': controller.center_fire}[state]
+                     'fire': controller.center_fire, 'depart': controller.depart_site}[state]
         state = operation(board)
         if state == 'explore':
             return state
@@ -564,7 +571,7 @@ def test_confirmed_visible_fire_never_requires_smoke_leg_or_fire_range(
     feed_fire(executive, controller)
     board = _confirmed_wall_board(executive, controller)
     assert getattr(controller, operation)(board) == 'fire'
-    assert controller.center_fire(board) == 'explore'
+    assert controller.center_fire(board) == 'depart'
     assert any(e[0] == 'inspection_report' and e[2] is not None for e in executive.events)
     assert not any(e[0] in {'navigation', 'plan'} for e in executive.events)
 
@@ -606,7 +613,7 @@ def test_smoke_wall_at_ten_metres_stops_even_if_fire_range_is_unknown(system):
     executive.odometry.pose.pose.position.x = 9.5
     executive.target_geometry.update(point=None, target_valid=False)
     feed_fire(executive, controller)
-    assert controller.center_fire(_confirmed_wall_board(executive, controller)) == 'explore'
+    assert controller.center_fire(_confirmed_wall_board(executive, controller)) == 'depart'
     assert not any(e[0] == 'navigation' for e in executive.events)
 
 
@@ -883,7 +890,7 @@ def test_center_fire_corrects_yaw_and_bounded_height_at_standoff(system, vertica
     controller.config['verify_fire_approach_max_steps'] = 5
     feed_fire(executive, controller, yaw_correction_rad=0.3,
               vertical_correction_rad=vertical)
-    assert controller.center_fire(_confirmed_wall_board(executive, controller)) == 'explore'
+    assert controller.center_fire(_confirmed_wall_board(executive, controller)) == 'depart'
     corrections = [e[0] for e in executive.events if e[0] in {'rotate', 'recovery_plan'}]
     assert corrections == ['rotate', 'recovery_plan', 'recovery_plan', 'recovery_plan']
     assert executive.odometry.pose.pose.position.z == pytest.approx(
@@ -906,7 +913,7 @@ def test_blocked_vertical_centering_still_reports_current_visible_fire(system, f
         raise error('test blocked clearance')
     executive._verify_recovery_plan_to = blocked
     outcome = controller.center_fire(_confirmed_wall_board(executive, controller))
-    assert outcome == ('explore' if failure == 'rejected' else 'fire')
+    assert outcome == ('depart' if failure == 'rejected' else 'fire')
     if failure == 'rejected':
         assert any(e[0] == 'rotate' for e in executive.events)
     assert any(e[0] == 'blocked_vertical' for e in executive.events)
@@ -1106,7 +1113,7 @@ def test_three_completed_boundary_windows_can_report_no_fire(system, initial_bea
     _enable_wall_probes(executive)
     board = _confirmed_wall_board(executive, controller)
     board['verify_smoke_bearing'] = initial_bearing
-    assert controller.center_fire(board) == 'explore'
+    assert controller.center_fire(board) == 'depart'
     reports = [e for e in executive.events if e[0] == 'inspection_report']
     assert len(reports) == 1 and reports[0][2] is None and reports[0][3] == 3
     assert len([e for e in executive.events if e[0] == 'recovery_plan']) == 2
@@ -1384,10 +1391,10 @@ def test_four_state_machine_propagates_cancel_return_and_failure(system, failure
     assert VerifyStateMachine(executive)(Blackboard()) == expected
 
 
-def test_verify_machine_declares_four_substates(system):
+def test_verify_machine_declares_departure_after_inspection(system):
     executive, _ = system
     assert set(VerifyStateMachine(executive).get_states()) == {
-        'APPROACH_SMOKE', 'REACQUIRE', 'CENTER_FIRE', 'SEARCH_FIRE'}
+        'APPROACH_SMOKE', 'REACQUIRE', 'CENTER_FIRE', 'SEARCH_FIRE', 'DEPART_SITE'}
 
 
 def test_approach_cycle_limit_stops_smoke_chasing(system):
@@ -1456,7 +1463,7 @@ def test_failed_horizontal_attempt_retains_visible_fire_without_vertical_dancing
         raise verification.VerificationStartUnavailable('yaw correction interrupted')
 
     executive._verify_rotate = blocked
-    assert controller.center_fire(_confirmed_wall_board(executive, controller)) == 'explore'
+    assert controller.center_fire(_confirmed_wall_board(executive, controller)) == 'depart'
     assert any(e[0] == 'blocked_horizontal' for e in executive.events)
     assert not any(e[0] == 'recovery_plan' for e in executive.events)
     assert any(e[0] == 'inspection_report' for e in executive.events)
@@ -2050,7 +2057,7 @@ def test_floor_blocked_height_at_wall_never_authorizes_forward_fallback(system):
         return False
 
     executive._verify_recovery_plan_to = reject
-    assert controller.center_fire(board) == 'explore'
+    assert controller.center_fire(board) == 'depart'
     assert executive.odometry.pose.pose.position == Point(z=6.0)
     assert not any(event[0] == 'navigation' for event in executive.events)
     assert any(event[0] == 'inspection_report' and event[2] is not None

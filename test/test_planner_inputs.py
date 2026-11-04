@@ -12,7 +12,9 @@ import uuid
 from ament_index_python.packages import get_package_prefix
 from geometry_msgs.msg import PointStamped, PoseStamped, TransformStamped, Vector3Stamped
 from kv_executive.inspection_navigation import InspectionNavigationMixin
-from kv_executive.msg import FireSourceReport
+from kv_executive.msg import (
+    CompletedInspectionCluster, CompletedInspectionClusters, FireSourceReport,
+)
 from kv_executive.srv import PlanInspectionPath, PlanPath, PlanToPose, QueryInspectionGeometry
 from mavros_msgs.msg import HomePosition
 from nav_msgs.msg import Odometry
@@ -78,6 +80,11 @@ class PlannerHarness:
                 depth=100, reliability=ReliabilityPolicy.RELIABLE,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
             ),
+        )
+        self.cluster_publisher = self.node.create_publisher(
+            CompletedInspectionClusters, f'{self.namespace}/completed_inspection_clusters',
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
         self.map_publications = 0
         self.process = None
@@ -457,6 +464,173 @@ def test_exploration_endpoint_is_outside_partial_reported_region(planner_factory
         assert response.success, response.message
         endpoint = response.path.poses[-1].pose.position
         assert math.hypot(endpoint.x, endpoint.y) >= 0.5
+
+
+def _publish_completed_clusters(planner, circles, *, mutate=None, accepted=True):
+    snapshot = CompletedInspectionClusters()
+    snapshot.header.frame_id = 'planner_test_map'
+    snapshot.header.stamp = planner.node.get_clock().now().to_msg()
+    for site_id, x, y, radius in circles:
+        cluster = CompletedInspectionCluster(site_id=site_id, radius=float(radius))
+        cluster.center.header = deepcopy(snapshot.header)
+        cluster.center.point.x, cluster.center.point.y = float(x), float(y)
+        snapshot.clusters.append(cluster)
+    if mutate:
+        mutate(snapshot)
+    marker = ('Completed inspection cluster snapshot accepted' if accepted
+              else 'Completed inspection cluster registry rejected')
+    previous = planner.logs().count(marker)
+    planner.cluster_publisher.publish(snapshot)
+    planner.wait_for(lambda: planner.logs().count(marker) > previous,
+                     'completed-cluster snapshot reception')
+    return snapshot
+
+
+def _assert_path_outside_circles(path, circles):
+    assert path.poses
+    for index, vertex in enumerate(path.poses):
+        end = vertex.pose.position
+        start = path.poses[index - 1].pose.position if index else end
+        for _, x, y, radius in circles:
+            sx, sy = start.x - x, start.y - y
+            dx, dy = end.x - start.x, end.y - start.y
+            squared = dx * dx + dy * dy
+            fraction = max(0.0, min(1.0, -(sx * dx + sy * dy) / squared)) if squared else 0.0
+            assert math.hypot(sx + fraction * dx, sy + fraction * dy) >= radius - 1e-6
+
+
+@pytest.mark.parametrize('altitude', [2.0, 6.0])
+def test_completed_cluster_cylinder_blocks_transit_even_above_smoke(
+        planner_factory, altitude):
+    planner = _strict_planner(planner_factory, wall=False)
+    circles = [(1, 0.5, 0.0, 0.4)]
+    _publish_completed_clusters(planner, circles)
+    request = QueryInspectionGeometry.Request()
+    request.corridor.poses = [planner.target(x=-1.0, z=altitude),
+                              planner.target(x=2.0, z=altitude)]
+    result = planner.query_geometry(request)
+    assert result.success and not result.corridor_safe
+    assert 'completed smoke-cluster keepout' in result.message
+    request.corridor.poses = [planner.target(x=-1.0, z=altitude),
+                              planner.target(x=-1.0, y=1.0, z=altitude),
+                              planner.target(x=2.0, y=1.0, z=altitude),
+                              planner.target(x=2.0, z=altitude)]
+    result = planner.query_geometry(request)
+    assert result.success and result.corridor_safe, result.message
+
+
+def test_target_and_exploration_plans_enforce_cluster_edges_not_only_goals(planner_factory):
+    planner = airborne_planner(planner_factory, planner_parameters={'planning_timeout': 2.0})
+    circles = [(1, 0.7, 0.0, 0.35)]
+    _publish_completed_clusters(planner, circles)
+    response = planner.plan_to(planner.target(x=1.5))
+    assert response.success, response.message
+    _assert_path_outside_circles(response.path, circles)
+    for _ in range(5):
+        response = planner.plan()
+        assert response.success, response.message
+        _assert_path_outside_circles(response.path, circles)
+
+
+def test_inside_cluster_requires_explicit_escape_and_cannot_escape_by_climbing(planner_factory):
+    planner = _strict_planner(planner_factory, wall=False)
+    _publish_completed_clusters(planner, [(1, -0.5, 0.0, 1.0)])
+    request = PlanInspectionPath.Request(target=planner.target(x=1.5))
+    result = planner.plan_inspection(request)
+    assert not result.success and result.error_code == result.START_INVALID
+    assert not planner.plan().success
+    request.allow_completed_cluster_escape = True
+    result = planner.plan_inspection(request)
+    assert result.success, result.message
+    assert result.path.poses[-1].pose.position.x == pytest.approx(1.5)
+    request.target = planner.target(z=3.0)
+    result = planner.plan_inspection(request)
+    assert not result.success
+    assert not result.path.poses
+
+
+@pytest.mark.parametrize('route,safe', [
+    ([(0.0, 0.0), (1.5, 0.0)], True),
+    ([(0.0, 0.0), (-0.2, 0.0)], False),
+    ([(0.0, 0.0), (0.3, 0.0), (0.1, 0.0)], False),
+    ([(0.0, 0.0), (1.5, 0.0), (0.2, 0.0)], False),
+    ([(0.7, 0.0), (0.2, 0.0)], False),
+])
+def test_cluster_escape_is_outward_from_fixed_anchor_and_cannot_reenter(
+        planner_factory, route, safe):
+    planner = _strict_planner(planner_factory, wall=False)
+    _publish_completed_clusters(planner, [(1, -0.5, 0.0, 1.0)])
+    request = QueryInspectionGeometry.Request(allow_completed_cluster_escape=True)
+    request.escape_origin = _geometry_point(x=0.0, y=0.0, z=2.0)
+    request.corridor.poses = [planner.target(x=x, y=y) for x, y in route]
+    result = planner.query_geometry(request)
+    assert result.success and result.corridor_safe is safe, result.message
+
+
+def test_overlapping_clusters_require_outward_progress_from_both(planner_factory):
+    planner = _strict_planner(planner_factory, wall=False)
+    _publish_completed_clusters(planner, [(1, -0.5, 0.0, 1.0), (2, 0.5, 0.0, 1.0)])
+    request = QueryInspectionGeometry.Request(allow_completed_cluster_escape=True)
+    request.corridor.poses = [planner.target(), planner.target(y=1.5)]
+    result = planner.query_geometry(request)
+    assert result.success and result.corridor_safe, result.message
+    request.corridor.poses = [planner.target(), planner.target(x=2.0)]
+    result = planner.query_geometry(request)
+    assert result.success and not result.corridor_safe
+
+
+def test_cluster_registry_leaves_stationary_health_and_plain_geometry_available(planner_factory):
+    planner = _strict_planner(planner_factory, wall=False)
+    _publish_completed_clusters(planner, [(1, 0.0, 0.0, 25.0)])
+    request = QueryInspectionGeometry.Request()
+    request.corridor.poses = [planner.target()]
+    assert planner.query_geometry(request).corridor_safe
+    request.corridor.poses.append(planner.target(yaw=1.0))
+    assert planner.query_geometry(request).corridor_safe
+    assert planner.query_geometry(_inspection_request()).success
+
+
+def test_cluster_escape_never_waives_occupied_collision_clearance(planner_factory):
+    planner = _strict_planner(planner_factory, wall=True)
+    _publish_completed_clusters(planner, [(1, -0.5, 0.0, 1.0)])
+    request = QueryInspectionGeometry.Request(allow_completed_cluster_escape=True)
+    request.corridor.poses = [planner.target(), planner.target(x=4.0)]
+    result = planner.query_geometry(request)
+    assert result.success and not result.corridor_safe
+    assert 'occupied' in result.message
+
+
+@pytest.mark.parametrize('invalid', ['frame', 'point_frame', 'radius', 'ids', 'count', 'older'])
+def test_invalid_cluster_snapshot_blocks_transit_until_valid_snapshot_replaces_it(
+        planner_factory, invalid):
+    planner = _strict_planner(planner_factory, wall=False)
+    previous = _publish_completed_clusters(planner, [(1, 1.0, 0.0, 0.25)])
+
+    def corrupt(snapshot):
+        if invalid == 'frame':
+            snapshot.header.frame_id = 'wrong_map'
+        elif invalid == 'point_frame':
+            snapshot.clusters[0].center.header.frame_id = 'wrong_map'
+        elif invalid == 'radius':
+            snapshot.clusters[0].radius = math.nan
+        elif invalid == 'ids':
+            snapshot.clusters.append(deepcopy(snapshot.clusters[0]))
+        elif invalid == 'count':
+            snapshot.clusters = [CompletedInspectionCluster(
+                site_id=index + 1, center=deepcopy(snapshot.clusters[0].center), radius=0.25)
+                for index in range(101)]
+        else:
+            snapshot.header.stamp = deepcopy(previous.header.stamp)
+            snapshot.header.stamp.sec -= 1
+
+    _publish_completed_clusters(planner, [(1, 1.0, 0.0, 0.25)], mutate=corrupt, accepted=False)
+    result = planner.plan_inspection(PlanInspectionPath.Request(target=planner.target(x=0.5)))
+    assert not result.success and result.error_code == result.INVALID_REQUEST
+    assert 'cluster registry' in result.message
+    assert planner.query_geometry(_inspection_request()).success
+    _publish_completed_clusters(planner, [])
+    result = planner.plan_inspection(PlanInspectionPath.Request(target=planner.target(x=0.5)))
+    assert result.success, result.message
 
 
 @lru_cache(maxsize=4)

@@ -179,7 +179,7 @@ def test_negative_inspection_keeps_three_views_without_repeating_wall_probes(sys
     executive._verify_center_fire_wall = executive._verify_opportunistic_wall = no_wall_rpc
     executive.on_wait = lambda: smoke(executive, controller)
     smoke(executive, controller)
-    assert controller.center_fire(board) == 'explore'
+    assert controller.center_fire(board) == 'depart'
     report = next(event for event in executive.events if event[0] == 'inspection_report')
     assert report[-1] == 3
     assert report[2] is None

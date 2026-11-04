@@ -338,7 +338,7 @@ SEARCH_FIRE   -> bounded near-wall inspection in CENTER_FIRE
 fresh farther wall -> APPROACH_SMOKE
 CENTER_FIRE   -> center -> measured smoke-wall standoff -> fire_found report
               -> completed near-wall search without fire -> fire_not_found report
-              -> completed report -> Exploration
+              -> completed report -> DEPART_SITE -> Exploration
 blocked recovery -> wait in LOITER for newer fresh maps -> bounded retry or explicit abort
 ```
 
@@ -851,9 +851,59 @@ Terrain heights select candidate altitudes; the full corridor must independently
 pass the configured collision and terrain policy
 before OFFBOARD, after warmup, during flight and on arrival. Revalidation pins
 the original escape anchor and cannot restart the below-floor escape after it
-has completed. Completed fire views are associated conservatively by observer
-and bearing when target coordinates are unavailable; a new bearing, translated
-observer or unavailable association permits another inspection.
+has completed.
+
+A completed inspection saves a cluster around its retained measured smoke-wall
+point, with a 20 m core and 5 m routing buffer by default. This is a conservative
+inspection footprint, not a measured fire boundary or an exact plume extent.
+The executive shares its bounded registry with the native planner through
+`completed_inspection_clusters` (`CompletedInspectionClusters`, retained latest
+snapshot). The same footprints apply to every native planned path segment and
+to inspection corridor revalidation. They extend vertically, so climbing over
+a completed cluster does not bypass it.
+
+Completed clusters survive movement, new mission requests and new Verify
+episodes while the executive remains running. An actual ROS clock rewind
+clears the registry; a node restart also loses it because it is not stored on
+disk or reloaded. A later report within an existing core enriches that fixed
+record without moving its original point or expanding its footprint through a
+chain of nearby reports. The older bearing-only compatibility gate and deferred
+unsuccessful viewpoints still expire after 2 m of observer translation; that
+expiry does not remove measured completed clusters.
+
+After publishing either completed result, Verify enters `DEPART_SITE`. When
+inside a buffered footprint, only a checked outward escape prefix is allowed;
+the aircraft must not move deeper into that footprint or re-enter after leaving.
+Departure tries short outward alternatives while retaining map, terrain,
+collision and mission-interrupt checks. Defaults are 3 m legs, at most 12 legs
+and 180 wall-clock seconds, with 1 m clearance beyond every buffered footprint.
+Outside them, the drone turns toward an eligible source or away from completed
+space, settles, then resumes Exploration. Departure ignores completed-source
+steering. If no safe route exists or its budget expires, the mission holds in
+`AUTO.LOITER`; the already published inspection remains valid and available to
+the image viewer.
+
+The executive also consumes `smoke/detection_candidates` and
+`fire/detection_candidates` in the drone namespace. Their arrays contain at most
+16 independently confirmed components, allowing a distinct neighboring plume
+to remain selectable when the primary detector target belongs to a completed
+cluster. Each source is filtered before guidance, recovery and reporting; a
+saved source cannot steal a new target's steering after a detector gap. With
+usable association, a new target needs three distinct fresh observations
+outside saved cluster associations. Duplicate images add no votes. Saved
+coordinates and image-time views support that association; a bearing alone
+does not localize a new plume. Missing image-time association permits fresh
+re-observation during Exploration, while an already bound inspection holds
+guidance until association is available. Existing primary detector topics
+remain supported when no current candidate feed is available.
+
+These candidate messages and shared planning interfaces require rebuilding
+`kv_perception` and `kv_executive` and restarting their consumers together.
+The checkpoint before cluster departure is
+`checkpoint-before-cluster-departure-20261104` in all relevant package
+repositories: executive `1c7e3e3`, perception `4631828`, simulator `6d2796d`.
+See the [cluster departure validation report](test/reports/cluster_departure_validation_20261104.md)
+for regression coverage, default limits and test scope.
 
 ### PX4 returning home during or after Exploration
 
@@ -985,7 +1035,10 @@ and rejection of unrelated frames.
 
 `detection_monitor_node.py` listens to the detectors' typed
 `kv_perception/msg/SmokeDetection` and `kv_perception/msg/FireDetection`
-messages. Either detector can interrupt an active Exploration goal: smoke
+messages and optional candidate arrays on each configured detection topic plus
+`_candidates`. A confirmed secondary component can therefore request Verify
+while the primary component is still tentative. Either detector can interrupt
+an active Exploration goal: smoke
 must have `detected=true`, `status=CONFIRMED` and `background_ready=true`;
 fire must have `detected=true` and `status=CONFIRMED`. The monitor uses the
 detectors' existing persistence checks and adds no second confirmation delay.
@@ -995,8 +1048,11 @@ provide a reliable distance in metres.
 The monitor follows the executing goal UUID on
 `execute_mission/_action/status` and the typed parent phase on `mission_phase`.
 It publishes `kv_executive/msg/MissionStateRequest` with `state: Verify` and
-that goal's `goal_id` on `mission_state_request_for_goal` once per Exploration
-entry. A new action goal and fresh observation rearm the monitor.
+that goal's `goal_id` on `mission_state_request_for_goal`, retrying at most once
+every two seconds while Exploration remains active. The executive may reject
+a request when all observed candidates belong to completed clusters; retries
+let a later novel component trigger Verify. A new action goal and fresh
+observation rearm the monitor.
 It sends no requests outside Exploration, while idle, or while the action is
 canceling or terminal.
 The executive checks the requested UUID against its active goal and latches
@@ -1011,8 +1067,9 @@ additional requests. A later goal requires a fresh observation from that
 goal, so an observation from a previous mission cannot stop a new one. A
 monitor joining an executing goal waits for its matching phase and a qualifying
 detector observation. The request interrupts Exploration, requests `AUTO.LOITER`,
-and enters Verify within the active action. Once Verify completes or loses its
-source, Exploration resumes with a new sweep. The executive performs the flight
+and enters Verify within the active action. A completed inspection passes through
+`DEPART_SITE` before Exploration resumes with a new sweep; inconclusive source
+loss follows its bounded recovery policy. The executive performs the flight
 commands; the monitor only publishes the goal-scoped transition request. It
 does not subscribe to odometry or fire-source reports, and applies no
 known-view suppression.

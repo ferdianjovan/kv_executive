@@ -6,7 +6,9 @@ import time
 from action_msgs.msg import GoalStatus
 from kv_executive.detection_monitor import DetectionMonitor
 from kv_executive.msg import MissionPhase, MissionStateRequest
-from kv_perception.msg import FireDetection, SmokeDetection
+from kv_perception.msg import (
+    FireDetection, FireDetectionArray, SmokeDetection, SmokeDetectionArray,
+)
 import pytest
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
@@ -66,13 +68,19 @@ def attach_monitor(flight):
         'smoke': fcu.create_publisher(SmokeDetection, 'smoke/detection', 10),
         'fire': fcu.create_publisher(FireDetection, 'fire/detection', 10),
     }
+    candidate_publishers = {
+        'smoke': fcu.create_publisher(SmokeDetectionArray, 'smoke/detection_candidates', 10),
+        'fire': fcu.create_publisher(FireDetectionArray, 'fire/detection_candidates', 10),
+    }
     wait_for(
         lambda: all(publisher.get_subscription_count() >= 1
                     for publisher in publishers.values())
+        and all(publisher.get_subscription_count() >= 1
+                for publisher in candidate_publishers.values())
         and monitor._request_publisher.get_subscription_count() >= 2,
         3.0, 'detector monitor and executive hook discovery',
     )
-    return monitor, publishers, requests, phases
+    return monitor, publishers, candidate_publishers, requests, phases
 
 
 def source_time(flight, monitor):
@@ -118,7 +126,7 @@ def test_confirmed_detection_enters_verify_and_next_goal_requires_new_images(
     fcu.offboard_loss_timeout = 2.0
     fcu.heartbeat_interval = 0.2
     executive.config['sweep_step_duration'] = 1.0
-    monitor, publishers, requests, phases = attach_monitor(mission)
+    monitor, publishers, _, requests, phases = attach_monitor(mission)
     assert monitor.get_parameter('use_sim_time').value
 
     # A confirmed observation while idle cannot interrupt a later action.
@@ -217,3 +225,48 @@ def test_confirmed_detection_enters_verify_and_next_goal_requires_new_images(
     )
     assert not second_goal.get_result_async().done()
     assert_canceled_in_loiter(mission, second_goal)
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+@pytest.mark.parametrize('mission', [True], indirect=True, ids=['sim_clock'])
+def test_confirmed_candidate_array_enters_verify_with_tentative_primary(
+    mission, source,  # noqa: F811
+):
+    executive, fcu = mission.executive, mission.fcu
+    fcu.offboard_loss_timeout = 2.0
+    fcu.heartbeat_interval = 0.2
+    executive.config['sweep_step_duration'] = 1.0
+    monitor, publishers, candidate_publishers, requests, phases = attach_monitor(mission)
+    prepare_airborne(mission)
+    goal = send_goal(mission, skip_takeoff=True)
+    assert goal.accepted
+    goal_id = tuple(goal.goal_id.uuid)
+    wait_for(lambda: monitor._active_goal_id == goal_id
+             and monitor._phase_goal_id == goal_id and monitor._phase_state == 'Exploration',
+             3.0, 'matching Exploration phase for candidate-only discovery')
+    now = source_time(mission, monitor)
+    tentative = observation(source, now.to_msg(), confirmed=False)
+    publishers[source].publish(tentative)
+    threading.Event().wait(0.05)
+    assert requests == []
+    selected = observation(source, source_time(mission, monitor).to_msg())
+    array_cls = SmokeDetectionArray if source == 'smoke' else FireDetectionArray
+    candidate_publishers[source].publish(array_cls(
+        header=selected.header, detections=[selected]))
+    # The primary channel may still miss or be tentative while another component
+    # has independently met the detector's confirmation requirements.
+    negative = observation(source, selected.header.stamp, confirmed=False)
+    negative.detected = False
+    publishers[source].publish(negative)
+    wait_for(lambda: len(requests) == 1, 3.0, 'candidate-only goal-scoped Verify request')
+    assert requests[0].state == 'Verify'
+    assert tuple(requests[0].goal_id.uuid) == goal_id
+    wait_for(lambda: monitor._phase_state == 'Verify'
+             and any(phase.state == 'Verify' and tuple(phase.goal_id.uuid) == goal_id
+                     for phase in phases),
+             5.0, 'Verify entered from independent candidate array')
+    candidate_publishers[source].publish(array_cls(header=selected.header))
+    threading.Event().wait(0.05)
+    assert len(requests) == 1
+    assert not goal.get_result_async().done()
+    assert_canceled_in_loiter(mission, goal)

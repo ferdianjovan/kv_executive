@@ -1,12 +1,15 @@
 """Request Verify on confirmed camera detections during Exploration."""
 
 from collections import deque
+from copy import deepcopy
 import math
 import time
 
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from kv_executive.msg import MissionPhase, MissionStateRequest
-from kv_perception.msg import FireDetection, SmokeDetection
+from kv_perception.msg import (
+    FireDetection, FireDetectionArray, SmokeDetection, SmokeDetectionArray,
+)
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -84,6 +87,14 @@ class DetectionMonitor(Node):
                 detection_qos,
             ),
             self.create_subscription(
+                SmokeDetectionArray, self.config['smoke_topic'] + '_candidates',
+                lambda message: self._candidates_callback(message, 'smoke'), detection_qos,
+            ),
+            self.create_subscription(
+                FireDetectionArray, self.config['fire_topic'] + '_candidates',
+                lambda message: self._candidates_callback(message, 'fire'), detection_qos,
+            ),
+            self.create_subscription(
                 GoalStatusArray, self.config['action_status_topic'], self._status_callback,
                 status_qos,
             ),
@@ -109,6 +120,11 @@ class DetectionMonitor(Node):
         self._phase_state = None
         self._phase_stamp_ns = 0
         self._phase_cache = {}
+        self._clear_candidate_tracking()
+
+    def _clear_candidate_tracking(self):
+        self._candidate_stamps = {'smoke': 0, 'fire': 0}
+        self._candidate_observations = {'smoke': None, 'fire': None}
 
     def _remember_closed_goal(self, goal_id):
         self._phase_cache.pop(goal_id, None)
@@ -148,6 +164,7 @@ class DetectionMonitor(Node):
         self._active_goal_stamp_ns = accepted_ns
         self._request_sent = False
         self._next_request_at = 0.0
+        self._clear_candidate_tracking()
         if goal_id != self._phase_goal_id:
             self._phase_goal_id = None
             self._phase_sequence = -1
@@ -184,6 +201,7 @@ class DetectionMonitor(Node):
         if message.state == 'Exploration':
             self._request_sent = False
             self._next_request_at = 0.0
+            self._clear_candidate_tracking()
 
     def _smoke_callback(self, message):
         if (
@@ -191,10 +209,43 @@ class DetectionMonitor(Node):
             and message.background_ready
         ):
             self._request_verify(message, 'smoke')
+        self._request_current_candidate('smoke')
 
     def _fire_callback(self, message):
         if message.detected and message.status == FireDetection.CONFIRMED:
             self._request_verify(message, 'fire')
+        self._request_current_candidate('fire')
+
+    def _candidates_callback(self, array, source):
+        """Observe bounded independent confirmations without replacing primary cues."""
+        if source not in ('smoke', 'fire') or len(array.detections) > 16:
+            return
+        stamp = array.header.stamp
+        source_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
+        now_ns = self.get_clock().now().nanoseconds
+        if (not array.header.frame_id.strip() or source_ns <= 0 or now_ns <= 0
+                or not -self.config['future_tolerance'] <= (now_ns - source_ns) / 1e9
+                <= self.config['observation_timeout']):
+            return
+        previous = self._candidate_stamps[source]
+        if source_ns < previous or (source_ns == previous and array.detections):
+            return
+        self._candidate_stamps[source] = source_ns
+        confirmed = SmokeDetection.CONFIRMED if source == 'smoke' else FireDetection.CONFIRMED
+        selected = next((message for message in array.detections
+                         if message.header == array.header and message.detected
+                         and message.status == confirmed
+                         and (source != 'smoke' or message.background_ready)), None)
+        self._candidate_observations[source] = (
+            (deepcopy(selected), time.monotonic()) if selected is not None else None)
+        self._request_current_candidate(source)
+
+    def _request_current_candidate(self, source):
+        """Retain a fresh independent candidate through primary misses."""
+        observation = self._candidate_observations[source]
+        if observation is not None and (
+                0.0 <= time.monotonic() - observation[1] <= self.config['observation_timeout']):
+            self._request_verify(observation[0], source)
 
     def _request_verify(self, message, source):
         if (

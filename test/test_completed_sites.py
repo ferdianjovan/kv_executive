@@ -33,6 +33,7 @@ class Harness(CompletedSitesMixin):
             'robot_base_frame': 'kv_drone/base_link', 'telemetry_timeout': 2.0,
             'verify_observation_timeout': 2.0, 'verify_future_tolerance': 0.25,
             'fire_exclusion_radius': 15.0,
+            'verify_planning_frame': 'px4_odom',
         }
         self.seconds = 20.0
         self._data_lock = threading.Lock()
@@ -55,7 +56,8 @@ class Harness(CompletedSitesMixin):
         self.odometry(20.1)
 
     def get_clock(self):
-        return SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=round(self.seconds * 1e9)))
+        return SimpleNamespace(now=lambda: SimpleNamespace(
+            nanoseconds=round(self.seconds * 1e9), to_msg=lambda: stamp(self.seconds)))
 
     def lookup(self, target, source, acquired, timeout):
         self.tf_calls.append((target, source, acquired.nanoseconds, timeout.nanoseconds))
@@ -523,3 +525,348 @@ def test_clock_rewind_clears_completed_bearing_evidence(executive):
 
     assert not executive._completed_sites
     assert executive.request_mission_state('Verify', goal_id=UUID(uuid=[1] * 16))
+
+
+def _measured_report(executive, *, center=(30.0, 0.0, 5.0), fire=True, site_id=1):
+    report = executive.report(point=center, fire=fire, uncertainty=0.0, site_id=site_id)
+    report.smoke_wall_confirmed = report.smoke_location_valid = True
+    report.smoke_planning_position = PointStamped(
+        header=Header(frame_id='px4_odom', stamp=stamp(executive.seconds)),
+        point=Point(**dict(zip('xyz', center))))
+    report.smoke_uncertainty_m = 0.0
+    executive.smoke = executive.detection('smoke')
+    executive.fire = executive.detection() if fire else None
+    return report
+
+
+def _next_cluster_frame(executive, *, source='fire', yaw=0.0, vertical=0.0,
+                        track_id=1, point=None):
+    _move_observer(executive, seconds=executive.seconds + 0.1)
+    message = executive.detection(source, yaw=yaw, vertical=vertical,
+                                  **({'track_id': track_id} if source == 'fire' else {}))
+    if point is not None:
+        known = PointStamped(header=Header(frame_id='px4_odom', stamp=stamp(executive.seconds)),
+                             point=Point(**dict(zip('xyz', point))))
+        executive._verify_candidate_planning_position = lambda *_args: known
+    return message
+
+
+@pytest.mark.parametrize('distance', [0.0, 19.99, 20.0, 20.01, 21.0, 24.99, 25.0])
+def test_measured_core_and_buffer_are_both_completed(executive, distance):
+    assert executive._verify_complete_site(_measured_report(executive))
+    candidate = _next_cluster_frame(executive, point=(30.0 + distance, 0.0, 5.0))
+    assert executive._verify_is_completed_detection(candidate, 'fire')
+    assert not executive._verify_candidate_is_eligible(candidate, 'fire')
+    assert executive._completed_cluster_regions()[0]['radius'] == 25.0
+
+
+def test_one_metre_edge_crossing_does_not_reopen_cluster(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    for offset in (19.5, 20.5, 19.8, 20.8, 21.0):
+        candidate = _next_cluster_frame(executive, point=(30.0 + offset, 0.0, 5.0))
+        assert not executive._verify_candidate_is_eligible(candidate, 'fire')
+
+
+def test_three_distinct_outside_images_are_required_and_replay_does_not_vote(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    for index in range(3):
+        candidate = _next_cluster_frame(executive, point=(56.0, 0.0, 5.0), track_id=42)
+        expected = index == 2
+        assert executive._verify_candidate_is_eligible(candidate, 'fire') == expected
+        for _ in range(5):
+            assert executive._verify_candidate_is_eligible(candidate, 'fire') == expected
+        assert not executive._verify_is_completed_detection(candidate, 'fire')
+
+
+def test_return_to_buffer_establishes_completed_continuity(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    for offset, expected in ((26.0, False), (26.0, False), (24.9, False),
+                             (26.0, False), (26.0, False), (26.0, False)):
+        candidate = _next_cluster_frame(executive, point=(30.0 + offset, 0.0, 5.0), track_id=42)
+        assert executive._verify_candidate_is_eligible(candidate, 'fire') == expected
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+@pytest.mark.parametrize('yaw,vertical', [
+    (math.radians(50.0), 0.0), (-math.radians(50.0), -math.radians(25.0))])
+def test_distinct_distant_bearing_becomes_eligible_without_ranging(
+        executive, source, yaw, vertical):
+    executive._verify_complete_site(_measured_report(executive, center=(15.0, 0.0, 5.0)))
+    for index in range(3):
+        candidate = _next_cluster_frame(executive, source=source, yaw=yaw, vertical=vertical,
+                                        track_id=42)
+        assert executive._verify_candidate_is_eligible(candidate, source) == (index == 2)
+    assert not hasattr(executive, '_verify_candidate_planning_position')
+
+
+def test_observer_inside_buffer_does_not_blacklist_every_direction(executive):
+    executive._verify_complete_site(_measured_report(executive, center=(15.0, 0.0, 5.0)))
+    assert executive._verify_is_completed_detection(executive.detection(), 'fire')
+    for _ in range(3):
+        opposite = _next_cluster_frame(executive, yaw=math.radians(70.0))
+        executive._verify_candidate_is_eligible(opposite, 'fire')
+    assert executive._verify_candidate_is_eligible(opposite, 'fire')
+
+
+def test_completed_location_survives_translation_and_track_reset(executive):
+    report = _measured_report(executive)
+    assert executive._verify_complete_site(report)
+    saved = deepcopy(executive._completed_cluster_regions())
+    _move_observer(executive, y=12.0)
+    direction = math.atan2(-12.0, 30.0)
+    candidate = executive.detection(yaw=direction, track_id=999)
+    assert executive._verify_is_completed_detection(candidate, 'fire')
+    assert executive._completed_cluster_regions() == saved
+
+
+def test_delayed_report_saves_real_point_even_with_stale_passed_image(executive):
+    report = _measured_report(executive)
+    old = deepcopy(executive.fire)
+    original_point = deepcopy(report.smoke_planning_position)
+    _move_observer(executive, seconds=23.0)
+    executive.fire = executive.detection(track_id=1)
+    executive.smoke = executive.detection('smoke')
+    assert executive._verify_complete_site(report, message=old, source='fire')
+    entry = executive._completed_clusters[0]
+    assert entry['center'] == original_point
+    assert entry['views']['fire'][0]['message'].header.stamp == stamp(23.0)
+    assert entry['views']['smoke'][0]['message'].header.stamp == stamp(23.0)
+
+
+def test_explicit_report_context_wins_over_old_raw_primary(executive):
+    report = _measured_report(executive)
+    selected = executive.detection('smoke', yaw=0.2)
+    executive._verify_report_completion_context = {'smoke': selected, 'fire': executive.fire}
+    executive.smoke = executive.detection('smoke', yaw=-0.8)
+    assert executive._verify_complete_site(report)
+    context = executive._completed_clusters[0]['views']['smoke'][0]['message']
+    assert context.yaw_correction_rad == pytest.approx(0.2)
+
+
+def test_different_visible_side_plume_is_not_saved_as_reported_context(executive):
+    report = _measured_report(executive)
+    executive.smoke = executive.detection('smoke', yaw=math.radians(60.0))
+    assert executive._verify_complete_site(report)
+    assert not executive._completed_clusters[0]['views']['smoke']
+
+
+@pytest.mark.parametrize('kind', ['missing_tf', 'missing_pose'])
+def test_missing_source_association_keeps_cluster_and_allows_reobservation(executive, kind):
+    executive._verify_complete_site(_measured_report(executive))
+    if kind == 'missing_tf':
+        def unavailable(*_args, **_kwargs):
+            raise TransformException('temporarily unavailable')
+        executive._tf_buffer.lookup_transform = unavailable
+    else:
+        executive._inspection_odometry_history.clear()
+    candidate = executive.detection()
+    assert executive._verify_candidate_is_eligible(candidate, 'fire')
+    assert not executive._verify_is_completed_detection(candidate, 'fire')
+    assert len(executive._completed_cluster_regions()) == 1
+
+
+def test_negative_smoke_cluster_never_blocks_new_confirmed_fire(executive):
+    executive._verify_complete_site(_measured_report(executive, fire=False))
+    assert executive._verify_is_completed_detection(executive.smoke, 'smoke')
+    executive.fire = executive.detection(track_id=42)
+    assert executive._verify_candidate_is_eligible(executive.fire, 'fire')
+    assert not executive._verify_is_completed_detection(executive.fire, 'fire')
+
+
+def test_raw_observations_drive_admission_without_recursive_filtered_getters(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    smoke, fire = executive.smoke, executive.fire
+    executive._verify.raw_fresh_smoke = lambda: smoke
+    executive._verify.raw_fresh_fire = lambda: fire
+
+    def filtered():
+        raise AssertionError('Completed association must not read filtered observations')
+
+    executive._verify.fresh_smoke = executive._verify.fresh_fire = filtered
+    assert executive._verify_request_is_completed()
+
+
+def test_all_array_candidates_are_checked_even_with_completed_primary(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    candidates = {'smoke': [executive.smoke], 'fire': [executive.fire]}
+    executive._verify.raw_candidates = lambda source: candidates[source]
+    assert executive._verify_request_is_completed()
+    for index in range(3):
+        other = _next_cluster_frame(executive, yaw=0.8, track_id=42)
+        candidates['fire'] = [executive.detection(), other]
+        candidates['smoke'] = []
+        assert executive._verify_request_is_completed() == (index < 2)
+
+
+def test_registry_snapshot_preserves_point_stamp_and_returns_independent_copies(executive):
+    report = _measured_report(executive)
+    executive._verify_complete_site(report)
+    _move_observer(executive, seconds=30.0, x=10.0)
+    snapshot = executive._completed_cluster_snapshot()
+    assert snapshot.header.frame_id == 'px4_odom'
+    assert snapshot.header.stamp == stamp(30.0)
+    assert snapshot.clusters[0].center == report.smoke_planning_position
+    assert snapshot.clusters[0].radius == 25.0
+    snapshot.clusters[0].center.point.x = -900.0
+    assert executive._completed_cluster_regions()[0]['center'].point.x == 30.0
+
+
+def test_reordered_odometry_does_not_erase_completed_registry(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    executive.odometry(19.95)
+    assert executive._completed_cluster_regions()
+    assert executive._inspection_odometry_history[-1][0] == 20_100_000_000
+
+
+def test_true_clock_rewind_clears_registry_and_emits_empty_snapshot(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    previous_version = executive._completed_clusters_version
+    _move_observer(executive, seconds=10.0)
+    assert not executive._completed_cluster_regions()
+    assert not executive._completed_cluster_snapshot().clusters
+    assert executive._completed_clusters_version > previous_version
+
+
+def test_queued_previous_epoch_odometry_cannot_poison_reset_pose_history(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    executive.seconds = 10.0
+    executive.odometry(20.2)  # A queued sample from before the source-clock reset.
+    executive.odometry(9.9)
+    executive.odometry(10.1)
+    assert not executive._completed_cluster_regions()
+    assert executive._completed_source_pose(10_000_000_000) is not None
+
+
+def test_registry_and_candidate_history_are_bounded(executive):
+    for index in range(105):
+        report = _measured_report(executive, center=(float(index * 50 + 30), 0.0, 5.0),
+                                  site_id=index + 1)
+        executive._verify_complete_site(report)
+    assert len(executive._completed_cluster_regions()) == 100
+    assert executive._completed_cluster_regions()[0]['site_id'] == 6
+    for identity in range(140):
+        candidate = _next_cluster_frame(executive, yaw=0.8, track_id=identity + 1)
+        executive._verify_candidate_is_eligible(candidate, 'fire')
+    assert len(executive._completed_candidate_history) == 128
+
+
+def test_nearby_report_enriches_fixed_cluster_without_moving_or_expanding_it(executive):
+    first = _measured_report(executive)
+    executive._verify_complete_site(first)
+    original = deepcopy(executive._completed_cluster_regions()[0])
+    for offset in (5.0, 10.0, 15.0, 20.0):
+        executive._verify_complete_site(_measured_report(
+            executive, center=(30.0 + offset, 0.0, 5.0), site_id=int(offset)))
+    original['site_id'] = 20
+    assert executive._completed_cluster_regions() == [original]
+    assert len(executive._completed_clusters[0]['views']['smoke']) <= 4
+    assert [r['site_id'] for r in executive._completed_clusters[0]['reports']] == [15, 20]
+    negative = _measured_report(executive, fire=False, site_id=21)
+    executive._verify_complete_site(negative)
+    assert executive._completed_clusters[0]['site_id'] == 21
+    assert executive._completed_clusters[0]['fire_found']
+
+
+def test_new_goal_does_not_erase_completed_spatial_registry(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    executive._goal_handle.goal_id = UUID(uuid=[2] * 16)
+    _move_observer(executive, x=3.0)
+    executive.smoke, executive.fire = executive.detection('smoke'), executive.detection()
+    assert executive._verify_request_is_completed()
+    assert not executive.request_mission_state('Verify', goal_id=UUID(uuid=[2] * 16))
+
+
+def test_map_cluster_is_compared_to_current_transformed_camera_ray(executive):
+    report = _measured_report(executive)
+    executive.config['verify_planning_frame'] = 'map'
+    report.smoke_planning_position.header.frame_id = 'map'
+    executive._path_frame_transform = lambda _frame: Transform(
+        translation=Vector3(x=10.0), rotation=quaternion_from_yaw(0.0))
+    assert executive._verify_complete_site(report)
+    _move_observer(executive, y=10.0)
+    candidate = executive.detection(yaw=math.atan2(-10.0, 40.0), track_id=42)
+    assert executive._verify_is_completed_detection(candidate, 'fire')
+    assert executive._completed_cluster_snapshot().clusters[0].center.header.frame_id == 'map'
+
+
+def test_report_transform_snapshot_and_nonblocking_candidate_hook_are_used(executive):
+    report = _measured_report(executive)
+    executive.config['verify_planning_frame'] = 'map'
+    report.smoke_planning_position.header.frame_id = 'map'
+    conversion = Transform(translation=Vector3(x=10.0), rotation=quaternion_from_yaw(0.0))
+
+    def blocking_lookup(_frame):
+        raise AssertionError('Candidate association must not use the blocking planning lookup')
+
+    executive._path_frame_transform = blocking_lookup
+    executive._completed_path_frame_transform = blocking_lookup
+    executive._verify_report_completion_context = {
+        'smoke': executive.smoke, 'fire': executive.fire, 'planning_to_local': conversion}
+    assert executive._verify_complete_site(report)
+    assert executive._completed_clusters[0]['views']['smoke']
+    executive._verify_report_completion_context = None
+    executive._completed_path_frame_transform = lambda _frame: conversion
+    assert executive._verify_is_completed_detection(executive.fire, 'fire')
+
+
+@pytest.mark.parametrize('invalid', ['nan', 'frame', 'zero_stamp', 'future', 'uncertainty'])
+def test_invalid_retained_point_does_not_create_spatial_cluster(executive, invalid):
+    report = _measured_report(executive)
+    if invalid == 'nan':
+        report.smoke_planning_position.point.x = math.nan
+    elif invalid == 'frame':
+        report.smoke_planning_position.header.frame_id = 'unknown_map'
+    elif invalid == 'zero_stamp':
+        report.smoke_planning_position.header.stamp = stamp(0.0)
+    elif invalid == 'future':
+        report.smoke_planning_position.header.stamp = stamp(30.0)
+    else:
+        report.smoke_uncertainty_m = math.nan
+    executive._verify_complete_site(report)
+    assert not executive._completed_cluster_regions()
+
+
+def test_boundary_uncertainty_requires_clearly_outside_evidence(executive):
+    report = _measured_report(executive)
+    report.smoke_uncertainty_m = 0.6
+    executive._verify_complete_site(report)
+    candidate = _next_cluster_frame(executive, point=(55.5, 0.0, 5.0))
+    assert not executive._verify_candidate_is_eligible(candidate, 'fire')
+
+
+def test_independent_position_uses_horizontal_cluster_footprint(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    candidate = _next_cluster_frame(executive, point=(50.0, 0.0, 100.0))
+    assert executive._verify_is_completed_detection(candidate, 'fire')
+
+
+def test_source_frame_gap_breaks_consecutive_outside_votes(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    for _ in range(2):
+        candidate = _next_cluster_frame(executive, yaw=0.8)
+        assert not executive._verify_candidate_is_eligible(candidate, 'fire')
+    _move_observer(executive, seconds=executive.seconds + 3.0)
+    candidate = executive.detection(yaw=0.8)
+    assert not executive._verify_candidate_is_eligible(candidate, 'fire')
+
+
+def test_continuous_completed_component_does_not_reopen_one_metre_outside_buffer(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    for offset in (24.0, 25.0, 26.0, 26.1, 25.9):
+        candidate = _next_cluster_frame(executive, point=(30.0 + offset, 0.0, 5.0))
+        assert executive._verify_is_completed_detection(candidate, 'fire')
+    assert executive._completed_cluster_regions()[0]['radius'] == 25.0
+
+
+def test_continuous_completed_bearing_keeps_identity_through_slow_parallax(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    for degrees in (4.0, 8.0, 12.0, 16.0, 20.0):
+        candidate = _next_cluster_frame(executive, yaw=math.radians(degrees))
+        assert executive._verify_is_completed_detection(candidate, 'fire')
+
+
+def test_large_independent_position_jump_breaks_completed_continuity(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    for index in range(3):
+        candidate = _next_cluster_frame(executive, point=(130.0, 0.0, 5.0))
+        assert executive._verify_candidate_is_eligible(candidate, 'fire') == (index == 2)

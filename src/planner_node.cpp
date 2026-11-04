@@ -26,6 +26,7 @@
 #include <ompl/config.h>
 #include <ompl/base/SpaceInformation.h>
 #include <ompl/base/MotionValidator.h>
+#include <ompl/base/DiscreteMotionValidator.h>
 #include <ompl/base/spaces/SO2StateSpace.h>
 #include <ompl/base/spaces/RealVectorStateSpace.h>
 #include <ompl/geometric/PathGeometric.h>
@@ -56,6 +57,7 @@
 #include "kv_executive/srv/plan_inspection_path.hpp"
 #include "kv_executive/srv/query_inspection_geometry.hpp"
 #include "kv_executive/msg/fire_source_report.hpp"
+#include "kv_executive/msg/completed_inspection_clusters.hpp"
 
 namespace ob = ompl::base;
 namespace og = ompl::geometric;
@@ -156,22 +158,41 @@ public:
     fire_sources_subscription_ = this->create_subscription<kv_executive::msg::FireSourceReport>(
             "fire_sources", rclcpp::QoS(100).reliable().transient_local(),
             std::bind(&MotionPlanner::fireSourceCallback, this, std::placeholders::_1));
+    completed_clusters_subscription_ =
+      this->create_subscription<kv_executive::msg::CompletedInspectionClusters>(
+      "completed_inspection_clusters", rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&MotionPlanner::completedClustersCallback, this, std::placeholders::_1));
 
     createStateSpace();
   }
 
   void createPlanningSetup(
     const ob::StateValidityCheckerFn & validity = {},
-    const std::function<bool(const ob::State *, const ob::State *)> & motion = {})
+    const std::function<bool(const ob::State *, const ob::State *)> & motion = {},
+    bool allow_completed_cluster_escape = false,
+    const geometry_msgs::msg::Point * completed_escape_origin = nullptr)
   {
     ss_ = std::make_shared<og::SimpleSetup>(space_);
-    ss_->setStateValidityChecker(validity ? validity :
-      ob::StateValidityCheckerFn([this](const ob::State * state) {return isStateValid(state);}));
+    const auto origin = completed_escape_origin ? *completed_escape_origin : current_pose.position;
+    ss_->setStateValidityChecker(
+      [this, validity, allow_completed_cluster_escape, origin](const ob::State * state) {
+        std::string reason;
+        return completedClusterCorridor({inspectionStatePoint(state)},
+                 allow_completed_cluster_escape, origin, reason) &&
+               (validity ? validity(state) : isStateValid(state));
+      });
     const auto si = ss_->getSpaceInformation();
     si->setStateValidityCheckingResolution(validity_resolution_fraction_);
-    if (motion) {
-      si->setMotionValidator(std::make_shared<InspectionMotionValidator>(si, motion));
-    }
+    const auto discrete = std::make_shared<ob::DiscreteMotionValidator>(si);
+    si->setMotionValidator(std::make_shared<InspectionMotionValidator>(si,
+      [this, motion, discrete, allow_completed_cluster_escape, origin](
+        const ob::State * start, const ob::State * end) {
+        std::string reason;
+        return completedClusterCorridor(
+          {inspectionStatePoint(start), inspectionStatePoint(end)},
+          allow_completed_cluster_escape, origin, reason) &&
+               (motion ? motion(start, end) : discrete->checkMotion(start, end));
+      }));
     auto planner = std::make_shared<og::RRTConnect>(si);
     ss_->setPlanner(planner);
   }
@@ -181,6 +202,10 @@ public:
     last_planning_error_.clear();
     if (!updatePlanningPoses()) {
       return false;
+    }
+    const auto cluster_issue = completedClustersIssue();
+    if (!cluster_issue.empty()) {
+      return failPlanning(cluster_issue);
     }
 
     geometry_msgs::msg::Point goal_position;
@@ -214,7 +239,10 @@ public:
       goal_position.z = min_z <= max_z ?
         std::uniform_real_distribution<double>(min_z, max_z)(random_generator_) :
         current_pose.position.z;
-      if (outsideReportedSites(goal_position)) {
+      std::string cluster_reason;
+      if (outsideReportedSites(goal_position) && completedClusterCorridor(
+          {goal_position}, false, current_pose.position, cluster_reason))
+      {
         return true;
       }
     }
@@ -228,7 +256,9 @@ public:
     const geometry_msgs::msg::Quaternion * goal_orientation = nullptr,
     const ob::StateValidityCheckerFn & validity = {},
     const std::function<bool(const ob::State *, const ob::State *)> & motion = {},
-    const geometry_msgs::msg::Pose * start_override = nullptr, bool publish = true)
+    const geometry_msgs::msg::Pose * start_override = nullptr, bool publish = true,
+    bool allow_completed_cluster_escape = false,
+    const geometry_msgs::msg::Point * completed_escape_origin = nullptr)
   {
     if (!current_pose_received_ || !home_pose_received_ || !occupancy_map_received_) {
       return failPlanning("Required odometry, home, or OctoMap data became unavailable");
@@ -238,7 +268,13 @@ public:
       return false;
     }
 
-    createPlanningSetup(validity, motion);
+    const auto cluster_issue = completedClustersIssue();
+    if (!cluster_issue.empty()) {
+      return failPlanning(cluster_issue);
+    }
+    const auto cluster_origin = completed_escape_origin ?
+      *completed_escape_origin : current_pose.position;
+    createPlanningSetup(validity, motion, allow_completed_cluster_escape, &cluster_origin);
     const auto & initial_pose = start_override ? *start_override : current_pose;
         // create a start state
     ob::ScopedState<> start(space_);
@@ -283,7 +319,23 @@ public:
     ss_->simplifySolution(simplification_time_);
     auto & solution_path = ss_->getSolutionPath();
 
-    path_message = processSolutionPath(solution_path, goal_orientation, publish);
+    path_message = processSolutionPath(solution_path, goal_orientation, false);
+    std::vector<geometry_msgs::msg::Point> cluster_vertices;
+    for (const auto & vertex : path_message.poses) {
+      cluster_vertices.push_back(vertex.pose.position);
+    }
+    std::string cluster_reason;
+    if (!completedClusterCorridor(cluster_vertices, allow_completed_cluster_escape,
+      cluster_origin, cluster_reason, true))
+    {
+      path_message.poses.clear();
+      return failPlanning(cluster_reason);
+    }
+    if (publish) {
+      path_publisher_->publish(path_message);
+      RCLCPP_INFO(this->get_logger(), "Published planned path with %zu poses in frame '%s'",
+        path_message.poses.size(), path_message.header.frame_id.c_str());
+    }
 
     return true;
   }
@@ -359,6 +411,118 @@ private:
   static double stampSeconds(const builtin_interfaces::msg::Time & stamp)
   {
     return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1e-9;
+  }
+
+  void completedClustersCallback(
+    const kv_executive::msg::CompletedInspectionClusters::SharedPtr snapshot)
+  {
+    const double stamp = stampSeconds(snapshot->header.stamp);
+    const double now = this->get_clock()->now().seconds();
+    std::string issue;
+    if (snapshot->header.frame_id.empty() || snapshot->header.frame_id.size() > 256 ||
+      snapshot->header.stamp.sec < 0 || snapshot->header.stamp.nanosec >= 1000000000u ||
+      stamp <= 0.0 || now <= 0.0 || stamp > now + inspection_future_tolerance_ ||
+      (stamp < completed_clusters_stamp_ &&
+      now + inspection_future_tolerance_ >= completed_clusters_stamp_) ||
+      snapshot->clusters.size() > 100)
+    {
+      issue = "invalid frame, snapshot timestamp/order, or more than 100 clusters";
+    }
+    std::set<uint64_t> identifiers;
+    for (const auto & cluster : snapshot->clusters) {
+      const auto & point = cluster.center.point;
+      const double measured = stampSeconds(cluster.center.header.stamp);
+      if (cluster.site_id == 0 || !identifiers.insert(cluster.site_id).second ||
+        cluster.center.header.frame_id != snapshot->header.frame_id || measured <= 0.0 ||
+        cluster.center.header.stamp.sec < 0 ||
+        cluster.center.header.stamp.nanosec >= 1000000000u ||
+        measured > stamp + inspection_future_tolerance_ ||
+        !std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) ||
+        !std::isfinite(cluster.radius) || cluster.radius <= 0.0)
+      {
+        issue = "invalid cluster identity, measurement frame/time, position, or radius";
+        break;
+      }
+    }
+    if (!issue.empty()) {
+      completed_clusters_issue_ = "Completed inspection cluster registry rejected: " + issue;
+      RCLCPP_WARN(this->get_logger(), "%s", completed_clusters_issue_.c_str());
+      return;
+    }
+    completed_clusters_ = snapshot->clusters;
+    completed_clusters_frame_ = snapshot->header.frame_id;
+    completed_clusters_stamp_ = stamp;
+    completed_clusters_issue_.clear();
+    RCLCPP_INFO(this->get_logger(), "Completed inspection cluster snapshot accepted: %zu regions",
+      completed_clusters_.size());
+  }
+
+  std::string completedClustersIssue() const
+  {
+    if (!completed_clusters_issue_.empty()) {
+      return completed_clusters_issue_;
+    }
+    if (!completed_clusters_frame_.empty()) {
+      std::shared_lock<std::shared_mutex> lock(occupancy_map_mutex_);
+      if (completed_clusters_frame_ != occupancy_map_frame_) {
+        return "Completed inspection cluster registry frame differs from the map frame";
+      }
+      if (completed_clusters_stamp_ >
+        this->get_clock()->now().seconds() + inspection_future_tolerance_)
+      {
+        return "Completed inspection cluster registry predates a ROS clock reset";
+      }
+    }
+    return {};
+  }
+
+  bool completedClusterCorridor(
+    const std::vector<geometry_msgs::msg::Point> & vertices, bool allow_escape,
+    const geometry_msgs::msg::Point & anchor, std::string & reason,
+    bool require_progress = false) const
+  {
+    const auto issue = completedClustersIssue();
+    if (!issue.empty()) {
+      reason = issue;
+      return false;
+    }
+    constexpr double tolerance = 1e-6;
+    for (const auto & cluster : completed_clusters_) {
+      const auto & center = cluster.center.point;
+      const double initial_radius = std::hypot(anchor.x - center.x, anchor.y - center.y);
+      const bool escaping = allow_escape && initial_radius + tolerance < cluster.radius;
+      for (std::size_t index = 0; index < vertices.size(); ++index) {
+        const auto & end = vertices[index];
+        const auto & start = vertices[index ? index - 1 : 0];
+        const double sx = start.x - center.x, sy = start.y - center.y;
+        const double dx = end.x - start.x, dy = end.y - start.y;
+        const double length_squared = dx * dx + dy * dy;
+        const double fraction = length_squared > 0.0 ?
+          std::clamp(-(sx * dx + sy * dy) / length_squared, 0.0, 1.0) : 0.0;
+        const double closest = std::hypot(sx + fraction * dx, sy + fraction * dy);
+        const double start_radius = std::hypot(sx, sy);
+        const double required = escaping ? initial_radius : cluster.radius;
+        const bool reentry = start_radius + tolerance >= cluster.radius &&
+          closest + tolerance < cluster.radius;
+        // While inside a permitted buffer, the squared radius must never
+        // decrease anywhere along the edge. An exact tangent is permitted.
+        const bool inward = escaping && start_radius + tolerance < cluster.radius &&
+          sx * dx + sy * dy < -tolerance;
+        if (!std::isfinite(closest) || closest + tolerance < required || reentry || inward) {
+          reason = "Inspection path violates completed smoke-cluster keepout for site " +
+            std::to_string(cluster.site_id) + (inward ? "; escape moves inward" : "");
+          return false;
+        }
+      }
+      if (escaping && require_progress && !vertices.empty() &&
+        std::hypot(vertices.back().x - center.x, vertices.back().y - center.y) <=
+        initial_radius + tolerance)
+      {
+        reason = "Completed smoke-cluster escape requires real outward horizontal progress";
+        return false;
+      }
+    }
+    return true;
   }
 
   std::string inspectionSourceIssue(const std_msgs::msg::Header & header) const
@@ -1572,6 +1736,17 @@ private:
             request->initial_climb_tracking_tolerance, request->terrain_envelope,
             request->allow_terrain_escape, anchored ? &escape_origin : nullptr,
             request->terrain_escape_complete || response->current_clearance_reached);
+        const bool translating = std::any_of(vertices.begin(), vertices.end(),
+            [&vertices](const auto & point) {
+              const auto & first = vertices.front();
+              return std::hypot(std::hypot(point.x - first.x, point.y - first.y),
+              point.z - first.z) > 1e-9;
+          });
+        if (response->corridor_safe && translating) {
+          response->corridor_safe = completedClusterCorridor(vertices,
+              request->allow_completed_cluster_escape,
+              anchored ? escape_origin : vertices.front(), response->message, true);
+        }
       } else {
         response->message = "Inspection geometry queried; support may be canopy, not bare ground";
       }
@@ -1748,6 +1923,12 @@ private:
           inspectionMapIssue(latest);
         return;
       }
+      const auto cluster_issue = completedClustersIssue();
+      if (!cluster_issue.empty()) {
+        response->error_code = Response::INVALID_REQUEST;
+        response->message = cluster_issue;
+        return;
+      }
       const auto & frame = latest.header.frame_id;
       auto supplied_target = request->target;
       normalizeOrientation(supplied_target.pose.orientation);
@@ -1890,7 +2071,8 @@ private:
             request->terrain_envelope);
         };
       if (!createPath(end, response->path, &target.pose.orientation, validity, motion,
-        climbed ? &initial : nullptr, false))
+        climbed ? &initial : nullptr, false, request->allow_completed_cluster_escape,
+        &original.position))
       {
         response->message = last_planning_error_;
         if (last_planning_error_.find("OMPL start state is invalid") == 0) {
@@ -1929,6 +2111,12 @@ private:
           response->message = "Inspection OctoMap became stale while planning: " +
             inspectionMapIssue(latest);
         }
+        return;
+      }
+      if (!completedClusterCorridor(vertices, request->allow_completed_cluster_escape,
+        original.position, response->message, true))
+      {
+        response->path.poses.clear();
         return;
       }
       response->success = true;
@@ -2593,6 +2781,10 @@ private:
   bool occupancy_map_received_{false};
   std::vector<kv_executive::msg::FireSourceReport> reported_sites_;
   std::vector<std::pair<geometry_msgs::msg::Point, double>> reported_site_regions_;
+  std::vector<kv_executive::msg::CompletedInspectionCluster> completed_clusters_;
+  std::string completed_clusters_frame_;
+  std::string completed_clusters_issue_;
+  double completed_clusters_stamp_{0.0};
 
   std::shared_ptr<ob::RealVectorStateSpace> position_space_;
   std::shared_ptr<ob::SO2StateSpace> yaw_space_;
@@ -2608,6 +2800,8 @@ private:
   rclcpp::Service<kv_executive::srv::QueryInspectionGeometry>::SharedPtr
     inspection_geometry_service_;
   rclcpp::Subscription<kv_executive::msg::FireSourceReport>::SharedPtr fire_sources_subscription_;
+  rclcpp::Subscription<kv_executive::msg::CompletedInspectionClusters>::SharedPtr
+    completed_clusters_subscription_;
   std::shared_ptr<const octomap::OcTree> occupancy_map_;
   mutable std::shared_mutex occupancy_map_mutex_;
   std::string occupancy_map_frame_;

@@ -1,5 +1,6 @@
 """Track image-time source bearings without replaying relative camera errors."""
 
+from copy import deepcopy
 import math
 import time
 
@@ -183,6 +184,7 @@ class InspectionHeadingMixin:
             return unavailable()
         body_target = math.remainder(yaw_from_quaternion(body_pose.orientation) + turn, math.tau)
         observation = {'source': source, 'frame': message.header.frame_id, 'stamp': stamp,
+                       'message': deepcopy(message),
                        'bearing': bearing, 'body_target': body_target,
                        'raw_error': message.yaw_correction_rad,
                        'received_at': time.monotonic()}
@@ -194,6 +196,10 @@ class InspectionHeadingMixin:
     def _heading_fire_memory(self):
         fire = self._heading_state().get('fire')
         if fire is None:
+            return None
+        eligible = getattr(getattr(self, '_verify', None), '_candidate_eligible', None)
+        if eligible is not None and fire.get('message') is not None and not eligible(
+                fire['message'], 'fire'):
             return None
         age = (self.get_clock().now().nanoseconds - fire['stamp']) / 1e9
         if (not -self.config.get('verify_future_tolerance', 0.25) <= age

@@ -95,6 +95,13 @@ mission_executive:
     # still interrupt the sweep. These are observer/bearing gates, not ranges.
     verify_retry_cooldown: 2.0
     verify_retry_translation: 2.0
+    # Successful sites persist; the translation retry rule applies only to inconclusive views.
+    verify_completed_cluster_radius: 20.0
+    verify_completed_cluster_buffer: 5.0
+    verify_departure_timeout: 180.0
+    verify_departure_step: 3.0
+    verify_departure_max_legs: 12
+    verify_departure_clearance: 1.0
     verify_retry_bearing_tolerance: 0.2617993877991494  # 15 degrees.
     # Legacy centering budget, retained for existing parameter files. Smoke
     # pursuit now uses forward guidance rather than separate axis corrections.

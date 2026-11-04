@@ -456,6 +456,7 @@ class SequenceExecutive:
         self._verify = SimpleNamespace(
             approach_smoke=lambda bb: 'reacquire', reacquire=lambda bb: 'explore',
             center_fire=lambda bb: 'explore', search_fire=lambda bb: 'approach',
+            depart_site=lambda bb: 'explore',
         )
 
     def _exploration_parent_entry(self, blackboard):

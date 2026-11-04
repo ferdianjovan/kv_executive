@@ -13,7 +13,8 @@ from kv_executive.mission_geometry import (
     angular_distance, quaternion_from_yaw, yaw_from_quaternion,
 )
 from kv_executive.msg import (
-    BatteryReturnEstimate, FireSourceReport, InspectionReport, MissionPhase, MissionStateRequest,
+    BatteryReturnEstimate, CompletedInspectionClusters, FireSourceReport, InspectionReport,
+    MissionPhase, MissionStateRequest,
 )
 from kv_executive.srv import QueryInspectionGeometry
 from kv_perception.msg import FireDetection, SmokeDetection
@@ -59,6 +60,7 @@ class MonitoringSensors(Node):
         self.source = None
         self.smoke_guidance = None
         self.fire_guidance = None
+        self.source_visibility = None
         self.smoke_coverage = 0.1
         self.smoke_regions = None
         self.smoke_suppressed_until = 0.0
@@ -83,6 +85,7 @@ class MonitoringSensors(Node):
         self.reports = []
         self.inspection_reports = []
         self.inspection_report_times = []
+        self.cluster_snapshots = []
         self.requests = []
         reliable = QoSProfile(
             depth=1, reliability=ReliabilityPolicy.RELIABLE,
@@ -114,6 +117,9 @@ class MonitoringSensors(Node):
         self.inspection_report_subscription = self.create_subscription(
             InspectionReport, 'inspection_reports', self.receive_inspection_report, retained,
         )
+        self.cluster_subscription = self.create_subscription(
+            CompletedInspectionClusters, 'completed_inspection_clusters',
+            self.receive_clusters, retained)
         self.request_subscription = self.create_subscription(
             MissionStateRequest, 'mission_state_request_for_goal',
             self.receive_request, reliable,
@@ -137,6 +143,10 @@ class MonitoringSensors(Node):
         with self.lock:
             self.requests.append(deepcopy(message))
 
+    def receive_clusters(self, message):
+        with self.lock:
+            self.cluster_snapshots.append(deepcopy(message))
+
     def publish_observations(self):
         with self.lock:
             if self.closed:
@@ -151,7 +161,8 @@ class MonitoringSensors(Node):
             smoke.background_ready = True
             smoke.status = SmokeDetection.SEARCHING
             if (self.source in {'smoke', 'smoke_fire'}
-                    and time.monotonic() >= self.smoke_suppressed_until):
+                    and time.monotonic() >= self.smoke_suppressed_until
+                    and (self.source_visibility is None or self.source_visibility('smoke'))):
                 smoke.detected = True
                 smoke.status = SmokeDetection.CONFIRMED
                 smoke.confirmation_frames = 10
@@ -182,7 +193,8 @@ class MonitoringSensors(Node):
             fire.header.frame_id = 'test_thermal_camera'
             fire.status = FireDetection.SEARCHING
             if (self.source in {'fire', 'smoke_fire'}
-                    and time.monotonic() >= self.fire_suppressed_until):
+                    and time.monotonic() >= self.fire_suppressed_until
+                    and (self.source_visibility is None or self.source_visibility('fire'))):
                 fire.detected = True
                 fire.status = FireDetection.CONFIRMED
                 fire.image_width = 640
@@ -1826,7 +1838,8 @@ def test_visible_fire_at_measured_wall_reports_without_fire_localization_or_tran
         assert not any(verify_at < stamp < sensors.inspection_report_times[0]
                        and text == 'Exploration: started' for stamp, text in fcu.statuses)
     wait_for(lambda: _states(sensors)[:3] == ['Exploration', 'Verify', 'Exploration'],
-             8.0, 'successful fire report to resume the same mission goal')
+             mission.executive.config['verify_departure_timeout'] + 5.0,
+             'successful fire report and checked departure to resume the same mission goal')
     assert not goal.get_result_async().done()
     _assert_same_goal_phases(sensors, goal)
     cancel_goal(goal)
@@ -2051,6 +2064,114 @@ def test_smoke_then_fire_is_approached_before_recording_the_same_mission_goal(
     _assert_same_goal_phases(sensors, goal)
     assert not goal.get_result_async().done()
     cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
+@pytest.mark.parametrize('route', ['free', 'blocked', 'cancel'])
+def test_completed_report_departure_precedes_exploration_and_survives_blocked_exit(
+    mission, monitoring_sensors, route,
+):
+    """A committed finding survives a checked departure, failed exit, or cancellation."""
+    sensors, fcu, executive = monitoring_sensors, mission.fcu, mission.executive
+    with fcu.lock:
+        pose = deepcopy(fcu.pose)
+        yaw = yaw_from_quaternion(pose.orientation)
+        fcu.inspection_target = Point(
+            x=pose.position.x + 20.0 * math.cos(yaw),
+            y=pose.position.y + 20.0 * math.sin(yaw), z=pose.position.z)
+        physical_fire = deepcopy(fcu.inspection_target)
+
+    def source_bearing():
+        with fcu.lock:
+            current = deepcopy(fcu.pose)
+        return angular_distance(
+            math.atan2(physical_fire.y - current.position.y,
+                       physical_fire.x - current.position.x),
+            yaw_from_quaternion(current.orientation))
+
+    original_plan = fcu.inspection_planning_service.callback
+    departure_plans = []
+
+    def checked_departure(request, response):
+        response = original_plan(request, response)
+        if request.allow_completed_cluster_escape:
+            departure_plans.append(deepcopy(request))
+            if route == 'blocked':
+                response.success = False
+                response.error_code = response.GOAL_INVALID
+                response.message = 'simulated occupied outward departure corridors'
+        return response
+
+    fcu.inspection_planning_service.callback = checked_departure
+    goal = _start_visible_fire(mission, sensors)
+    result = goal.get_result_async()
+    try:
+        wait_for(lambda: bool(sensors.inspection_snapshot()), 20.0,
+                 'a successful inspection before departure begins')
+        report = sensors.inspection_snapshot()[0]
+        assert report.fire_found and report.smoke_location_valid
+        observer = report.observer_local_pose.pose
+        heading = yaw_from_quaternion(observer.orientation)
+        physical_fire = Point(x=observer.position.x + 20.0 * math.cos(heading),
+                              y=observer.position.y + 20.0 * math.sin(heading),
+                              z=observer.position.z)
+        with sensors.lock:
+            sensors.fire_guidance = sensors.smoke_guidance = lambda: (source_bearing(), 0.0)
+            sensors.source_visibility = lambda _source: abs(source_bearing()) < 0.6
+        wait_for(lambda: any(text == 'Verify/DEPART_SITE: started' for _, text in fcu.statuses),
+                 5.0, 'published result to enter DEPART_SITE')
+        wait_for(lambda: bool(sensors.cluster_snapshots)
+                 and bool(sensors.cluster_snapshots[-1].clusters),
+                 3.0, 'latched completed-cluster snapshot')
+        assert sensors.cluster_snapshots[-1].clusters[0].center == report.smoke_planning_position
+        if route == 'cancel':
+            canceled = cancel_goal(goal)
+            assert canceled.status == GoalStatus.STATUS_CANCELED
+        elif route == 'blocked':
+            wait_for(result.done, 90.0, 'blocked departure to finish with LOITER recovery')
+            aborted = result.result()
+            assert aborted.status == GoalStatus.STATUS_ABORTED
+            assert 'DEPART_SITE: no safe outward route' in aborted.result.message
+            wait_for(lambda: received_state(mission, mode='AUTO.LOITER'),
+                     3.0, 'blocked departure to remain safely in LOITER')
+            assert departure_plans
+            assert executive._completed_cluster_regions()
+        else:
+            def handed_off():
+                assert not result.done(), result.result().result.message if result.done() else ''
+                return any(text == 'Verify/DEPART_SITE: handoff complete; resuming Exploration'
+                           for _, text in fcu.statuses)
+
+            wait_for(handed_off, 90.0, 'checked outward flight beyond the completed buffer')
+            wait_for(lambda: _states(sensors)[:3] == ['Exploration', 'Verify', 'Exploration'],
+                     5.0, 'Exploration only after departure completes')
+            with fcu.lock:
+                current = deepcopy(fcu.pose.position)
+                statuses = list(fcu.statuses)
+            center = report.smoke_planning_position.point
+            assert math.hypot(current.x - center.x, current.y - center.y) >= 26.0
+            assert departure_plans and all(request.terrain_envelope
+                                           and request.minimum_agl >= 3.0
+                                           for request in departure_plans)
+            handoff = next(stamp for stamp, text in statuses
+                           if text == 'Verify/DEPART_SITE: handoff complete; resuming Exploration')
+            assert not any(stamp > sensors.inspection_report_times[0] and stamp < handoff
+                           and text == 'Exploration: entered' for stamp, text in statuses)
+            # The sweep sees the physical old source again after turning. The
+            # durable cluster must prevent another Verify/report at its new pose.
+            time.sleep(4.0)
+            with fcu.lock:
+                assert sum(text == 'Verify: entered' for _, text in fcu.statuses) == 1
+            cancel_goal(goal)
+        assert len(sensors.inspection_snapshot()) == 1
+        assert executive._completed_cluster_regions()
+        _assert_same_goal_phases(sensors, goal)
+    finally:
+        with sensors.lock:
+            sensors.source = None
+        if not result.done():
+            cancel_goal(goal)
+        fcu.inspection_planning_service.callback = original_plan
     _assert_airborne_safety(mission)
 
 
@@ -2485,8 +2606,9 @@ def test_opportunistic_wall_arrival_searches_and_reports_without_broad_smoke(
             assert f'Verify/{state}: started' in statuses
         assert len(requests) >= 2
         assert len({(stamp.sec, stamp.nanosec) for stamp in probes}) >= 2
-        wait_for(lambda: _states(sensors)[-1] == 'Exploration', 5.0,
-                 'the same action to resume exploration after completed inspection')
+        wait_for(lambda: _states(sensors)[-1] == 'Exploration',
+                 mission.executive.config['verify_departure_timeout'] + 5.0,
+                 'the same action to resume exploration after inspection and checked departure')
         _assert_same_goal_phases(sensors, goal)
     finally:
         cancel_goal(goal)

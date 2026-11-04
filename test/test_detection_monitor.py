@@ -8,7 +8,9 @@ from builtin_interfaces.msg import Time
 import kv_executive.detection_monitor as monitor_module
 from kv_executive.detection_monitor import DEFAULTS, DetectionMonitor
 from kv_executive.msg import MissionPhase
-from kv_perception.msg import FireDetection, SmokeDetection
+from kv_perception.msg import (
+    FireDetection, FireDetectionArray, SmokeDetection, SmokeDetectionArray,
+)
 import pytest
 from std_msgs.msg import Header
 from unique_identifier_msgs.msg import UUID
@@ -81,6 +83,24 @@ class Harness:
             values.update(status=FireDetection.CONFIRMED)
             values.update(overrides)
             self._fire_callback(FireDetection(**values))
+
+    def candidates(self, source='smoke', acquired=None, *, empty=False, **overrides):
+        values = {
+            'header': Header(stamp=stamp(self.seconds if acquired is None else acquired),
+                             frame_id=source + '_camera'),
+            'detected': True,
+        }
+        if source == 'smoke':
+            values.update(status=SmokeDetection.CONFIRMED, background_ready=True)
+            cls, array_cls = SmokeDetection, SmokeDetectionArray
+        else:
+            values.update(status=FireDetection.CONFIRMED)
+            cls, array_cls = FireDetection, FireDetectionArray
+        values.update(overrides)
+        result = array_cls(header=deepcopy(values['header']),
+                           detections=[] if empty else [cls(**values)])
+        self._candidates_callback(result, source)
+        return result
 
 
 @pytest.fixture
@@ -371,3 +391,136 @@ def test_duplicate_or_older_exploration_phase_cannot_rearm_sent_request(monitor)
     monitor.phase(goal=2, sequence=99)
     monitor.detection()
     assert len(monitor._request_publisher.messages) == 1
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+def test_confirmed_candidate_interrupts_when_primary_is_only_tentative(monitor, source):
+    monitor.status(goal_status())
+    monitor.phase()
+    pending = SmokeDetection.CONFIRMING if source == 'smoke' else FireDetection.CONFIRMING
+    monitor.detection(source, status=pending)
+    assert monitor._request_publisher.messages == []
+    candidate = monitor.candidates(source)
+    monitor.detection(source, detected=False)
+    assert len(monitor._request_publisher.messages) == 1
+    assert monitor._request_publisher.messages[0].goal_id == UUID(uuid=[1] * 16)
+    assert monitor._candidate_observations[source][0] == candidate.detections[0]
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+def test_primary_negative_cannot_erase_fresh_candidate_waiting_for_discovery(monitor, source):
+    monitor.status(goal_status())
+    monitor.phase()
+    monitor._request_publisher.subscribers = 0
+    monitor.candidates(source)
+    assert monitor._request_publisher.messages == []
+    monitor._request_publisher.subscribers = 1
+    monitor.seconds += 0.1
+    monitor.monotonic_seconds += 0.1
+    monitor.detection(source, detected=False)
+    assert len(monitor._request_publisher.messages) == 1
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+def test_empty_same_header_candidate_array_revokes_waiting_confirmation(monitor, source):
+    monitor.status(goal_status())
+    monitor.phase()
+    monitor._request_publisher.subscribers = 0
+    old = monitor.candidates(source)
+    monitor.candidates(source, empty=True)
+    assert monitor._candidate_observations[source] is None
+    monitor._request_publisher.subscribers = 1
+    monitor._candidates_callback(old, source)
+    monitor.detection(source, detected=False)
+    assert monitor._request_publisher.messages == []
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+def test_duplicate_and_reordered_arrays_do_not_reissue_verify(monitor, source):
+    monitor.status(goal_status())
+    monitor.phase()
+    confirmed = monitor.candidates(source)
+    assert len(monitor._request_publisher.messages) == 1
+    monitor.monotonic_seconds += monitor.config['request_retry_interval'] + 0.1
+    monitor.seconds += 0.1
+    monitor._candidates_callback(confirmed, source)
+    monitor.candidates(source, acquired=19.9)
+    assert len(monitor._request_publisher.messages) == 1
+    monitor.candidates(source)
+    assert len(monitor._request_publisher.messages) == 2
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+@pytest.mark.parametrize('invalid', ['mismatched_header', 'missing_frame', 'too_many'])
+def test_malformed_candidate_array_cannot_trigger_verify(monitor, source, invalid):
+    monitor.status(goal_status())
+    monitor.phase()
+    monitor._request_publisher.subscribers = 0
+    array = monitor.candidates(source)
+    monitor._candidate_stamps[source] = 0
+    monitor._candidate_observations[source] = None
+    monitor._request_publisher.subscribers = 1
+    if invalid == 'mismatched_header':
+        array.detections[0].header.frame_id = 'different_camera'
+    elif invalid == 'missing_frame':
+        array.header.frame_id = ''
+        array.detections[0].header.frame_id = ''
+    else:
+        array.detections = [deepcopy(array.detections[0]) for _ in range(17)]
+    monitor._candidates_callback(array, source)
+    assert monitor._request_publisher.messages == []
+
+
+@pytest.mark.parametrize('source,fields', [
+    ('smoke', {'detected': False}),
+    ('smoke', {'status': SmokeDetection.CONFIRMING}),
+    ('smoke', {'background_ready': False}),
+    ('fire', {'detected': False}),
+    ('fire', {'status': FireDetection.CONFIRMING}),
+])
+def test_unconfirmed_candidate_array_never_requests_verify(monitor, source, fields):
+    monitor.status(goal_status())
+    monitor.phase()
+    monitor.candidates(source, **fields)
+    assert monitor._request_publisher.messages == []
+    assert monitor._candidate_observations[source] is None
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+@pytest.mark.parametrize('acquired', [0.0, 17.9, 20.250000001, 19.49])
+def test_array_freshness_and_action_epoch_match_primary_rules(monitor, source, acquired):
+    monitor.status(goal_status(accepted=19.5))
+    monitor.phase()
+    monitor.candidates(source, acquired=acquired)
+    assert monitor._request_publisher.messages == []
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+def test_candidate_cache_does_not_carry_into_new_exploration_phase_or_goal(monitor, source):
+    monitor.status(goal_status())
+    monitor.phase('Verify', entered=19.5)
+    monitor.candidates(source)
+    monitor.phase('Exploration', sequence=2, entered=20.0)
+    monitor.detection(source, detected=False)
+    monitor.candidates(source, acquired=20.0)
+    assert monitor._request_publisher.messages == []
+    monitor.seconds = 20.1
+    monitor.candidates(source)
+    assert len(monitor._request_publisher.messages) == 1
+    monitor.status(goal_status(status=GoalStatus.STATUS_ABORTED))
+    monitor.status(goal_status(goal=2, accepted=20.1))
+    monitor.phase(goal=2, entered=20.1)
+    monitor.detection(source, detected=False)
+    assert len(monitor._request_publisher.messages) == 1
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+def test_cached_candidate_requires_both_source_and_receipt_freshness(monitor, source):
+    monitor.status(goal_status())
+    monitor.phase()
+    monitor._request_publisher.subscribers = 0
+    monitor.candidates(source)
+    monitor._request_publisher.subscribers = 1
+    monitor.monotonic_seconds += monitor.config['observation_timeout'] + 0.1
+    monitor.detection(source, detected=False)
+    assert monitor._request_publisher.messages == []
