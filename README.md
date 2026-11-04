@@ -773,6 +773,69 @@ reports. Record `inspection_reports` with rosbag if longer-term review is needed
 Camera topics can be set with `inspection_evidence_rgb_topic` and
 `inspection_evidence_thermal_topic` launch arguments.
 
+#### Viewing inspection report images
+
+To view the RGB and thermal snapshots from inspection reports:
+
+1. After updating the workspace, build and source the installed viewer:
+
+   ```bash
+   cd /home/s04fj3/kv_ws
+   source /opt/ros/jazzy/setup.bash
+   colcon build --packages-up-to kv_executive --symlink-install
+   source install/setup.bash
+   ```
+
+2. In the terminal used for the viewer, source ROS and the same workspace as
+   above. Use the same `ROS_DOMAIN_ID` and `RMW_IMPLEMENTATION` as autonomy,
+   together with any configured discovery or network settings. Inherit those
+   settings from the autonomy environment; do not replace them with example
+   domain or middleware defaults.
+
+3. From the workspace root, start the installed exporter:
+
+   ```bash
+   install/kv_executive/lib/kv_executive/python_shared_runtime \
+     --python /usr/bin/python3 -- \
+     install/kv_executive/lib/kv_executive/view_inspection_images.py \
+     --output "$PWD/inspection_images"
+   ```
+
+   The default topic is `/inspection_reports`. If it is remapped or namespaced,
+   append `--topic` followed by the actual report topic. The exporter can start
+   before the inspection and wait for reports. It shows completed inspection
+   snapshots, not a continuous camera feed: no image files appear before the
+   first report arrives. Completed `fire_found` and `fire_not_found` reports
+   produce pages; aborted, exhausted or timed-out inspections do not publish
+   completed reports and therefore produce no new page.
+
+4. After the terminal prints `Saved:`, open
+   `/home/s04fj3/kv_ws/inspection_images/index.html` in a browser. For example,
+   from the workspace root:
+
+   ```bash
+   xdg-open "$PWD/inspection_images/index.html"
+   ```
+
+   Select a report to view RGB and thermal images side by side. Refresh the
+   browser index after another `Saved:` message. An unavailable image is shown
+   with its report status instead of substituting an older picture.
+
+5. Leave the exporter running to save subsequent reports. Stop it with
+   **Ctrl+C** when finished; exported HTML, JPEG and PNG files remain in
+   `inspection_images` for later review.
+
+The thermal page uses a separate contrast-scaled colour preview for visibility.
+Its colours are not calibrated temperatures. Each page also links to the
+original report JPEG and lossless thermal PNG; the thermal original retains its
+16-bit samples when supplied by the camera.
+
+The viewer requests retained reports, so a late subscriber can receive the last
+two reports by default while autonomy is still running. That retained history is
+lost when the publishing autonomy node stops or restarts. Start the exporter
+before stopping autonomy to preserve those images; previously exported files
+remain available after a restart.
+
 This changes the inspection report and geometry service interfaces: rebuild
 `kv_executive` and restart autonomy and report/service consumers together.
 The pre-change rollback tag is

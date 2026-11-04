@@ -103,6 +103,7 @@ install(PROGRAMS
   scripts/diagnose_ros_executor.py
   scripts/configure_px4_external_odometry.py
   scripts/relay_external_odometry.py
+  scripts/view_inspection_images.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
