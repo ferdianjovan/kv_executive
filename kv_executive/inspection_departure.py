@@ -113,6 +113,175 @@ class InspectionDepartureMixin:
             motion_timeout=min(45.0, self.config['verify_departure_timeout']),
             motion_label='DEPART_SITE')
 
+    def _departure_checked_step(self, map_bearing, distance, guard):
+        """Try one outside-zone translation and verify progress at the actual pose."""
+        from kv_executive.mission_executive import MissionError
+        from kv_executive.mission_navigation import _inverse
+        from kv_executive.verification import VerificationObservationLost
+        guard()
+        _, current = self._verify_control_pose()
+        conversion = self._path_frame_transform(self.config['verify_planning_frame'])
+        start = transform_pose(current, _inverse(conversion)).position
+        endpoint = deepcopy(start)
+        endpoint.x += distance * math.cos(map_bearing)
+        endpoint.y += distance * math.sin(map_bearing)
+        target = transform_pose(Pose(position=endpoint,
+                                     orientation=quaternion_from_yaw(0.0)), conversion)
+        candidate = Path()
+        candidate.header.frame_id = self.config['local_frame']
+        candidate.poses = [PoseStamped(pose=deepcopy(p)) for p in (current, target)]
+        if not self._verify_cluster_path(candidate):
+            return False
+        try:
+            self._verify_departure_leg(target, current, guard)
+        except VerificationObservationLost as error:
+            self._snapshot('AUTO.LOITER', require_armed=True)
+            self._report(f'Verify/DEPART_SITE: observation leg unavailable: {error}')
+        guard()
+        _, actual = self._verify_control_pose()
+        actual_map = transform_pose(actual, _inverse(self._path_frame_transform(
+            self.config['verify_planning_frame']))).position
+        if not cluster_path_safe([start, actual_map], self._departure_regions()):
+            raise MissionError('DEPART_SITE: actual observation leg entered a completed zone; '
+                               'holding')
+        return math.hypot(actual_map.x - start.x, actual_map.y - start.y) >= 0.1
+
+    def _departure_onward_step(self, current, position, conversion, guard):
+        """Prefer a new target, otherwise make lateral progress before another sweep."""
+        from kv_executive.mission_navigation import _inverse
+        candidate = self._verify.stable_fire() or self._verify.fresh_smoke()
+        heading = self._verify_image_bearing(candidate) if candidate is not None else None
+        bearings = []
+        if heading is not None:
+            local_endpoint = deepcopy(current)
+            local_endpoint.position.x += math.cos(heading)
+            local_endpoint.position.y += math.sin(heading)
+            projected = transform_pose(local_endpoint, _inverse(conversion)).position
+            bearings.append(math.atan2(projected.y - position.y, projected.x - position.x))
+        nearest = min(self._departure_regions(), key=lambda r: math.hypot(
+            position.x - r['center'].point.x, position.y - r['center'].point.y))
+        away = math.atan2(position.y - nearest['center'].point.y,
+                          position.x - nearest['center'].point.x)
+        bearings.extend((away + math.pi / 2, away - math.pi / 2))
+        for bearing in bearings:
+            guard()
+            if self._departure_checked_step(bearing, self.config['verify_departure_step'], guard):
+                self._report('Verify/DEPART_SITE: checked onward progress before Exploration')
+                return True
+        self._report('Verify/DEPART_SITE: no safe onward observation leg; '
+                     'resuming bounded Exploration with completed-site filtering')
+        return False
+
+    def _verify_completed_followup(self, guard=None, maximum_legs=None):
+        """Give an obscured direction a bounded, settled view from a lateral baseline."""
+        from kv_executive.mission_executive import MissionError
+        from kv_executive.mission_navigation import _inverse
+        self._completed_followup_legs_used = 0
+        getter = getattr(self, '_completed_followup_task', None)
+        result = getattr(self, '_completed_followup_result', None)
+        task = getter() if getter is not None else None
+        if task is None or result is None:
+            return False
+        key = task['key']
+        accounted = False
+        deadline = time.monotonic() + self.config['verify_departure_timeout']
+
+        def check():
+            self._check_running()
+            if guard:
+                guard()
+            if not any(r['site_id'] == task['site_id'] for r in self._departure_regions()):
+                raise MissionError('DEPART_SITE: follow-up cluster changed epoch; holding')
+            if time.monotonic() >= deadline:
+                raise MissionError('DEPART_SITE: observation time budget exhausted; holding')
+
+        try:
+            check()
+            release = getattr(self._verify, 'release_inspection_target', None)
+            if release is not None:
+                release()
+            origin = task['origin']
+            direction = task['direction']
+            horizontal = math.hypot(*direction[:2])
+            if (horizontal <= 1e-6 or not all(math.isfinite(v) for v in (*origin, *direction))):
+                self._report('Verify/DEPART_SITE: invalid saved follow-up direction')
+                return False
+            perpendicular = (-direction[1] / horizontal, direction[0] / horizontal)
+            baseline = self.config.get('verify_completed_followup_baseline', 6.0)
+            step = self.config['verify_departure_step']
+            legs = (max(1, math.ceil(2.0 * baseline / step)) if maximum_legs is None
+                    else max(0, maximum_legs))
+            side = 1.0 if task.get('attempts', 0) % 2 == 0 else -1.0
+            self._report(f'Verify/DEPART_SITE: alternate view of unresolved direction; '
+                         f'site_id={task["site_id"]}, baseline={baseline:.2f} m')
+            for _ in range(legs):
+                check()
+                _, current = self._verify_control_pose()
+                conversion = self._path_frame_transform(self.config['verify_planning_frame'])
+                position = transform_pose(current, _inverse(conversion)).position
+                lateral = ((position.x - origin[0]) * perpendicular[0]
+                           + (position.y - origin[1]) * perpendicular[1])
+                if side * lateral >= baseline - 1e-6:
+                    break
+                remaining = baseline - side * lateral
+                bearing = math.atan2(side * perpendicular[1], side * perpendicular[0])
+                self._completed_followup_legs_used += 1
+                if not self._departure_checked_step(bearing, min(step, remaining), check):
+                    side *= -1.0  # The opposite side may have a safe terrain corridor.
+            check()
+            _, current = self._verify_control_pose()
+            conversion = self._path_frame_transform(self.config['verify_planning_frame'])
+            position = transform_pose(current, _inverse(conversion)).position
+            lateral = ((position.x - origin[0]) * perpendicular[0]
+                       + (position.y - origin[1]) * perpendicular[1])
+            prior = task.get('observations', ())
+            distinct = all(abs((position.x - p[0]) * perpendicular[0]
+                               + (position.y - p[1]) * perpendicular[1])
+                           >= baseline - 1e-6 for p in prior)
+            if abs(lateral) < baseline - 1e-6 or not distinct:
+                self._report('Verify/DEPART_SITE: useful alternate viewpoint unavailable; '
+                             'follow-up attempt remains bounded')
+                return False
+            endpoint = deepcopy(position)
+            endpoint.x += direction[0]
+            endpoint.y += direction[1]
+            local_endpoint = transform_pose(Pose(position=endpoint,
+                                                 orientation=quaternion_from_yaw(0.0)),
+                                            conversion).position
+            heading = math.atan2(local_endpoint.y - current.position.y,
+                                 local_endpoint.x - current.position.x)
+            self._verify_rotate(heading, guard=check)
+            if not self._verify_prepare_wall_observation(
+                    guard=check, align_fire=False, wait_for_map=False):
+                self._report('Verify/DEPART_SITE: alternate viewpoint did not settle')
+                return False
+            check()
+            _, settled = self._verify_control_pose()
+            settled_map = transform_pose(settled, _inverse(self._path_frame_transform(
+                self.config['verify_planning_frame']))).position
+            lateral = ((settled_map.x - origin[0]) * perpendicular[0]
+                       + (settled_map.y - origin[1]) * perpendicular[1])
+            if (abs(lateral) < baseline - 1e-6
+                    or any(abs((settled_map.x - p[0]) * perpendicular[0]
+                               + (settled_map.y - p[1]) * perpendicular[1])
+                           < baseline - 1e-6 for p in prior)
+                    or not cluster_path_safe([settled_map], self._departure_regions())):
+                self._report('Verify/DEPART_SITE: settling lost the alternate-view baseline')
+                return False
+            observed = tuple(getattr(settled_map, axis) for axis in 'xyz')
+            accounted = True
+            if not result(key, True, observation_origin=observed):
+                self._report('Verify/DEPART_SITE: alternate-view permission unavailable; '
+                             'resuming bounded Exploration')
+                return False
+            self._completed_followup_heading = heading
+            self._report('Verify/DEPART_SITE: settled alternate viewpoint ready for '
+                         'bounded investigation of unresolved smoke')
+            return True
+        finally:
+            if not accounted:
+                result(key, False)
+
     def _verify_depart_completed_site(self, report, guard=None):
         from kv_executive.mission_executive import MissionError
         from kv_executive.mission_navigation import _inverse
@@ -121,6 +290,9 @@ class InspectionDepartureMixin:
         if not any(r['site_id'] == report.site_id for r in regions):
             raise MissionError('DEPART_SITE: completed report has no saved cluster; holding')
         deadline = time.monotonic() + self.config['verify_departure_timeout']
+        onward_tried = False
+        discretionary_legs = 0
+        followup_heading = None
 
         def check():
             self._check_running()
@@ -147,11 +319,34 @@ class InspectionDepartureMixin:
             self._report(f'Verify/DEPART_SITE: nearest zone clearance={nearest_clearance:.2f} m; '
                          f'exit margin={self.config["verify_departure_clearance"]:.2f} m')
             if not inside:
+                if not onward_tried:
+                    onward_tried = True
+                    remaining_legs = self.config['verify_departure_max_legs'] - leg
+                    followed = self._verify_completed_followup(
+                        guard=check, maximum_legs=min(4, remaining_legs))
+                    discretionary_legs += self._completed_followup_legs_used
+                    if followed:
+                        followup_heading = self._completed_followup_heading
+                        self._verify_hold(self.config.get(
+                            'verify_completed_followup_observation_time', 2.0), guard=check)
+                    if not followed and remaining_legs > discretionary_legs:
+                        _, current = self._verify_control_pose()
+                        conversion = self._path_frame_transform(
+                            self.config['verify_planning_frame'])
+                        map_position = transform_pose(current, _inverse(conversion)).position
+                        if self._departure_onward_step(current, map_position, conversion, check):
+                            discretionary_legs += 1
+                    # Onward navigation changes the actual pose and camera basis.
+                    _, current = self._verify_control_pose()
+                    conversion = self._path_frame_transform(self.config['verify_planning_frame'])
+                    map_position = transform_pose(current, _inverse(conversion)).position
                 self._report('Verify/DEPART_SITE: outside completed cluster buffers; '
                              'looking toward uninspected space')
                 # A new target is used only if it survived the shared completion filter.
                 candidate = self._verify.stable_fire() or self._verify.fresh_smoke()
                 bearing = self._verify_image_bearing(candidate) if candidate is not None else None
+                if bearing is None and followup_heading is not None:
+                    bearing = followup_heading
                 if bearing is None:
                     nearest, _ = min(centers, key=lambda c: math.hypot(
                         map_position.x - c[0].x, map_position.y - c[0].y))
@@ -181,7 +376,7 @@ class InspectionDepartureMixin:
                     continue
                 self._report('Verify/DEPART_SITE: handoff complete; resuming Exploration')
                 return
-            if leg == self.config['verify_departure_max_legs']:
+            if leg + discretionary_legs >= self.config['verify_departure_max_legs']:
                 break
             dx = sum((map_position.x - c.x) / max(0.1, math.hypot(
                 map_position.x - c.x, map_position.y - c.y)) for c, _ in inside)

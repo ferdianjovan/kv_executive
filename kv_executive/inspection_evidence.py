@@ -246,7 +246,9 @@ class InspectionEvidenceMixin:
 
     def _inspection_evidence_select(self, fire_message, after_ns, limits):
         controller = getattr(self, '_verify', None)
-        smoke = controller.fresh_smoke() if controller is not None else None
+        report_smoke = getattr(self, '_inspection_report_smoke', None)
+        smoke = (report_smoke() if report_smoke is not None else
+                 controller.fresh_smoke() if controller is not None else None)
         fire = (controller.stable_fire() if controller is not None and fire_message is not None
                 else None)
         if fire is not None:

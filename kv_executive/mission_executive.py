@@ -12,7 +12,7 @@ import time
 
 from action_msgs.msg import GoalInfo
 from action_msgs.srv import CancelGoal
-from geometry_msgs.msg import Pose, PoseStamped
+from geometry_msgs.msg import Point, Pose, PoseStamped
 from kv_executive.action import ExecuteMission
 from kv_executive.completed_sites import COMPLETED_SITE_DEFAULTS, CompletedSitesMixin
 from kv_executive.inspection_departure import DEPARTURE_DEFAULTS, InspectionDepartureMixin
@@ -284,6 +284,8 @@ class MissionExecutive(
         if self.config['verify_smoke_inspection_max_distance'] <= self.config[
                 'verify_smoke_standoff']:
             raise ValueError('Smoke inspection maximum must exceed the minimum standoff')
+        if self.config['verify_completed_projection_margin'] >= math.pi / 2:
+            raise ValueError('Completed-site projection margin must be less than 90 degrees')
 
         self._callbacks = ReentrantCallbackGroup()
         self._data_lock = threading.Lock()
@@ -633,6 +635,16 @@ class MissionExecutive(
     def _exploration_parent_entry(self, blackboard):
         """Publish the goal-scoped phase used by the detection monitor."""
         self._verify.release_inspection_target()
+        consume = getattr(self, '_completed_followup_consume', None)
+        try:
+            followup_handoff = bool(blackboard['verify_followup_handoff'])
+        except (KeyError, RuntimeError):
+            followup_handoff = False
+        followup_handoff |= getattr(self, '_completed_startup_handoff', False)
+        self._completed_startup_handoff = False
+        blackboard['verify_followup_handoff'] = False
+        if consume is not None and not followup_handoff:
+            consume()
         try:
             retry_delayed = bool(blackboard['verify_exploration_required'])
         except (KeyError, RuntimeError):
@@ -822,6 +834,7 @@ class MissionExecutive(
                      f'Exploration; clearance={clearance:.2f} m')
         self._verify_depart_completed_site(
             SimpleNamespace(site_id=site_id), guard=self._check_running)
+        self._completed_startup_handoff = True
 
     def _wait_until(self, predicate, timeout, description):
         deadline = time.monotonic() + timeout
@@ -1153,6 +1166,12 @@ class MissionExecutive(
             self._target = None
 
     def _sweep(self, blackboard):
+        # A pending obscured direction gets a checked alternate viewpoint
+        # before another full rotation can rediscover the same foreground site.
+        followup = getattr(self, '_verify_completed_followup', None)
+        if followup is not None and followup(guard=self._check_running):
+            self._verify_hold(self.config.get('verify_completed_followup_observation_time', 2.0),
+                              guard=self._check_running)
         _, odometry = self._snapshot(require_armed=True)
         original = deepcopy(odometry.pose.pose)
         original_yaw = yaw_from_quaternion(original.orientation)
@@ -1177,6 +1196,22 @@ class MissionExecutive(
     def _completed_path_frame_transform(self, frame):
         """Never wait for TF in detector callbacks; later polls retry unassociated images."""
         return self._path_frame_transform(frame, timeout=0.0)
+
+    def _completed_image_frame_transform(self, frame, stamp):
+        """Align a saved camera pose with map TF from that same image instant."""
+        stamp_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
+        local_pose = self._completed_source_pose(stamp_ns)
+        if local_pose is None:
+            raise MissionError('Image-time local pose is not bracketed by odometry')
+        if frame == self.config['local_frame']:
+            return relative_transform(local_pose, local_pose)
+        mapped = self._tf_buffer.lookup_transform(
+            frame, self.config['robot_base_frame'], Time.from_msg(stamp),
+            timeout=Duration(seconds=0.0)).transform
+        source_pose = Pose(
+            position=Point(x=mapped.translation.x, y=mapped.translation.y,
+                           z=mapped.translation.z), orientation=deepcopy(mapped.rotation))
+        return relative_transform(local_pose, source_pose)
 
     def _path_frame_transform(self, frame, *, timeout=None):
         _, odometry = self._snapshot(require_armed=True)
@@ -1303,7 +1338,9 @@ class MissionExecutive(
         Requests apply only to the active goal and never start a mission.
         A supplied action UUID must match while holding the same admission lock.
         """
+        self._last_state_request_rejection = ''
         if state not in {'Abort', 'Return', 'Verify'}:
+            self._last_state_request_rejection = 'unsupported requested state'
             return False
         completed = (state == 'Verify' and goal_id is not None
                      and CompletedSitesMixin._verify_request_is_completed(self))
@@ -1315,12 +1352,19 @@ class MissionExecutive(
                 goal is None or not goal.is_active or self._finalizing
                 or self._recovering or goal.is_cancel_requested or self._stop.is_set()
             ):
+                self._last_state_request_rejection = (
+                    'mission inactive, finalizing, recovering, or cancellation pending')
                 return False
             if goal_id is not None and tuple(goal_id.uuid) != tuple(goal.goal_id.uuid):
+                self._last_state_request_rejection = 'request belongs to a different action goal'
                 return False
             if state == 'Verify' and self._parent_state == 'Verify':
+                self._last_state_request_rejection = 'inspection already active'
                 return False
             if completed or deferred:
+                self._last_state_request_rejection = (
+                    'confirmed candidates withheld by completed-site association'
+                    if completed else 'inconclusive viewpoint requires translation or new bearing')
                 return False
             priority = {None: 0, 'Verify': 1, 'Return': 2, 'Abort': 3}
             if priority[state] >= priority[self._requested_mission_state]:
@@ -1335,6 +1379,9 @@ class MissionExecutive(
     def _goal_state_request_callback(self, message):
         if not self.request_mission_state(message.state, goal_id=message.goal_id):
             self._report(f'MISSION: ignored goal state request {message.state!r}')
+            reason = getattr(self, '_last_state_request_rejection', '')
+            if reason:
+                self._report(f'MISSION: request admission reason: {reason}')
 
     def _auto_start(self):
         if not self._mission_client.server_is_ready():
@@ -1445,6 +1492,10 @@ class MissionExecutive(
                     else:
                         goal_handle.abort()
             finally:
+                consume = getattr(self, '_completed_followup_consume', None)
+                if consume is not None:
+                    consume()
+                self._completed_startup_handoff = False
                 with self._data_lock:
                     state = self._vehicle_state
                     if (

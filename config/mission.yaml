@@ -98,6 +98,12 @@ mission_executive:
     # Successful sites persist; the translation retry rule applies only to inconclusive views.
     verify_completed_cluster_radius: 20.0
     verify_completed_cluster_buffer: 5.0
+    # Image projection associates targets beyond LiDAR range; it never proves free space.
+    verify_completed_projection_margin: 0.05235987755982989  # 3 degrees.
+    verify_completed_followup_baseline: 6.0
+    verify_completed_followup_attempts: 2
+    verify_completed_followup_lease_timeout: 60.0
+    verify_completed_followup_observation_time: 2.0
     verify_departure_timeout: 180.0
     verify_departure_step: 3.0
     verify_departure_max_legs: 12

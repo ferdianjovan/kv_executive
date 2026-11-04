@@ -213,12 +213,15 @@ class Harness(InspectionNavigationMixin):
         self.events.append(('legacy_prepare', deepcopy(message)))
         return self._verify_publish_fire_report(result) if publish else result
 
-    def _verify_publish_fire_report(self, report):
-        self._site_sequence += 1
-        report.site_id = self._site_sequence
+    def _verify_publish_fire_report(self, report, *, site_id=None):
+        if site_id is None:
+            self._site_sequence += 1
+            report.site_id = self._site_sequence
+        else:
+            report.site_id = site_id
         self.events.append((
             'legacy_report', report.message, report.bearing, report.require_centering,
-            self._site_sequence))
+            report.site_id))
         return report
 
     def _verify_plan_to(self, target, **kwargs):
@@ -3156,3 +3159,120 @@ def test_report_completion_passes_retained_measurement_observer_without_moving_r
     else:
         assert contexts[0].get('wall_observer') is None
     assert executive._verify_report_completion_context is None
+
+
+@pytest.mark.parametrize('previous_fire,current_fire', [
+    (True, True), (True, False), (False, False),
+])
+@pytest.mark.parametrize('gps_available', [False, True])
+def test_completed_wall_suppresses_both_report_publishers_and_site_allocation(
+    executive, previous_fire, current_fire, gps_available,
+):
+    wall = _confirmed_report_wall(executive)
+    executive.fire = _persistent_fire(executive.now, track_id=99) if current_fire else None
+    executive._site_sequence = 7
+    if not gps_available:
+        executive._global_position = None
+    matched = {'site_id': 3, 'fire_found': previous_fire}
+    examined = []
+
+    def match(report):
+        examined.append(deepcopy(report))
+        assert report.smoke_wall_confirmed
+        assert report.smoke_planning_position == wall['nearest_point']
+        return deepcopy(matched)
+
+    executive._completed_report_match = match
+    executive._verify_complete_site = lambda *_args, **_kwargs: pytest.fail(
+        'A duplicate cannot create or replace a completed cluster')
+    report = executive._verify_report_inspection({}, executive.fire, attempts=3)
+
+    assert report.site_id == 3
+    assert report.fire_found is previous_fire
+    assert report.status == ('fire_found' if previous_fire else 'fire_not_found')
+    assert not report.fire_location_valid  # Departure identity is not a new target estimate.
+    assert 'not published' in report.evidence_status
+    assert not executive._verify_report_was_published
+    assert executive._site_sequence == 7
+    assert len(examined) == 1
+    assert not any(e[0] in {'report', 'legacy_report', 'legacy_prepare', 'capture'}
+                   for e in executive.events)
+
+
+@pytest.mark.parametrize('gps_available', [False, True])
+def test_confirmed_fire_upgrades_negative_cluster_without_allocating_new_identity(
+    executive, gps_available,
+):
+    _confirmed_report_wall(executive)
+    executive.fire = _persistent_fire(executive.now)
+    executive._site_sequence = 7
+    if not gps_available:
+        executive._global_position = None
+    executive._completed_report_match = lambda report: {'site_id': 3, 'fire_found': False}
+    saved = []
+    executive._verify_complete_site = lambda report, **_kwargs: saved.append(deepcopy(report))
+
+    report = executive._verify_report_inspection({}, executive.fire, attempts=3)
+
+    assert report.site_id == 3
+    assert report.fire_found and report.status == 'fire_found'
+    assert executive._verify_report_was_published
+    assert executive._site_sequence == 7
+    published = [e[1] for e in executive.events if e[0] == 'report']
+    assert len(published) == len(saved) == 1
+    assert published[0].site_id == saved[0].site_id == 3
+    legacy = [e for e in executive.events if e[0] == 'legacy_report']
+    assert len(legacy) == int(gps_available)
+    if gps_available:
+        assert legacy[0][4] == 3
+
+
+@pytest.mark.parametrize('current_fire', [False, True])
+def test_registry_change_during_image_capture_is_checked_before_either_publication(
+    executive, current_fire,
+):
+    _confirmed_report_wall(executive)
+    executive.fire = _persistent_fire(executive.now) if current_fire else None
+    completed = []
+    executive._completed_report_match = lambda report: (
+        {'site_id': 9, 'fire_found': True} if completed else None)
+    capture = executive._inspection_capture_evidence
+
+    def complete_during_capture(*args, **kwargs):
+        capture(*args, **kwargs)
+        completed.append(True)
+
+    executive._inspection_capture_evidence = complete_during_capture
+    report = executive._verify_report_inspection({}, executive.fire, attempts=3)
+
+    assert report.site_id == 9 and report.fire_found
+    assert not executive._verify_report_was_published
+    assert executive._site_sequence == 0
+    assert not any(e[0] in {'report', 'legacy_report'} for e in executive.events)
+
+
+def test_separate_measured_wall_still_publishes_when_camera_bearing_is_identical(executive):
+    wall = _confirmed_report_wall(executive, nearest=100.0)
+    examined = []
+
+    def match(report):
+        examined.append(report.smoke_planning_position.point.x)
+        return ({'site_id': 3, 'fire_found': True}
+                if abs(report.smoke_planning_position.point.x - 30.0) <= 20.0 else None)
+
+    executive._completed_report_match = match
+    report = executive._verify_report_inspection({}, attempts=3)
+
+    assert examined == [wall['nearest_point'].point.x] * 2
+    assert report.site_id == 1 and not report.fire_found
+    assert executive._verify_report_was_published
+    assert len([e for e in executive.events if e[0] == 'report']) == 1
+
+
+def test_invalid_first_report_cannot_be_committed_by_duplicate_hook(executive):
+    from kv_executive.verification import VerificationObservationLost
+    executive._completed_report_match = lambda report: pytest.fail(
+        'Unconfirmed geometry cannot reach a completed-wall decision')
+    with pytest.raises(VerificationObservationLost):
+        executive._verify_report_inspection({}, attempts=3)
+    assert not any(e[0] in {'report', 'legacy_report'} for e in executive.events)

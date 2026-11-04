@@ -556,10 +556,10 @@ def _next_cluster_frame(executive, *, source='fire', yaw=0.0, vertical=0.0,
 
 
 @pytest.mark.parametrize('distance', [0.0, 19.99, 20.0, 20.01, 21.0, 24.99, 25.0])
-def test_measured_core_and_buffer_are_both_completed(executive, distance):
+def test_navigation_buffer_does_not_prove_semantic_identity(executive, distance):
     assert executive._verify_complete_site(_measured_report(executive))
     candidate = _next_cluster_frame(executive, point=(30.0 + distance, 0.0, 5.0))
-    assert executive._verify_is_completed_detection(candidate, 'fire')
+    assert executive._verify_is_completed_detection(candidate, 'fire') == (distance <= 20.0)
     assert not executive._verify_candidate_is_eligible(candidate, 'fire')
     assert executive._completed_cluster_regions()[0]['radius'] == 25.0
 
@@ -584,8 +584,8 @@ def test_three_distinct_outside_images_are_required_and_replay_does_not_vote(exe
 
 def test_return_to_buffer_establishes_completed_continuity(executive):
     executive._verify_complete_site(_measured_report(executive))
-    for offset, expected in ((26.0, False), (26.0, False), (24.9, False),
-                             (26.0, False), (26.0, False), (26.0, False)):
+    for offset, expected in ((26.0, False), (26.0, False), (19.9, False),
+                             (20.5, False), (21.0, False), (24.0, False)):
         candidate = _next_cluster_frame(executive, point=(30.0 + offset, 0.0, 5.0), track_id=42)
         assert executive._verify_candidate_is_eligible(candidate, 'fire') == expected
 
@@ -619,7 +619,8 @@ def test_completed_location_survives_translation_and_track_reset(executive):
     _move_observer(executive, y=12.0)
     direction = math.atan2(-12.0, 30.0)
     candidate = executive.detection(yaw=direction, track_id=999)
-    assert executive._verify_is_completed_detection(candidate, 'fire')
+    assert executive._completed_candidate_decision(candidate, 'fire') == 'ambiguous'
+    assert not executive._verify_candidate_is_eligible(candidate, 'fire')
     assert executive._completed_cluster_regions() == saved
 
 
@@ -655,7 +656,7 @@ def test_different_visible_side_plume_is_not_saved_as_reported_context(executive
 
 
 @pytest.mark.parametrize('kind', ['missing_tf', 'missing_pose'])
-def test_missing_source_association_keeps_cluster_and_allows_reobservation(executive, kind):
+def test_missing_source_association_keeps_cluster_and_waits_for_pose(executive, kind):
     executive._verify_complete_site(_measured_report(executive))
     if kind == 'missing_tf':
         def unavailable(*_args, **_kwargs):
@@ -664,8 +665,8 @@ def test_missing_source_association_keeps_cluster_and_allows_reobservation(execu
     else:
         executive._inspection_odometry_history.clear()
     candidate = executive.detection()
-    assert executive._verify_candidate_is_eligible(candidate, 'fire')
-    assert not executive._verify_is_completed_detection(candidate, 'fire')
+    assert not executive._verify_candidate_is_eligible(candidate, 'fire')
+    assert executive._completed_candidate_decision(candidate, 'fire') == 'unknown'
     assert len(executive._completed_cluster_regions()) == 1
 
 
@@ -763,13 +764,12 @@ def test_nearby_report_enriches_fixed_cluster_without_moving_or_expanding_it(exe
     for offset in (5.0, 10.0, 15.0, 20.0):
         executive._verify_complete_site(_measured_report(
             executive, center=(30.0 + offset, 0.0, 5.0), site_id=int(offset)))
-    original['site_id'] = 20
     assert executive._completed_cluster_regions() == [original]
     assert len(executive._completed_clusters[0]['views']['smoke']) <= 4
     assert [r['site_id'] for r in executive._completed_clusters[0]['reports']] == [15, 20]
     negative = _measured_report(executive, fire=False, site_id=21)
     executive._verify_complete_site(negative)
-    assert executive._completed_clusters[0]['site_id'] == 21
+    assert executive._completed_clusters[0]['site_id'] == 1
     assert executive._completed_clusters[0]['fire_found']
 
 
@@ -792,7 +792,7 @@ def test_map_cluster_is_compared_to_current_transformed_camera_ray(executive):
     assert executive._verify_complete_site(report)
     _move_observer(executive, y=10.0)
     candidate = executive.detection(yaw=math.atan2(-10.0, 40.0), track_id=42)
-    assert executive._verify_is_completed_detection(candidate, 'fire')
+    assert executive._completed_candidate_decision(candidate, 'fire') == 'ambiguous'
     assert executive._completed_cluster_snapshot().clusters[0].center.header.frame_id == 'map'
 
 
@@ -842,10 +842,11 @@ def test_boundary_uncertainty_requires_clearly_outside_evidence(executive):
     assert not executive._verify_candidate_is_eligible(candidate, 'fire')
 
 
-def test_independent_position_uses_horizontal_cluster_footprint(executive):
+def test_independent_position_does_not_inherit_infinite_height_routing_cylinder(executive):
     executive._verify_complete_site(_measured_report(executive))
-    candidate = _next_cluster_frame(executive, point=(50.0, 0.0, 100.0))
-    assert executive._verify_is_completed_detection(candidate, 'fire')
+    for index in range(3):
+        candidate = _next_cluster_frame(executive, point=(50.0, 0.0, 100.0))
+        assert executive._verify_candidate_is_eligible(candidate, 'fire') == (index == 2)
 
 
 def test_source_frame_gap_breaks_consecutive_outside_votes(executive):
@@ -858,9 +859,9 @@ def test_source_frame_gap_breaks_consecutive_outside_votes(executive):
     assert not executive._verify_candidate_is_eligible(candidate, 'fire')
 
 
-def test_continuous_completed_component_does_not_reopen_one_metre_outside_buffer(executive):
+def test_continuous_completed_component_retains_identity_inside_boundary_band(executive):
     executive._verify_complete_site(_measured_report(executive))
-    for offset in (24.0, 25.0, 26.0, 26.1, 25.9):
+    for offset in (19.0, 20.0, 21.0, 24.9, 25.0):
         candidate = _next_cluster_frame(executive, point=(30.0 + offset, 0.0, 5.0))
         assert executive._verify_is_completed_detection(candidate, 'fire')
     assert executive._completed_cluster_regions()[0]['radius'] == 25.0
@@ -870,7 +871,9 @@ def test_continuous_completed_bearing_keeps_identity_through_slow_parallax(execu
     executive._verify_complete_site(_measured_report(executive))
     for degrees in (4.0, 8.0, 12.0, 16.0, 20.0):
         candidate = _next_cluster_frame(executive, yaw=math.radians(degrees))
-        assert executive._verify_is_completed_detection(candidate, 'fire')
+        assert executive._completed_candidate_decision(candidate, 'fire') in (
+            'completed', 'ambiguous')
+        assert not executive._verify_candidate_is_eligible(candidate, 'fire')
 
 
 def test_large_independent_position_jump_breaks_completed_continuity(executive):
@@ -1007,8 +1010,364 @@ def test_routing_geometry_is_logged_once_when_new_circle_is_created(executive):
     executive._report = logs.append
     executive._verify_complete_site(_measured_report(executive))
     executive._verify_complete_site(_measured_report(executive, site_id=2))
+    logs = [line for line in logs if 'completed smoke routing zone' in line]
     assert len(logs) == 1
     assert 'wall=(30.00, 0.00, 5.00)' in logs[0]
     assert 'center=(55.00, 0.00, 5.00)' in logs[0]
     assert 'radius=25.00' in logs[0]
     assert 'front_normal=(+1.000, +0.000)' in logs[0]
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+def test_overlapping_nonmatches_do_not_become_novel_through_time_or_track_reset(
+        executive, source):
+    executive._verify_complete_site(_measured_report(executive))
+    for index in range(12):
+        candidate = _next_cluster_frame(
+            executive, source=source, yaw=math.radians(22), track_id=index + 40)
+        assert executive._completed_candidate_decision(candidate, source) == 'ambiguous'
+        assert not executive._verify_candidate_is_eligible(candidate, source)
+    assert executive._completed_followup_task() is not None
+
+
+def test_candidate_bbox_intersection_is_used_instead_of_whole_camera_view(executive):
+    source = 'smoke'
+    executive._verify_complete_site(_measured_report(executive))
+    message = executive.detection(source, yaw=math.radians(40))
+    message.angular_bounds_valid = True
+    message.yaw_min_rad, message.yaw_max_rad = math.radians(20), math.radians(45)
+    message.vertical_min_rad, message.vertical_max_rad = -0.01, 0.01
+    assert executive._completed_candidate_decision(message, source) == 'ambiguous'
+    for _ in range(3):
+        separate = _next_cluster_frame(executive, source=source, yaw=math.radians(60))
+        executive._verify_candidate_is_eligible(separate, source)
+    assert executive._verify_candidate_is_eligible(separate, source)
+
+
+@pytest.mark.parametrize('vertical', [-math.radians(40), math.radians(40)])
+def test_infinite_height_routing_cylinder_does_not_mask_distinct_vertical_source(
+        executive, vertical):
+    executive._verify_complete_site(_measured_report(executive))
+    for index in range(3):
+        candidate = _next_cluster_frame(executive, vertical=vertical)
+        assert executive._verify_candidate_is_eligible(candidate, 'fire') == (index == 2)
+
+
+def test_known_site_beyond_seventy_metres_has_no_identity_horizon(executive):
+    executive._verify_complete_site(_measured_report(executive, center=(100.0, 0.0, 5.0)))
+    _move_observer(executive, y=8.0)
+    candidate = executive.detection(yaw=math.atan2(-8.0, 100.0), track_id=222)
+    assert executive._completed_candidate_decision(candidate, 'fire') == 'ambiguous'
+    assert not executive._verify_candidate_is_eligible(candidate, 'fire')
+
+
+def test_far_aligned_smoke_gets_bounded_alternate_view_investigation(executive):
+    executive._verify_complete_site(_measured_report(
+        executive, center=(60.0, 0.0, 5.0), fire=False))
+    task = executive._completed_followup_task()
+    assert task is not None
+    assert task['origin'] == (0.0, 0.0, 5.0)
+    _move_observer(executive, y=6.0)
+    assert executive._completed_followup_result(task['key'], True, (0.0, 6.0, 5.0))
+    assert executive._completed_followup_task() is None
+    for index in range(3):
+        executive.seconds += 0.1
+        executive.odometry(executive.seconds - 0.01, y=6.0)
+        executive.odometry(executive.seconds + 0.01, y=6.0)
+        candidate = executive.detection('smoke', yaw=math.atan2(-6.0, 100.0))
+        assert executive._verify_candidate_is_eligible(candidate, 'smoke') == (index == 2)
+    executive._completed_followup_consume()
+    assert not executive._verify_candidate_is_eligible(candidate, 'smoke')
+    second = executive._completed_followup_task()
+    assert second['origin'] == task['origin']
+    assert second['observations'] == [(0.0, 6.0, 5.0)]
+    assert executive._completed_followup_result(second['key'], True, (0.0, -6.0, 5.0))
+    executive._completed_followup_consume()
+    assert executive._completed_followup_task() is None
+    for _ in range(5):
+        executive._completed_candidate_decision(executive.detection('smoke'), 'smoke')
+    assert executive._completed_followup_task() is None
+
+
+def test_followup_requires_real_distinct_observer_displacement(executive):
+    executive._verify_complete_site(_measured_report(executive, fire=False))
+    task = executive._completed_followup_task()
+    assert not executive._completed_followup_result(task['key'], True, (0.0, 0.5, 5.0))
+    assert executive._completed_followup_task()['attempts'] == 1
+    assert not executive._completed_followup_result(task['key'], True, (math.nan, 8.0, 5.0))
+    assert executive._completed_followup_task() is None
+
+
+def test_successful_followup_cannot_repeat_same_observation(executive):
+    executive._verify_complete_site(_measured_report(executive, fire=False))
+    key = executive._completed_followup_task()['key']
+    assert executive._completed_followup_result(key, True, (0.0, 6.0, 5.0))
+    executive._completed_followup_consume()
+    assert not executive._completed_followup_result(key, True, (0.0, 6.0, 5.0))
+    assert executive._completed_followup_task() is None
+
+
+def test_clock_reset_clears_tasks_leases_and_requeue_tombstones(executive):
+    executive._verify_complete_site(_measured_report(executive, fire=False))
+    key = executive._completed_followup_task()['key']
+    executive._completed_followup_result(key, True, (0.0, 6.0, 5.0))
+    _move_observer(executive, seconds=10.0)
+    assert executive._completed_followup_task() is None
+    assert not executive._completed_followups
+    assert not executive._completed_clusters
+
+
+def test_followup_lease_expires_while_exploring_but_not_during_bound_inspection(
+        executive, monkeypatch):
+    import kv_executive.completed_sites as module
+    now = [100.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: now[0])
+    executive._verify_complete_site(_measured_report(executive, fire=False))
+    task = executive._completed_followup_task()
+    executive._completed_followup_result(task['key'], True, (0.0, 6.0, 5.0))
+    now[0] += 61.0
+    executive._parent_state = 'Verify'
+    assert executive._completed_followup_task() is None
+    assert executive._completed_followups[task['key']]['lease']
+    executive._parent_state = 'Exploration'
+    assert executive._completed_followup_task() is not None
+    assert not executive._completed_followups[task['key']]['lease']
+
+
+def test_same_fresh_image_can_recover_association_after_pose_arrives(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    executive._inspection_odometry_history.clear()
+    candidate = executive.detection(yaw=1.0, track_id=200)
+    assert executive._completed_candidate_decision(candidate, 'fire') == 'unknown'
+    executive.odometry(19.9)
+    executive.odometry(20.1)
+    assert executive._completed_candidate_decision(candidate, 'fire') == 'pending'
+    assert not executive._verify_candidate_is_eligible(candidate, 'fire')
+
+
+@pytest.mark.parametrize('offset,expected', [(0.0, 1), (20.0, 1), (20.01, None), (50.0, None)])
+def test_report_identity_match_uses_original_wall_and_stable_id(executive, offset, expected):
+    executive._verify_complete_site(_measured_report(executive))
+    other = _measured_report(executive, center=(30.0 + offset, 0.0, 5.0), site_id=99)
+    match = executive._completed_report_match(other)
+    assert (match['site_id'] if match is not None else None) == expected
+    if match is not None:
+        match['wall_point'].point.x = 900.0
+        assert executive._completed_clusters[0]['wall_point'].point.x == 30.0
+
+
+def test_all_nearby_confirmed_components_are_saved_without_unrelated_side_plume(executive):
+    report = _measured_report(executive)
+    nearby = executive.detection('fire', yaw=math.radians(15.0), track_id=23)
+    unrelated = executive.detection('fire', yaw=math.radians(65.0), track_id=24)
+    executive._verify.raw_candidates = lambda kind: (
+        [executive.fire, nearby, unrelated] if kind == 'fire' else [executive.smoke])
+    executive._verify_complete_site(report)
+    ids = [view['message'].track_id for view in executive._completed_clusters[0]['views']['fire']]
+    assert ids == [1, 23]
+
+
+def test_projection_diagnostics_are_throttled_and_include_reason(executive):
+    logs = []
+    executive._report = logs.append
+    executive._verify_complete_site(_measured_report(executive))
+    for _ in range(10):
+        executive._completed_candidate_decision(executive.fire, 'fire')
+    matching = [line for line in logs if 'source=fire' in line]
+    assert len(matching) == 1
+    assert 'site_id=1' in matching[0]
+    assert 'reason=' in matching[0]
+
+
+@pytest.mark.parametrize('point', [(6.0, 0.0, 5.0), (0.0, 0.0, 11.0)])
+def test_followup_baseline_rejects_forward_only_and_vertical_only_motion(executive, point):
+    executive._verify_complete_site(_measured_report(executive, fire=False))
+    key = executive._completed_followup_task()['key']
+    assert not executive._completed_followup_result(key, True, point)
+    assert not executive._completed_followups[key]['lease']
+
+
+def test_followup_leases_are_source_specific_and_both_sources_can_get_opportunity(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    assert executive._completed_followup_task()['source'] == 'fire'
+    smoke_task = next(task for task in executive._completed_followups.values()
+                      if task['source'] == 'smoke')
+    assert executive._completed_followup_result(smoke_task['key'], True, (0.0, 6.0, 5.0))
+    _move_observer(executive, y=6.0)
+    for _ in range(3):
+        executive.seconds += 0.1
+        executive.odometry(executive.seconds - 0.01, y=6.0)
+        executive.odometry(executive.seconds + 0.01, y=6.0)
+        candidate = executive.detection(yaw=math.atan2(-6.0, 100.0))
+        assert executive._completed_candidate_decision(candidate, 'fire') == 'ambiguous'
+    fire_tasks = [task for task in executive._completed_followups.values()
+                  if task['source'] == 'fire']
+    assert fire_tasks
+    executive._completed_followup_consume()
+    fire_task = fire_tasks[0]
+    assert executive._completed_followup_result(fire_task['key'], True, (0.0, 6.0, 5.0))
+    for index in range(3):
+        executive.seconds += 0.1
+        executive.odometry(executive.seconds - 0.01, y=6.0)
+        executive.odometry(executive.seconds + 0.01, y=6.0)
+        candidate = executive.detection(yaw=math.atan2(-6.0, 100.0))
+        assert executive._verify_candidate_is_eligible(candidate, 'fire') == (index == 2)
+
+
+def test_expired_lease_cannot_replay_cached_novel_image(executive, monkeypatch):
+    import kv_executive.completed_sites as module
+    now = [100.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: now[0])
+    executive._verify_complete_site(_measured_report(executive, fire=False))
+    task = executive._completed_followup_task()
+    executive._completed_followup_result(task['key'], True, (0.0, 6.0, 5.0))
+    _move_observer(executive, y=6.0)
+    for _ in range(3):
+        executive.seconds += 0.1
+        executive.odometry(executive.seconds - 0.01, y=6.0)
+        executive.odometry(executive.seconds + 0.01, y=6.0)
+        candidate = executive.detection('smoke', yaw=math.atan2(-6.0, 100.0))
+        executive._verify_candidate_is_eligible(candidate, 'smoke')
+    assert executive._verify_candidate_is_eligible(candidate, 'smoke')
+    now[0] += 61.0
+    assert not executive._verify_candidate_is_eligible(candidate, 'smoke')
+    assert executive._completed_candidate_decision(candidate, 'smoke') == 'ambiguous'
+
+
+def test_only_one_alternate_view_investigation_lease_can_be_active(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    fire = executive._completed_followup_task()
+    smoke = next(task for task in executive._completed_followups.values()
+                 if task['source'] == 'smoke')
+    assert fire['source'] == 'fire'
+    assert executive._completed_followup_result(fire['key'], True, (0.0, 6.0, 5.0))
+    assert not executive._completed_followup_result(smoke['key'], True, (0.0, 6.0, 5.0))
+    assert not executive._completed_followup_result(fire['key'], True, (0.0, -6.0, 5.0))
+    assert sum(task['lease'] for task in executive._completed_followups.values()) == 1
+    assert executive._completed_followups[smoke['key']]['attempts'] == 0
+
+
+def test_observer_parallax_does_not_requeue_exhausted_cluster_sector(executive):
+    executive._verify_complete_site(_measured_report(
+        executive, center=(15.0, 0.0, 5.0), fire=False))
+    task = executive._completed_followup_task()
+    executive._completed_followup_result(task['key'], False)
+    executive._completed_followup_result(task['key'], False)
+    for lateral in (6.0, 12.0, -12.0, -20.0):
+        _move_observer(executive, seconds=executive.seconds + 1.0, y=lateral)
+        candidate = executive.detection('smoke', yaw=math.atan2(-lateral, 15.0))
+        assert executive._completed_candidate_decision(candidate, 'smoke') == 'ambiguous'
+        assert executive._completed_followup_task() is None
+    assert len(executive._completed_followups) == 1
+
+
+def test_candidate_priority_prefers_separated_then_uninspected_angular_components(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    task = executive._completed_followup_task()
+    assert task['source'] == 'fire'
+    _move_observer(executive, y=6.0)
+    assert executive._completed_followup_result(task['key'], True, (0.0, 6.0, 5.0))
+    for _ in range(3):
+        executive.seconds += 0.1
+        executive.odometry(executive.seconds - 0.01, y=6.0)
+        executive.odometry(executive.seconds + 0.01, y=6.0)
+        old = executive.detection(yaw=math.atan2(-6.0, 30.0), track_id=1)
+        angular_new = executive.detection(yaw=math.radians(12.0), track_id=42)
+        separate = executive.detection(yaw=math.radians(70.0), track_id=43)
+        for message in (old, angular_new, separate):
+            executive._completed_candidate_decision(message, 'fire')
+    assert executive._completed_candidate_priority(separate, 'fire')[0] == 0
+    assert executive._completed_candidate_priority(angular_new, 'fire')[0] == 1
+    assert executive._completed_candidate_priority(old, 'fire')[0] == 2
+    assert executive._completed_candidate_priority(separate, 'fire') \
+        < executive._completed_candidate_priority(angular_new, 'fire') \
+        < executive._completed_candidate_priority(old, 'fire')
+    # Priority is advisory. It never suppresses an already eligible component.
+    assert all(executive._verify_candidate_is_eligible(message, 'fire')
+               for message in (old, angular_new, separate))
+
+
+def test_first_site_candidate_priority_preserves_existing_selection(executive):
+    assert executive._completed_candidate_priority(executive.detection(), 'fire') == (0, 0.0)
+
+
+@pytest.mark.parametrize('map_yaw', [0.0, 0.7, -0.6])
+def test_map_association_uses_image_time_transform_when_current_tf_is_not_available(
+        executive, map_yaw):
+    from rclpy.duration import Duration
+    from rclpy.time import Time as RclTime
+    from tf2_ros import Buffer
+    executive.config['verify_planning_frame'] = 'map'
+    executive.seconds = 21.0
+    executive._inspection_odometry_history.clear()
+    for acquired in (19.9, 20.1):
+        executive.odometry(acquired, x=10.0, y=-4.0, z=5.0, yaw=0.3)
+    executive.odometry(21.0, x=15.0, y=9.0, z=6.0, yaw=1.1)
+    buffer = Buffer()
+    camera = TransformStamped(
+        header=Header(frame_id='kv_drone/base_link', stamp=stamp(20.0)),
+        child_frame_id='thermal_camera', transform=Transform(
+            translation=Vector3(x=0.25, y=-0.1, z=0.2),
+            rotation=quaternion_from_yaw(0.2)))
+    buffer.set_transform_static(camera, 'completed-site-test')
+    for acquired in (19.9, 20.1):
+        buffer.set_transform(TransformStamped(
+            header=Header(frame_id='map', stamp=stamp(acquired)),
+            child_frame_id='kv_drone/base_link', transform=Transform(
+                translation=Vector3(x=100.0, y=30.0, z=15.0),
+                rotation=quaternion_from_yaw(map_yaw))), 'completed-site-test')
+    with pytest.raises(TransformException):
+        buffer.lookup_transform('map', 'kv_drone/base_link', RclTime(seconds=21.0),
+                                timeout=Duration(seconds=0.0))
+    calls = []
+
+    def lookup(target, source, acquired, timeout):
+        calls.append((target, source, acquired.nanoseconds, timeout.nanoseconds))
+        return buffer.lookup_transform(target, source, acquired, timeout=timeout)
+
+    executive._tf_buffer = SimpleNamespace(lookup_transform=lookup)
+    executive._completed_image_frame_transform = (
+        MissionExecutive._completed_image_frame_transform.__get__(executive))
+
+    def current_alignment(*_args):
+        raise AssertionError('A camera image must not depend on the newest odometry TF')
+
+    executive._completed_path_frame_transform = current_alignment
+    message = executive.detection(
+        header=Header(frame_id='thermal_camera', stamp=stamp(20.0)), yaw=0.1, vertical=0.2)
+    origin, direction, observer = executive._completed_planning_ray(message, 'fire')
+    expected_x = 100.0 + 0.25 * math.cos(map_yaw) + 0.1 * math.sin(map_yaw)
+    expected_y = 30.0 + 0.25 * math.sin(map_yaw) - 0.1 * math.cos(map_yaw)
+    assert (origin.x, origin.y, origin.z) == pytest.approx((expected_x, expected_y, 15.2))
+    assert (observer.x, observer.y, observer.z) == pytest.approx((100.0, 30.0, 15.0))
+    raw = (1.0, math.tan(0.1), math.tan(0.2))
+    angle = map_yaw + 0.2
+    expected = (math.cos(angle) * raw[0] - math.sin(angle) * raw[1],
+                math.sin(angle) * raw[0] + math.cos(angle) * raw[1], raw[2])
+    assert direction == pytest.approx(tuple(value / math.hypot(*raw) for value in expected))
+    assert all(acquired == 20_000_000_000 and timeout == 0
+               for _, _, acquired, timeout in calls)
+    assert ('map', 'kv_drone/base_link', 20_000_000_000, 0) in calls
+
+
+def test_missing_image_time_map_tf_cannot_borrow_a_newer_transform(executive):
+    from tf2_ros import Buffer
+    executive._verify_complete_site(_measured_report(executive))
+    executive.config['verify_planning_frame'] = 'map'
+    executive._completed_image_frame_transform = (
+        MissionExecutive._completed_image_frame_transform.__get__(executive))
+    buffer = Buffer()
+    buffer.set_transform_static(TransformStamped(
+        header=Header(frame_id='kv_drone/base_link', stamp=stamp(20.0)),
+        child_frame_id='thermal_camera', transform=Transform(
+            rotation=quaternion_from_yaw(0.0))), 'completed-site-test')
+    buffer.set_transform(TransformStamped(
+        header=Header(frame_id='map', stamp=stamp(21.0)),
+        child_frame_id='kv_drone/base_link', transform=Transform(
+            translation=Vector3(x=100.0), rotation=quaternion_from_yaw(0.0))),
+        'completed-site-test')
+    executive._tf_buffer = buffer
+    candidate = executive.detection(yaw=1.0, track_id=88)
+    assert executive._completed_planning_ray(candidate, 'fire') is None
+    assert executive._completed_candidate_decision(candidate, 'fire') == 'unknown'
+    assert not executive._verify_candidate_is_eligible(candidate, 'fire')

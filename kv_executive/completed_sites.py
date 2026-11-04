@@ -3,6 +3,7 @@
 from collections import deque, OrderedDict
 from copy import deepcopy
 import math
+import time
 
 from geometry_msgs.msg import Point, PointStamped, Pose, Transform, Vector3
 from kv_executive.mission_geometry import (
@@ -21,6 +22,11 @@ COMPLETED_SITE_DEFAULTS = {
     'verify_completed_cluster_buffer': 5.0,
     'verify_completed_outside_frames': 3,
     'verify_completed_candidate_history': 128,
+    'verify_completed_projection_margin': math.radians(3.0),
+    'verify_completed_followup_attempts': 2,
+    'verify_completed_followup_baseline': 6.0,
+    'verify_completed_followup_lease_timeout': 60.0,
+    'verify_completed_followup_observation_time': 2.0,
 }
 
 
@@ -50,6 +56,8 @@ class CompletedSitesMixin:
         self._completed_clusters = deque(maxlen=100)
         self._completed_candidate_history = OrderedDict()
         self._completed_candidate_sequence = 0
+        self._completed_followups = OrderedDict()
+        self._completed_diagnostics = {}
         self._completed_clusters_version = 0
         self._completed_clock_ns = self.get_clock().now().nanoseconds
         self._inspection_odometry_history = deque(maxlen=512)
@@ -66,6 +74,8 @@ class CompletedSitesMixin:
             self._completed_clusters.clear()
             self._deferred_viewpoints.clear()
             self._completed_candidate_history.clear()
+            self._completed_followups.clear()
+            self._completed_diagnostics.clear()
             self._completed_clusters_version += 1
         self._completed_clock_ns = now_ns
 
@@ -236,9 +246,13 @@ class CompletedSitesMixin:
             context = getattr(self, '_verify_report_completion_context', None) or {}
             planning_to_local = context.get('planning_to_local')
             if planning_to_local is None:
-                transform = (getattr(self, '_completed_path_frame_transform', None)
-                             or getattr(self, '_path_frame_transform'))
-                planning_to_local = transform(frame)
+                image_transform = getattr(self, '_completed_image_frame_transform', None)
+                if image_transform is not None:
+                    planning_to_local = image_transform(frame, message.header.stamp)
+                else:
+                    transform = (getattr(self, '_completed_path_frame_transform', None)
+                                 or getattr(self, '_path_frame_transform'))
+                    planning_to_local = transform(frame)
             conversion = _inverse(planning_to_local)
             start = transform_pose(Pose(position=origin, orientation=quaternion_from_yaw(0.0)),
                                    conversion).position
@@ -296,46 +310,216 @@ class CompletedSitesMixin:
             return None
         return result.point, uncertainty
 
-    def _completed_view_matches(self, cluster, source, origin, direction):
-        """Require a narrow saved view even when the camera is inside the spatial buffer."""
+    def _completed_candidate_extents(self, message, source, direction):
+        """Project this component's image bounds, including camera attitude at image time."""
+        if not getattr(message, 'angular_bounds_valid', False):
+            return 0.0, 0.0
+        bounds = [getattr(message, name, math.nan) for name in (
+            'yaw_min_rad', 'yaw_max_rad', 'vertical_min_rad', 'vertical_max_rad')]
+        if (not all(math.isfinite(v) and abs(v) < math.pi / 2 for v in bounds)
+                or bounds[0] > bounds[1] or bounds[2] > bounds[3]):
+            return 0.0, 0.0
+        yaw = math.atan2(direction[1], direction[0])
+        elevation = math.atan2(direction[2], math.hypot(*direction[:2]))
+        horizontal = vertical = 0.0
+        for left in bounds[:2]:
+            for upper in bounds[2:]:
+                corner = deepcopy(message)
+                corner.yaw_correction_rad, corner.vertical_correction_rad = left, upper
+                ray = self._completed_planning_ray(corner, source)
+                if ray is None:
+                    continue
+                vector = ray[1]
+                horizontal = max(horizontal, abs(math.remainder(
+                    math.atan2(vector[1], vector[0]) - yaw, 2 * math.pi)))
+                vertical = max(vertical, abs(math.atan2(
+                    vector[2], math.hypot(*vector[:2])) - elevation))
+        return horizontal, vertical
+
+    @staticmethod
+    def _completed_semantic_heights(cluster):
+        wall = cluster['center'].point
+        lows, highs = [wall.z - 2.0], [wall.z + 2.0]
+        for views in cluster['views'].values():
+            for view in views:
+                depth = math.hypot(view['anchor'][0] - view['origin'][0],
+                                   view['anchor'][1] - view['origin'][1])
+                height = max(2.0, depth * math.tan(min(
+                    math.radians(75.0), view['vertical'])))
+                lows.append(view['anchor'][2] - height)
+                highs.append(view['anchor'][2] + height)
+        return min(lows), max(highs)
+
+    def _completed_projected_overlap(self, cluster, origin, direction, extents):
+        """Intersect a component's forward view with bounded semantic coverage.
+
+        Routing cylinders are intentionally infinite in height. Recognition uses
+        only the physical core and finite vertical coverage from inspected images.
+        There is no maximum ray distance: an old site beyond 70 m remains known.
+        """
+        wall = cluster['center'].point
+        normal = cluster['front_normal']
+        radius = cluster['core_radius'] + cluster['uncertainty']
+        cx = wall.x + cluster['core_radius'] * normal[0]
+        cy = wall.y + cluster['core_radius'] * normal[1]
+        dx, dy = cx - origin.x, cy - origin.y
+        distance = math.hypot(dx, dy)
+        margin = self.config.get('verify_completed_projection_margin', math.radians(3.0))
+        delta = abs(math.remainder(math.atan2(direction[1], direction[0])
+                                   - math.atan2(dy, dx), 2 * math.pi))
+        coverage = math.pi if distance <= radius else math.asin(min(1.0, radius / distance))
+        if delta > coverage + extents[0] + margin:
+            return False
+        low, high = self._completed_semantic_heights(cluster)
+        near, far = max(1e-3, distance - radius), max(1e-3, distance + radius)
+        angles = [math.atan2(z - origin.z, depth)
+                  for z in (low, high) for depth in (near, far)]
+        elevation = math.atan2(direction[2], math.hypot(*direction[:2]))
+        return (min(angles) - margin <= elevation + extents[1]
+                and max(angles) + margin >= elevation - extents[1])
+
+    def _completed_saved_view_identity(self, cluster, source, origin, direction):
+        """Use local inspected image coverage without pretending smoke depth fixes a fire."""
         views = cluster['views'].get(source, ())
         if not views and source == 'smoke':
             views = cluster['views'].get('fire', ())
-        if not views:
-            # A valid historical wall can be saved even when a camera transform
-            # is temporarily absent. Its point remains a narrow fallback, not
-            # an all-direction exclusion sphere around a nearby observer.
-            views = [{'anchor': _coordinates(cluster['center'].point),
-                      'horizontal': 0.0, 'vertical': 0.0}]
         tolerance = self.config.get('verify_completed_bearing_tolerance', math.radians(10.0))
         for view in views:
-            relative = tuple(a - b for a, b in zip(view['anchor'], _coordinates(origin)))
-            length = math.hypot(*relative)
-            if length <= 1e-6:
+            if math.dist(_coordinates(origin), view['origin']) >= self.config.get(
+                    'verify_retry_translation', 2.0):
                 continue
-            forward = sum(a * b for a, b in zip(relative, direction))
-            if forward <= 0.0:
-                continue
-            # A finite spatial miss protects distinct distant bearings. The
-            # angle test is also mandatory: the camera can itself be inside
-            # the 25 m buffer, where ray/sphere intersection has no selectivity.
-            miss = math.sqrt(max(0.0, length * length - forward * forward))
-            if miss > cluster['radius'] + cluster['uncertainty']:
-                continue
-            horizontal = abs(math.atan2(
-                math.sin(math.atan2(direction[1], direction[0])
-                         - math.atan2(relative[1], relative[0])),
-                math.cos(math.atan2(direction[1], direction[0])
-                         - math.atan2(relative[1], relative[0]))))
+            previous_yaw = math.atan2(view['direction'][1], view['direction'][0])
+            horizontal = abs(math.remainder(math.atan2(direction[1], direction[0])
+                                            - previous_yaw, 2 * math.pi))
             vertical = abs(math.atan2(direction[2], math.hypot(*direction[:2]))
-                           - math.atan2(relative[2], math.hypot(*relative[:2])))
+                           - math.atan2(view['direction'][2], math.hypot(*view['direction'][:2])))
             if (horizontal <= tolerance + view['horizontal']
                     and vertical <= tolerance + view['vertical']):
                 return True
         return False
 
+    def _completed_queue_followup(self, cluster, source, origin, direction):
+        """One bounded follow-up per completed site/sector, independent of detector IDs."""
+        wall = cluster['center'].point
+        bearing = math.atan2(direction[1], direction[0])
+        relative_bearing = math.remainder(
+            bearing - math.atan2(wall.y - origin.y, wall.x - origin.x), 2 * math.pi)
+        # Relative-to-wall sectors survive observer parallax. Absolute image or
+        # world bearings would recreate an exhausted task after every side step.
+        sector = round(relative_bearing / math.radians(15.0)) % 24
+        key = (cluster['site_id'], source, sector)
+        with self._data_lock:
+            tasks = self._completed_followups
+            previous = next((task for task in tasks.values()
+                             if task['site_id'] == cluster['site_id']
+                             and task['source'] == source
+                             and abs(math.remainder(task['relative_bearing'] - relative_bearing,
+                                                    2 * math.pi)) <= math.radians(20.0)), None)
+            if previous is not None:
+                return previous['key']
+            saved = next((entry for entry in self._completed_clusters
+                          if entry['site_id'] == cluster['site_id']), None)
+            sectors = saved.setdefault('followup_sectors', set()) if saved is not None else set()
+            if any(kind == source and min((sector - old) % 24, (old - sector) % 24) <= 1
+                   for kind, old in sectors):
+                return key
+            sectors.add((source, sector))
+            tasks[key] = {'key': key, 'site_id': cluster['site_id'], 'source': source,
+                          'origin': _coordinates(origin), 'direction': tuple(direction),
+                          'relative_bearing': relative_bearing,
+                          'attempts': 0, 'observations': [], 'lease': False}
+            while len(tasks) > 32:
+                tasks.popitem(last=False)
+        return key
+
+    def _completed_followup_expire_locked(self):
+        if getattr(self, '_parent_state', None) == 'Verify':
+            return
+        timeout = self.config.get('verify_completed_followup_lease_timeout', 60.0)
+        expired = False
+        for task in self._completed_followups.values():
+            if task['lease'] and time.monotonic() - task['lease_started'] >= timeout:
+                task['lease'] = False
+                expired = True
+        if expired:
+            self._completed_candidate_history.clear()
+
+    def _completed_followup_task(self):
+        """Return the next unresolved direction; consumed tasks cannot recreate a loop."""
+        with self._data_lock:
+            self._completed_clock_locked()
+            self._completed_followup_expire_locked()
+            limit = self.config.get('verify_completed_followup_attempts', 2)
+            if any(task['lease'] for task in self._completed_followups.values()):
+                return None
+            sites = {entry['site_id'] for entry in self._completed_clusters}
+            eligible = [task for task in self._completed_followups.values()
+                        if task['attempts'] < limit and task['site_id'] in sites]
+            # A distant thermal source needs its own observation opportunity;
+            # a smoke-only lease must never lend guidance to an old fire blob.
+            eligible.sort(key=lambda task: task['source'] != 'fire')
+            return deepcopy(eligible[0]) if eligible else None
+
+    def _completed_followup_result(self, key, success, observation_origin=None):
+        """Retain immutable initial pose and actual settled alternate viewpoints."""
+        with self._data_lock:
+            task = self._completed_followups.get(key)
+            if task is None or task['attempts'] >= self.config.get(
+                    'verify_completed_followup_attempts', 2):
+                return False
+            if any(entry['lease'] for entry in self._completed_followups.values()):
+                return False
+            task['attempts'] += 1
+            point = tuple(observation_origin) if observation_origin is not None else None
+            baseline = self.config.get('verify_completed_followup_baseline', 6.0)
+            horizontal = math.hypot(*task['direction'][:2])
+
+            def lateral(previous):
+                return abs((point[0] - previous[0]) * task['direction'][1]
+                           - (point[1] - previous[1]) * task['direction'][0]) / horizontal
+            useful = (success and point is not None and len(point) == 3
+                      and all(math.isfinite(value) for value in point) and horizontal > 1e-6
+                      and all(lateral(previous) + 1e-6 >= baseline
+                              for previous in [task['origin']] + task['observations']))
+            if useful:
+                task['observations'].append(point)
+                task['lease'] = True
+                task['lease_started'] = time.monotonic()
+            return bool(useful)
+
+    def _completed_followup_consume(self):
+        """End a bounded investigation permission, retaining attempts across action retries."""
+        with self._data_lock:
+            for task in self._completed_followups.values():
+                task['lease'] = False
+            self._completed_candidate_history.clear()
+
+    def _completed_followup_permission(self, cluster, source, direction):
+        with self._data_lock:
+            self._completed_followup_expire_locked()
+            return any(task['lease'] and task['site_id'] == cluster['site_id']
+                       and task['source'] == source
+                       and _angle(direction, task['direction']) <= math.radians(30.0)
+                       for task in self._completed_followups.values())
+
+    def _completed_association_diagnostic(self, source, decision, cluster_id, reason):
+        logger = getattr(self, '_report', None)
+        if logger is None:
+            return
+        key = (source, decision, cluster_id, reason)
+        now = time.monotonic()
+        with self._data_lock:
+            previous = self._completed_diagnostics.get(key, -math.inf)
+            if now - previous < 5.0:
+                return
+            self._completed_diagnostics[key] = now
+            if len(self._completed_diagnostics) > 64:
+                self._completed_diagnostics.pop(next(iter(self._completed_diagnostics)))
+        logger(f'Completed-site association: source={source}; decision={decision}; '
+               f'site_id={cluster_id}; reason={reason}')
+
     def _completed_candidate_decision(self, message, source):
-        """Classify one source image once; three supported outside images open a new target."""
+        """Require spatial separation or one bounded alternate-view investigation lease."""
         if message is None or source not in ('smoke', 'fire'):
             return 'invalid'
         age = (self.get_clock().now().nanoseconds - _stamp_ns(message)) / 1e9
@@ -350,16 +534,13 @@ class CompletedSitesMixin:
             return 'invalid'
         with self._data_lock:
             self._completed_clock_locked()
-            # Candidate arrays can contain 16 components per frame. Matching
-            # copies only small geometry, never every retained detector message
-            # and report context on this frequent path.
+            self._completed_followup_expire_locked()
             clusters = [{**{name: entry[name] for name in (
-                'radius', 'core_radius', 'uncertainty')},
-                # Detection identity stays anchored to the measured wall,
-                # independently of the shifted circle used only for routing.
+                'site_id', 'radius', 'core_radius', 'uncertainty', 'front_normal')},
                 'center': deepcopy(entry.get('wall_point', entry['center'])),
-                'views': {kind: [{name: view[name] for name in (
-                    'anchor', 'horizontal', 'vertical')} for view in entries]
+                'views': {kind: [{name: deepcopy(view[name]) for name in (
+                    'anchor', 'horizontal', 'vertical', 'origin', 'direction')}
+                                for view in entries]
                           for kind, entries in entry['views'].items()}}
                 for entry in self._completed_clusters if source != 'fire' or entry['fire_found']]
         if not clusters:
@@ -367,18 +548,32 @@ class CompletedSitesMixin:
                     else 'novel')
         ray = self._completed_planning_ray(message, source)
         if ray is None:
-            return 'unknown'  # Missing association permits a fresh re-observation.
+            self._completed_association_diagnostic(
+                source, 'unknown', 0, 'image-time pose or map/camera transform unavailable')
+            return 'unknown'
         origin, direction, _ = ray
         independent = self._completed_independent_point(message, source)
+        extents = self._completed_candidate_extents(message, source, direction)
+        overlaps = [entry for entry in clusters if self._completed_projected_overlap(
+            entry, origin, direction, extents)]
         if independent is not None:
             point, uncertainty = independent
             matched = any(math.hypot(point.x - entry['center'].point.x,
                                      point.y - entry['center'].point.y)
-                          <= entry['radius'] + entry['uncertainty'] + uncertainty
+                          <= entry['core_radius'] + entry['uncertainty'] + uncertainty
+                          and self._completed_semantic_heights(entry)[0] - uncertainty
+                          <= point.z <= self._completed_semantic_heights(entry)[1] + uncertainty
                           for entry in clusters)
+            # Independent measured location can resolve a ray's depth ambiguity.
+            ambiguous = False
         else:
-            matched = any(self._completed_view_matches(entry, source, origin, direction)
-                          for entry in clusters)
+            matched = any(self._completed_saved_view_identity(entry, source, origin, direction)
+                          for entry in overlaps)
+            ambiguous = bool(overlaps) and not matched
+        for entry in overlaps:
+            self._completed_queue_followup(entry, source, origin, direction)
+        permission = ambiguous and any(
+            self._completed_followup_permission(entry, source, direction) for entry in overlaps)
         stamp = _stamp_ns(message)
         identity = int(getattr(message, 'track_id', getattr(message, 'candidate_id', 0)))
         frame = message.header.frame_id
@@ -403,43 +598,102 @@ class CompletedSitesMixin:
                 self._completed_candidate_sequence += 1
                 key = self._completed_candidate_sequence
                 previous, continuous = {}, False
-            if (not matched and continuous and previous.get('decision') == 'completed'
-                    and _angle(direction, previous['direction']) <= math.radians(5.0)):
+            # An independently positioned component retains a small uncertainty
+            # hysteresis. Bearing-only nonmatches never use this to grow a zone.
+            if (independent is not None and not matched and continuous
+                    and previous.get('decision') == 'completed'):
                 old_point = previous.get('position')
-                jump = (independent is not None and old_point is not None
-                        and math.hypot(independent[0].x - old_point[0],
-                                       independent[0].y - old_point[1])
-                        > self.config.get('verify_completed_cluster_radius', 20.0))
-                clearly_far = (independent is not None and all(
-                    math.hypot(independent[0].x - entry['center'].point.x,
-                               independent[0].y - entry['center'].point.y)
-                    > entry['radius'] + entry['uncertainty'] + independent[1]
-                    + entry['core_radius'] for entry in clusters))
-                if not jump and not clearly_far:
-                    # A continuous previously completed component does not
-                    # become a new site through a small border/parallax shift.
-                    # This changes association only, never the fixed footprint.
+                in_band = any(math.hypot(independent[0].x - entry['center'].point.x,
+                                         independent[0].y - entry['center'].point.y)
+                              <= entry['core_radius'] + entry['uncertainty'] + independent[1]
+                              + self.config.get('verify_completed_cluster_buffer', 5.0)
+                              for entry in clusters)
+                if (in_band and old_point is not None
+                        and math.dist(_coordinates(independent[0]), old_point)
+                        <= self.config.get('verify_completed_cluster_buffer', 5.0)):
                     matched = True
-            count = (0 if matched else previous.get('outside', 0) + 1 if continuous else 1)
+            outside = not matched and (not ambiguous or permission)
+            count = ((previous.get('outside', 0) + 1 if continuous else 1) if outside else 0)
             required = self.config.get('verify_completed_outside_frames', 3)
-            decision = 'completed' if matched else 'novel' if count >= required else 'pending'
+            decision = ('completed' if matched else 'ambiguous' if ambiguous and not permission
+                        else 'novel' if count >= required else 'pending')
             history[key] = {'source': source, 'frame': frame, 'identity': identity,
                             'direction': direction, 'stamp': stamp, 'outside': count,
                             'decision': decision,
                             'position': _coordinates(independent[0]) if independent else None}
             history.move_to_end(key)
-            limit = self.config.get('verify_completed_candidate_history', 128)
-            while len(history) > limit:
+            while len(history) > self.config.get('verify_completed_candidate_history', 128):
                 history.popitem(last=False)
+        reason = ('measured position or inspected image coverage' if matched else
+                  'bounded alternate-view investigation' if permission else
+                  'projected completed area overlaps this component' if ambiguous else
+                  'component is spatially separated from completed coverage')
+        self._completed_association_diagnostic(
+            source, decision, overlaps[0]['site_id'] if overlaps else 0, reason)
         return decision
+
+    def _completed_candidate_priority(self, message, source):
+        """Prefer visibly uninspected components; uncertain depth only affects ordering.
+
+        A synthetic anchor at the smoke-wall depth is never identity proof. Its
+        projected coverage is widened with observer translation and used only
+        to choose among already eligible candidates during a bounded follow-up.
+        """
+        if self._completed_candidate_decision(message, source) != 'novel':
+            return 3, 0.0
+        ray = self._completed_planning_ray(message, source)
+        if ray is None:
+            return 3, 0.0
+        origin, direction, _ = ray
+        if self._completed_independent_point(message, source) is not None:
+            return 0, 0.0
+        with self._data_lock:
+            clusters = [{**{name: entry[name] for name in (
+                'site_id', 'radius', 'core_radius', 'uncertainty', 'front_normal')},
+                'center': deepcopy(entry.get('wall_point', entry['center'])),
+                'views': {kind: [{name: deepcopy(view[name]) for name in (
+                    'anchor', 'horizontal', 'vertical', 'origin', 'direction', 'localized')}
+                                for view in entries]
+                          for kind, entries in entry['views'].items()}}
+                for entry in self._completed_clusters if source != 'fire' or entry['fire_found']]
+        extents = self._completed_candidate_extents(message, source, direction)
+        overlaps = [entry for entry in clusters if self._completed_projected_overlap(
+            entry, origin, direction, extents)]
+        if not overlaps:
+            return 0, 0.0
+        yaw = math.atan2(direction[1], direction[0])
+        elevation = math.atan2(direction[2], math.hypot(*direction[:2]))
+        margin = self.config.get('verify_completed_projection_margin', math.radians(3.0))
+        scores = []
+        for cluster in overlaps:
+            views = cluster['views'].get(source, ())
+            if not views and source == 'smoke':
+                views = cluster['views'].get('fire', ())
+            for view in views:
+                relative = tuple(a - b for a, b in zip(view['anchor'], _coordinates(origin)))
+                depth = math.hypot(*relative)
+                if depth <= 1e-6 or sum(a * b for a, b in zip(relative, direction)) <= 0:
+                    continue
+                uncertainty = cluster['uncertainty']
+                if not view['localized']:
+                    uncertainty += math.dist(_coordinates(origin), view['origin'])
+                padding = margin + math.atan2(uncertainty, depth)
+                horizontal = abs(math.remainder(
+                    yaw - math.atan2(relative[1], relative[0]), 2 * math.pi))
+                vertical = abs(elevation - math.atan2(relative[2], math.hypot(*relative[:2])))
+                scores.append(max(horizontal / (padding + extents[0] + view['horizontal']),
+                                  vertical / (padding + extents[1] + view['vertical'])))
+        # Large separation is a selection preference, never a permanent veto.
+        separation = min(scores, default=2.0)
+        return (1 if separation > 1.0 else 2), -min(separation, 100.0)
 
     def _verify_is_completed_detection(self, message, source):
         """Identify completed sources without reading filtered controller observations."""
         return self._completed_candidate_decision(message, source) == 'completed'
 
     def _verify_candidate_is_eligible(self, message, source):
-        """Withhold completed/border-pending candidates while allowing unknown re-observation."""
-        return self._completed_candidate_decision(message, source) in ('novel', 'unknown')
+        """Missing association with saved clusters waits for a fresh source-time transform."""
+        return self._completed_candidate_decision(message, source) == 'novel'
 
     def _verify_defer_viewpoint(self):
         """Remember an inconclusive goal's viewpoint without inventing a source range."""
@@ -518,8 +772,20 @@ class CompletedSitesMixin:
                    for message in (candidates(source) if candidates else
                                    [self._completed_raw_observation(source)])]
         visible = [(source, message) for source, message in sources if message is not None]
-        return bool(visible) and all(
-            not self._verify_candidate_is_eligible(message, source) for source, message in visible)
+        decisions = [(source, self._completed_candidate_decision(message, source))
+                     for source, message in visible]
+        if not decisions or any(decision == 'novel' for _, decision in decisions):
+            return False
+        # Camera frames can precede their bracketing odometry. Such a newest
+        # frame cannot erase a still-fresh earlier association, or qualify alone.
+        waiting = {source for source, decision in decisions
+                   if decision in ('unknown', 'pending')}
+        for source in waiting:
+            getter = getattr(self._verify, 'fresh_' + source, None)
+            accepted = getter() if getter is not None else None
+            if accepted is not None and self._verify_candidate_is_eligible(accepted, source):
+                return False
+        return True
 
     def _completed_report_point(self, report, source):
         point = getattr(report, source + '_planning_position', None)
@@ -535,55 +801,72 @@ class CompletedSitesMixin:
             return None
         return point, uncertainty
 
+    def _completed_report_match(self, report):
+        """Match authoritative confirmed wall coordinates before any report/ID publication."""
+        measured = self._completed_report_point(report, 'smoke')
+        if measured is None or not getattr(report, 'smoke_wall_confirmed', False):
+            return None
+        wall, _ = measured
+        with self._data_lock:
+            self._completed_clock_locked()
+            matches = [(math.hypot(entry['wall_point'].point.x - wall.point.x,
+                                   entry['wall_point'].point.y - wall.point.y), entry)
+                       for entry in self._completed_clusters]
+            matches = [(distance, entry) for distance, entry in matches
+                       if distance <= entry['core_radius']]
+            if not matches:
+                return None
+            entry = min(matches, key=lambda pair: pair[0])[1]
+            return deepcopy({name: entry[name] for name in (
+                'site_id', 'fire_found', 'wall_point', 'core_radius', 'uncertainty')})
+
     def _completed_report_views(self, report, center, message, source):
-        """Keep both image-time contexts; view anchors are association aids, not source fixes."""
+        """Keep bounded coverage for selected and nearby confirmed image components."""
         result = {'smoke': [], 'fire': []}
         context = getattr(self, '_verify_report_completion_context', None)
+        candidates = getattr(self._verify, 'raw_candidates', None)
         for kind in ('smoke', 'fire'):
-            observation = (context.get(kind) if context is not None
-                           else self._completed_raw_observation(kind))
-            if observation is None and kind == source:
-                observation = message
-            if observation is None:
-                continue
-            if (kind == 'fire' and int(getattr(report, 'track_id', 0))
-                    and int(getattr(report, 'track_id', 0))
-                    != int(getattr(observation, 'track_id', 0))):
-                continue
-            ray = self._completed_planning_ray(observation, kind)
-            if ray is None:
-                continue
-            origin, direction, observer = ray
-            known = self._completed_report_point(report, kind)
-            if known is not None and kind == 'fire':
-                anchor = _coordinates(known[0].point)
-            else:
-                # A saved image ray needs a finite reference depth for later
-                # parallax. Use the measured cluster depth only as a narrow
-                # association guide; never publish it as a localized fire.
-                depth = math.dist(_coordinates(origin), _coordinates(center.point))
+            selected = (context.get(kind) if context is not None
+                        else self._completed_raw_observation(kind))
+            if selected is None and kind == source:
+                selected = message
+            observations = [selected] if selected is not None else []
+            if candidates is not None:
+                observations.extend(candidate for candidate in candidates(kind)[:16]
+                                    if candidate != selected)
+            for observation in observations:
+                if (observation == selected and kind == 'fire'
+                        and int(getattr(report, 'track_id', 0))
+                        and int(report.track_id) != int(getattr(observation, 'track_id', 0))):
+                    continue
+                ray = self._completed_planning_ray(observation, kind)
+                if ray is None:
+                    continue
+                origin, direction, observer = ray
                 relative = tuple(a - b for a, b in zip(
                     _coordinates(center.point), _coordinates(origin)))
-                if depth <= 1e-6 or _angle(relative, direction) > math.radians(30.0):
+                depth = math.hypot(*relative)
+                horizontal, vertical = self._completed_candidate_extents(
+                    observation, kind, direction)
+                if (depth <= 1e-6 or _angle(relative, direction)
+                        > math.radians(30.0) + min(horizontal, math.radians(30.0))):
                     continue  # Do not attach an unrelated side plume to this report.
-                anchor = tuple(value + depth * component
-                               for value, component in zip(_coordinates(origin), direction))
-            horizontal = vertical = 0.0
-            if getattr(observation, 'angular_bounds_valid', False):
-                bounds = [getattr(observation, name, math.nan) for name in (
-                    'yaw_min_rad', 'yaw_max_rad', 'vertical_min_rad', 'vertical_max_rad')]
-                if all(math.isfinite(value) for value in bounds):
-                    horizontal = min(math.radians(30.0), max(
-                        abs(bounds[0] - observation.yaw_correction_rad),
-                        abs(bounds[1] - observation.yaw_correction_rad)))
-                    vertical = min(math.radians(30.0), max(
-                        abs(bounds[2] - observation.vertical_correction_rad),
-                        abs(bounds[3] - observation.vertical_correction_rad)))
-            result[kind].append({
-                'message': deepcopy(observation), 'origin': _coordinates(origin),
-                'direction': direction, 'observer': _coordinates(observer), 'anchor': anchor,
-                'horizontal': horizontal, 'vertical': vertical,
-            })
+                known = self._completed_report_point(report, kind)
+                localized = (known is not None and kind == 'fire'
+                             and observation == selected)
+                anchor = (_coordinates(known[0].point) if localized else
+                          tuple(value + depth * component for value, component
+                                in zip(_coordinates(origin), direction)))
+                # A finite anchor helps project image coverage after movement;
+                # only independently localized coordinates establish identity.
+                result[kind].append({
+                    'message': deepcopy(observation), 'origin': _coordinates(origin),
+                    'direction': direction, 'observer': _coordinates(observer), 'anchor': anchor,
+                    'localized': localized, 'horizontal': min(math.radians(30.0), horizontal),
+                    'vertical': min(math.radians(30.0), vertical),
+                })
+                if len(result[kind]) >= 4:
+                    break
         return result
 
     def _completed_wall_direction(self, report, wall):
@@ -650,7 +933,6 @@ class CompletedSitesMixin:
             else:
                 # Never move or expand a historical center by chaining nearby
                 # reports; only enrich that fixed cluster's source contexts.
-                previous['site_id'] = entry['site_id']
                 previous['fire_found'] |= entry['fire_found']
                 previous['reports'] = (previous['reports'] + entry['reports'])[-2:]
                 for kind in views:

@@ -183,3 +183,54 @@ def test_negative_inspection_keeps_three_views_without_repeating_wall_probes(sys
     report = next(event for event in executive.events if event[0] == 'inspection_report')
     assert report[-1] == 3
     assert report[2] is None
+
+
+@pytest.mark.parametrize('operation', ['center_fire', 'search_fire'])
+@pytest.mark.parametrize('previous_fire', [False, True])
+def test_known_measured_cluster_leaves_without_another_search_or_report(
+        system, operation, previous_fire):
+    executive, controller = system
+    board = confirmed(system)
+    matched = []
+
+    def match(report):
+        matched.append(report)
+        return {'site_id': 7, 'fire_found': previous_fire}
+
+    executive._completed_report_match = match
+    executive._verify_opportunistic_wall = no_wall_rpc
+    executive._verify_prepare_wall_observation = no_wall_rpc
+    assert getattr(controller, operation)(board) == 'depart'
+    result = board['verify_completed_report']
+    assert result.site_id == 7 and result.fire_found == previous_fire
+    assert result.status == ('fire_found' if previous_fire else 'fire_not_found')
+    assert matched[0].smoke_planning_position == board['verify_report_wall']['nearest_point']
+    assert not any(event[0] in {'inspection_report', 'plan', 'hold'}
+                   for event in executive.events)
+
+
+def test_known_negative_cluster_still_allows_a_genuine_fire_upgrade(system):
+    executive, controller = system
+    board = confirmed(system)
+    feed_fire(executive, controller)
+    executive._completed_report_match = lambda report: {'site_id': 7, 'fire_found': False}
+    assert not controller._completed_arrival(board)
+    with pytest.raises(RuntimeError, match='does not exist'):
+        board['verify_completed_report']
+
+
+@pytest.mark.parametrize('damage', ['unconfirmed', 'wrong_frame', 'same_stamp', 'not_finite'])
+def test_invalid_retained_wall_cannot_skip_new_inspection(system, damage):
+    executive, controller = system
+    board = confirmed(system)
+    wall = board['verify_report_wall']
+    if damage == 'unconfirmed':
+        wall['confirmed'] = False
+    elif damage == 'wrong_frame':
+        wall['nearest_point'].header.frame_id = 'other_map'
+    elif damage == 'same_stamp':
+        wall['confirmation_stamps'] = (wall['map_stamp_ns'], wall['map_stamp_ns'])
+    else:
+        wall['nearest_point'].point.x = math.nan
+    executive._completed_report_match = lambda report: pytest.fail('Invalid wall was matched')
+    assert not controller._completed_arrival(board)

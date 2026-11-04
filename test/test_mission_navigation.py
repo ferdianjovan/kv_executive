@@ -943,3 +943,27 @@ def test_committed_fire_timeout_starts_after_offboard_preparation(executive):
     executive.on_warmup = lambda: setattr(executive, 'now', executive.now + 70.0)
     assert executive._verify_plan_to(pose(1.0), maximum_path_length=12.0, motion_timeout=60.0)
     assert executive.state.mode == 'AUTO.LOITER'
+
+
+def test_fire_upgrade_reuses_cluster_identity_and_replaces_legacy_viewpoint(executive):
+    first = executive._verify_record_fire(fire(executive), 0.4, publish=False)
+    executive._site_sequence = 7
+    executive._verify_publish_fire_report(first, site_id=3)
+    replacement = deepcopy(first)
+    replacement.bearing_rad = 0.8
+    executive._verify_publish_fire_report(replacement, site_id=3)
+    assert executive._site_sequence == 7
+    assert [report.site_id for report in executive._fire_sites] == [3]
+    assert executive._fire_sites[0].bearing_rad == 0.8
+    assert executive._fire_sites[0] is not replacement
+    assert len([e for e in executive.events if e[0] == 'report']) == 2
+
+
+@pytest.mark.parametrize('invalid', [0, -1, True, 1.0, 2 ** 64, '3'])
+def test_fire_upgrade_rejects_invalid_retained_identity_before_commit(executive, invalid):
+    report = executive._verify_record_fire(fire(executive), 0.4, publish=False)
+    with pytest.raises(ValueError, match='Retained site identity'):
+        executive._verify_publish_fire_report(report, site_id=invalid)
+    assert executive._site_sequence == 0
+    assert not executive._fire_sites
+    assert not any(e[0] == 'report' for e in executive.events)

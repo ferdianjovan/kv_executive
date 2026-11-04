@@ -12,6 +12,7 @@ import time
 from kv_executive.inspection_navigation import smoke_wall_standoff_reached
 from kv_executive.inspection_report_view import retained_wall_valid
 from kv_executive.mission_geometry import yaw_from_quaternion
+from kv_executive.msg import InspectionReport
 from yasmin import State, StateMachine
 
 
@@ -163,6 +164,9 @@ class VerifyController:
             self._last_stamps = {'smoke': 0, 'fire': 0}
             self._raw_primary = {'smoke': None, 'fire': None}
             self._candidate_arrays = {'smoke': None, 'fire': None}
+            self._raw_observation_info = {
+                source: {'received': 0, 'received_at': None, 'stamp_ns': 0}
+                for source in ('smoke', 'fire')}
             self._active_target = None
             self._fire_start_ns = 0
             self._fire_frames = 0
@@ -282,6 +286,14 @@ class VerifyController:
 
     def _receive(self, message, source, *, replace_same_stamp=False, received_at=None):
         if not self._candidate_eligible(message, source):
+            with self._lock:
+                current = self._fresh_locked(source)
+            if not self._retain_pending_association([message], source, current):
+                with self._lock:
+                    self._observations[source] = None
+                    if source == 'fire':
+                        self._fire_frames = 0
+                        self._fire_reference = None
             return
         arrival = time.monotonic() if received_at is None else received_at
         if not 0.0 <= time.monotonic() - arrival <= self.config['verify_observation_timeout']:
@@ -362,6 +374,7 @@ class VerifyController:
         """Explain missing guidance without printing on every detector frame."""
         with self._lock:
             info = dict(self._observation_info[source])
+            raw = dict(self._raw_observation_info[source])
             observation = self._observations[source]
             reason = info['reason']
             if observation is not None:
@@ -387,14 +400,23 @@ class VerifyController:
                     f'detector_persistence={info["detector_persistence"]:.2f}s, '
                     f'detector_track={info["detector_track"]}, '
                     f'reset={self._fire_reset_reason}')
+        raw_details = ''
+        if raw['received_at'] is not None:
+            raw_details = (
+                f'; raw_received={raw["received"]}, '
+                f'raw_image_age={(self._now_ns() - raw["stamp_ns"]) / 1e9:.2f}s, '
+                f'raw_receive_gap={time.monotonic() - raw["received_at"]:.2f}s')
         if info['received_at'] is None:
+            if raw_details:
+                return f'{source}: no eligible messages; source filtered by target association' \
+                    + raw_details
             return f'{source}: no messages received'
         age = (self._now_ns() - info['stamp_ns']) / 1e9
         gap = time.monotonic() - info['received_at']
         return (
             f'{source}: {reason}; received={info["received"]}, accepted={info["accepted"]}, '
             f'status={info["status"]}, detected={info["detected"]}, '
-            f'image_age={age:.2f}s, receive_gap={gap:.2f}s{persistence}'
+            f'image_age={age:.2f}s, receive_gap={gap:.2f}s{persistence}{raw_details}'
         )
 
     def smoke_callback(self, message):
@@ -441,6 +463,7 @@ class VerifyController:
         self._active_target = None
 
     def _primary_callback(self, message, source):
+        self._record_raw_observation(message, source)
         with self._lock:
             if self._valid_stamp(message) is not None:
                 previous = self._raw_primary[source]
@@ -450,6 +473,14 @@ class VerifyController:
         if (array is None
                 or time.monotonic() - array[1] > self.config['verify_observation_timeout']):
             self._receive(message, source)
+
+    def _record_raw_observation(self, message, source):
+        """Keep reception visible even when completed-site filtering withholds guidance."""
+        with self._lock:
+            info = self._raw_observation_info[source]
+            info['received'] += 1
+            info['received_at'] = time.monotonic()
+            info['stamp_ns'] = self._stamp_ns(message)
 
     def raw_candidates(self, source):
         """Expose fresh observations for association without recursive target filtering."""
@@ -470,6 +501,7 @@ class VerifyController:
         """Select an eligible component; a completed primary cannot hide its neighbours."""
         if source not in ('smoke', 'fire') or len(array.detections) > 16:
             return None
+        self._record_raw_observation(array, source)
         stamp = self._stamp_ns(array)
         if self._valid_stamp(array) is None:
             return None
@@ -485,23 +517,40 @@ class VerifyController:
             current = self._fresh_locked(source)
         eligible = [m for m in candidates if self._candidate_eligible(m, source)]
         if not eligible:
+            if self._retain_pending_association(candidates, source, current):
+                return None
             with self._lock:
                 self._observations[source] = None
                 if source == 'fire':
                     self._fire_frames = 0
                     self._fire_reference = None
             return None
-        selected = eligible[0]
-        if current is not None:
-            selected = min(eligible, key=lambda m: (
-                0 if source == 'fire' and m.track_id == current.track_id else 1,
-                abs(m.yaw_correction_rad - current.yaw_correction_rad)))
+        selected = self._select_candidate(eligible, source, current)
         with self._lock:
             same = self._fresh_locked(source)
             duplicate = same is not None and same == selected
         if not duplicate:
             self._receive(selected, source, replace_same_stamp=True)
         return deepcopy(selected)
+
+    def _retain_pending_association(self, messages, source, current):
+        """Keep an older valid image through TF latency without renewing its receipt age."""
+        decision = getattr(self.executive, '_completed_candidate_decision', None)
+        return (bool(messages) and current is not None and decision is not None
+                and self._candidate_eligible(current, source)
+                and all(decision(message, source) in ('unknown', 'pending')
+                        for message in messages))
+
+    def _select_candidate(self, candidates, source, current):
+        """Prefer uninspected coverage before applying existing track continuity."""
+        priority = getattr(self.executive, '_completed_candidate_priority', lambda *_: 0)
+        return min(enumerate(candidates), key=lambda item: (
+            priority(item[1], source),
+            0 if current is not None and source == 'fire'
+            and item[1].track_id == current.track_id else 1,
+            abs(item[1].yaw_correction_rad - current.yaw_correction_rad)
+            if current is not None else 0.0,
+            item[0]))[1]
 
     def _fresh_locked(self, source):
         observation = self._observations[source]
@@ -523,11 +572,7 @@ class VerifyController:
                       and self._candidate_eligible(m, source)]
         if not candidates:
             return
-        selected = candidates[0]
-        if current is not None:
-            selected = min(candidates, key=lambda m: (
-                0 if source == 'fire' and m.track_id == current.track_id else 1,
-                abs(m.yaw_correction_rad - current.yaw_correction_rad)))
+        selected = self._select_candidate(candidates, source, current)
         with self._lock:
             array = self._candidate_arrays[source]
             primary = self._raw_primary[source]
@@ -1987,6 +2032,8 @@ class VerifyController:
     def center_fire(self, blackboard):
         """Inspect only after fresh near-wall confirmation; revalidate moving smoke."""
         self._check()
+        if self._completed_arrival(blackboard):
+            return 'depart'
         try:
             self._inspection_guard(blackboard)
             if not self._prepare_wall_observation(blackboard):
@@ -2243,6 +2290,9 @@ class VerifyController:
 
     def search_fire(self, blackboard):
         """Revalidate near-wall evidence before entering final inspection."""
+        self._check()
+        if self._completed_arrival(blackboard):
+            return 'depart'
         self._check_inspection_deadline(blackboard)
         try:
             if self._recover_fire_height(blackboard):
@@ -2276,10 +2326,43 @@ class VerifyController:
         report = _bb_get(blackboard, 'verify_completed_report', None)
         if report is None:
             raise self.error_type('DEPART_SITE: no completed inspection report')
+        consume = getattr(self.executive, '_completed_followup_consume', None)
+        if consume is not None:
+            consume()
         self.release_inspection_target()
         self.executive._verify_depart_completed_site(report, guard=self._check)
         blackboard['verify_completed_report'] = None
+        blackboard['verify_followup_handoff'] = True
         return 'explore'
+
+    def _completed_arrival(self, blackboard):
+        """Leave an already inspected measured cluster before spending another search budget."""
+        match = getattr(self.executive, '_completed_report_match', None)
+        wall = self._report_wall(blackboard)
+        if match is None or wall is None:
+            return False
+        report = InspectionReport(
+            smoke_wall_confirmed=True, smoke_location_valid=True,
+            smoke_planning_position=deepcopy(wall['nearest_point']),
+            smoke_uncertainty_m=float(wall['uncertainty']))
+        existing = match(report)
+        if existing is None:
+            return False
+        # A genuine fire can upgrade an earlier negative inspection. Its
+        # persistence/visibility and normal reporting checks still apply.
+        if not existing['fire_found'] and (
+                self.stable_fire() is not None or self.had_fire_confirmation()):
+            return False
+        report.site_id = existing['site_id']
+        report.fire_found = existing['fire_found']
+        report.status = 'fire_found' if report.fire_found else 'fire_not_found'
+        report.evidence_status = 'Existing completed site; no new inspection report published'
+        self.executive._verify_report_was_published = False
+        blackboard['verify_completed_report'] = report
+        self.executive._report(
+            f'Verify: confirmed arrival matches completed site {report.site_id}; '
+            'resuming departure without another inspection or report')
+        return True
 
 
 _FINAL_OUTCOMES = ['explore', 'aborted', 'canceled', 'return_requested']

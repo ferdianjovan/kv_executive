@@ -1591,6 +1591,27 @@ class InspectionNavigationMixin(
                 'source': 'smoke', 'target_valid': True,
                 'method': 'confirmed_smoke_wall_nearest_hit'}
 
+    def _inspection_completed_match(self, report):
+        """Consult measured completed walls without starting another ranging query."""
+        match = getattr(self, '_completed_report_match', None)
+        return match(report) if match is not None else None
+
+    def _inspection_duplicate_result(self, report, completed):
+        """Return a departure identity, never a newly published duplicate finding."""
+        if completed is None or (report.fire_found and not completed['fire_found']):
+            return None  # A confirmed fire can upgrade an earlier negative inspection.
+        from kv_executive.msg import InspectionReport
+        result = InspectionReport(
+            header=deepcopy(report.header), site_id=int(completed['site_id']),
+            fire_found=bool(completed['fire_found']),
+            status='fire_found' if completed['fire_found'] else 'fire_not_found',
+            evidence_status='Already completed; duplicate inspection was not published')
+        self._verify_report_was_published = False
+        self._report(f'Verify: duplicate inspection withheld for completed site '
+                     f'{result.site_id}; retained result={result.status}; '
+                     'departing without a new report or site identity')
+        return result
+
     def _verify_report_inspection(
         self, smoke_geometry, fire_message=None, attempts=1, *, wall=None, guard=None,
     ):
@@ -1598,6 +1619,7 @@ class InspectionNavigationMixin(
         from kv_executive.mission_executive import MissionError
         from kv_executive.msg import InspectionReport
         from kv_executive.verification import VerificationObservationLost
+        self._verify_report_was_published = False
         if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 3:
             raise MissionError('Inspection attempts must be between one and three')
 
@@ -1622,7 +1644,7 @@ class InspectionNavigationMixin(
             raise VerificationObservationLost('No-fire inspection attempts are incomplete')
 
         def visual_smoke_valid():
-            smoke = self._verify.fresh_smoke()
+            smoke = self._inspection_report_smoke(retained_wall)
             return (self._inspection_detection_valid(smoke, 'smoke')
                     and _stamp_ns(smoke) > view_after_ns
                     and self._verify_wall_observation_ready()
@@ -1656,7 +1678,7 @@ class InspectionNavigationMixin(
         else:
             if self._verify.stable_fire() is not None:
                 raise VerificationObservationLost('Fire became persistent during no-fire report')
-            if self._verify.fresh_smoke() is None:
+            if self._inspection_report_smoke(retained_wall) is None:
                 raise VerificationObservationLost(
                     'Smoke disappeared while locating inspection target')
         fix = self._inspection_fresh_fix()
@@ -1697,6 +1719,14 @@ class InspectionNavigationMixin(
             report.header.stamp, retained=True)
         self._inspection_target_fields(
             report, 'fire', fire_geometry, fix, odometry.pose.pose, report.header.stamp)
+        # A confirmed retained wall supplies a spatial identity independent of
+        # detector track IDs or temporary fire loss. Stop before preparing a
+        # legacy report or capturing images for an already completed finding.
+        check()
+        duplicate = self._inspection_duplicate_result(
+            report, self._inspection_completed_match(report))
+        if duplicate is not None:
+            return duplicate
         legacy = None
         if report.fire_found:
             latest = self._verify.stable_fire()
@@ -1754,7 +1784,7 @@ class InspectionNavigationMixin(
             if self._verify.had_fire_confirmation():
                 raise VerificationObservationLost(
                     'Confirmed fire was observed during this inspection; no-fire result withheld')
-            current_smoke = self._verify.fresh_smoke()
+            current_smoke = self._inspection_report_smoke(retained_wall)
             if latest is not None or current_smoke is None:
                 raise VerificationObservationLost(
                     'Smoke or no-fire evidence changed before publishing')
@@ -1789,6 +1819,13 @@ class InspectionNavigationMixin(
                     'Invalid current fire source count before publishing inspection')
             report.source_count = source_count
         check()
+        # Viewing and image capture can block. Recheck the registry at the
+        # commit boundary, before either publisher or site-ID allocation.
+        completed = self._inspection_completed_match(report)
+        duplicate = self._inspection_duplicate_result(report, completed)
+        if duplicate is not None:
+            return duplicate
+        retained_site_id = int(completed['site_id']) if completed is not None else None
         if legacy is not None and fix is not None:
             legacy.header = deepcopy(report.header)
             legacy.local_pose = deepcopy(report.observer_local_pose)
@@ -1798,16 +1835,24 @@ class InspectionNavigationMixin(
             legacy.bearing_rad = float(math.remainder(
                 yaw_from_quaternion(odometry.pose.pose.orientation) + latest.yaw_correction_rad,
                 math.tau))
-            report.site_id = int(self._verify_publish_fire_report(legacy).site_id)
+            published = (self._verify_publish_fire_report(legacy)
+                         if retained_site_id is None else
+                         self._verify_publish_fire_report(legacy, site_id=retained_site_id))
+            report.site_id = int(published.site_id)
+        elif retained_site_id is not None:
+            report.site_id = retained_site_id
+            with self._data_lock:
+                self._site_sequence = max(self._site_sequence, retained_site_id)
         else:
             with self._data_lock:
                 self._site_sequence += 1
                 report.site_id = self._site_sequence
         self._inspection_report_publisher.publish(report)
+        self._verify_report_was_published = True
         complete = getattr(self, '_verify_complete_site', None)
         if complete is not None:
             self._verify_report_completion_context = {
-                'smoke': deepcopy(self._verify.fresh_smoke()),
+                'smoke': deepcopy(self._inspection_report_smoke(retained_wall)),
                 'fire': deepcopy(latest) if report.fire_found else None,
                 'planning_to_local': deepcopy(conversion)}
             if retained_wall.get('map_origin') is not None:

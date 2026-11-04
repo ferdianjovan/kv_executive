@@ -40,9 +40,56 @@ def retained_wall_valid(wall, planning_frame, maximum_uncertainty=2.0):
 class InspectionReportViewMixin:
     """Look from the current pose without moving a historical wall estimate."""
 
+    def _inspection_report_smoke(self, retained_wall=None):
+        """Read report-only visual evidence without reopening a completed navigation target."""
+        controller = self._verify
+        selected = controller.fresh_smoke()
+        if selected is not None:
+            return selected
+        retained_wall = (retained_wall if retained_wall is not None else
+                         getattr(self, '_verify_retained_report_wall', None))
+        if not retained_wall_valid(
+                retained_wall, self.config['verify_planning_frame'],
+                self.config.get('verify_inspection_max_uncertainty', 2.0)):
+            return None
+        candidates = getattr(controller, 'raw_candidates', None)
+        planning_ray = getattr(self, '_completed_planning_ray', None)
+        if candidates is None or planning_ray is None:
+            return None
+        wall = retained_wall['nearest_point'].point
+        tolerance = self.config.get('verify_report_view_yaw_tolerance', math.radians(30.0))
+        matches = []
+        for message in candidates('smoke'):
+            if not self._inspection_detection_valid(message, 'smoke'):
+                continue
+            ray = planning_ray(message, 'smoke')
+            if ray is None:
+                continue
+            origin, direction, _ = ray
+            relative = tuple(getattr(wall, axis) - getattr(origin, axis) for axis in 'xyz')
+            if sum(a * b for a, b in zip(relative, direction)) <= 0.0:
+                continue
+            # Smoke can rise far above the nearest wall hit. Require the same
+            # horizontal source direction; do not demand a ground-height blob.
+            difference = abs(math.remainder(
+                math.atan2(direction[1], direction[0])
+                - math.atan2(relative[1], relative[0]), math.tau))
+            half_width = 0.0
+            extents = getattr(self, '_completed_candidate_extents', None)
+            if extents is not None:
+                half_width = min(math.radians(30.0), extents(message, 'smoke', direction)[0])
+            elif getattr(message, 'angular_bounds_valid', False):
+                bounds = (message.yaw_min_rad, message.yaw_max_rad)
+                if all(math.isfinite(value) for value in bounds):
+                    half_width = min(math.radians(30.0), max(
+                        abs(value - message.yaw_correction_rad) for value in bounds))
+            if difference <= tolerance + half_width:
+                matches.append((difference, message))
+        return deepcopy(min(matches, key=lambda item: item[0])[1]) if matches else None
+
     def _verify_report_camera_frame(self, retained_wall):
         controller = self._verify
-        smoke = controller.fresh_smoke()
+        smoke = self._inspection_report_smoke(retained_wall)
         if smoke is not None and smoke.header.frame_id:
             return smoke.header.frame_id
         lock = getattr(controller, '_lock', None)
@@ -149,7 +196,7 @@ class InspectionReportViewMixin:
             if not self._verify_wall_observation_ready():
                 raise VerificationObservationLost(
                     'Report viewpoint moved before visual confirmation')
-            smoke = self._verify.fresh_smoke()
+            smoke = self._inspection_report_smoke(retained_wall)
             if (self._inspection_detection_valid(smoke, 'smoke')
                     and _stamp_ns(smoke) > after_ns):
                 return smoke

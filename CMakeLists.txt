@@ -154,6 +154,8 @@ if(BUILD_TESTING)
     smoke_navigation_sparse_terrain test/test_smoke_navigation_sparse_terrain.py TIMEOUT 45)
   ament_add_pytest_test(source_localization test/test_source_localization.py TIMEOUT 45)
   ament_add_pytest_test(completed_sites test/test_completed_sites.py TIMEOUT 45)
+  ament_add_pytest_test(completed_followup test/test_completed_followup.py TIMEOUT 45)
+  ament_add_pytest_test(completed_site_workflow test/test_completed_site_workflow.py TIMEOUT 45)
   # Repeated Exploration cycles, parent-state requests, and simulated FCU recovery.
   ament_add_pytest_test(mission_action test/test_mission_action.py TIMEOUT 300)
   # the following line skips the linter which checks for copyrights

@@ -425,11 +425,20 @@ class VerifyNavigationMixin:
         report.source_count = current_count
         return self._verify_publish_fire_report(report) if publish else report
 
-    def _verify_publish_fire_report(self, report):
+    def _verify_publish_fire_report(self, report, *, site_id=None):
         """Commit an already validated viewpoint without another blocking operation."""
+        if site_id is not None and (isinstance(site_id, bool) or not isinstance(site_id, int)
+                                    or not 0 < site_id < 2 ** 64):
+            raise ValueError('Retained site identity must be a positive uint64')
         with self._data_lock:
-            self._site_sequence += 1
-            report.site_id = self._site_sequence
+            if site_id is None:
+                self._site_sequence += 1
+                report.site_id = self._site_sequence
+            else:
+                report.site_id = site_id
+                self._site_sequence = max(self._site_sequence, site_id)
+                self._fire_sites[:] = [old for old in self._fire_sites
+                                       if old.site_id != site_id]
             self._fire_sites.append(deepcopy(report))
             del self._fire_sites[:-100]
         self._fire_report_publisher.publish(report)

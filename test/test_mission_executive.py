@@ -2206,3 +2206,42 @@ def test_invalid_airborne_goal_aborts_without_changing_flight_mode(harness, arme
     assert harness.state.mode == mode
     assert not harness._mission_lock.locked()
     assert not any(event[0] in {'offboard', 'loiter', 'ramp'} for event in harness.events)
+
+
+def test_pending_completed_direction_is_observed_before_sweep_pose_is_captured(harness):
+    def followup(guard):
+        guard()
+        harness.events.append(('followup',))
+        harness.odometry.pose.pose = make_pose(2.0, 6.0, 5.0, 0.2)
+        return True
+
+    harness._verify_completed_followup = followup
+    harness._verify_hold = lambda seconds, guard: guard()
+    board = Blackboard()
+    harness._sweep(board)
+    assert harness.events[0] == ('followup',)
+    moves = [event for event in harness.events if event[0] == 'ramp']
+    assert len(moves) == 6
+    assert all(xyz(event[1]) == xyz(event[2]) == (2.0, 6.0, 5.0) for event in moves)
+
+
+def test_followup_cancellation_cannot_start_a_sweep(harness):
+    def followup(guard):
+        raise MissionCanceled('cancelled alternate view')
+
+    harness._verify_completed_followup = followup
+    with pytest.raises(MissionCanceled, match='alternate view'):
+        harness._sweep(Blackboard())
+    assert not harness.events
+
+
+@pytest.mark.parametrize('handoff', [False, True])
+def test_exploration_preserves_only_new_departure_followup_lease(harness, handoff):
+    consumed = []
+    harness._completed_followup_consume = lambda: consumed.append(True)
+    harness._verify_parent_entry = lambda state: None
+    board = Blackboard()
+    board['verify_followup_handoff'] = handoff
+    harness._exploration_parent_entry(board)
+    assert consumed == ([] if handoff else [True])
+    assert board['verify_followup_handoff'] is False

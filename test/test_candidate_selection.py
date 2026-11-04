@@ -439,3 +439,82 @@ def test_stable_fire_poll_alone_retries_pending_source_frame(system, monkeypatch
     frames = controller._fire_frames
     assert controller.stable_fire() == pending
     assert controller._fire_frames == frames
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+def test_filtered_source_reception_remains_visible_in_diagnostics(system, source):
+    executive, controller = system
+    executive.allow_completed = False
+    message = observation(executive, source)
+    receive_primary(executive, message, source)
+    assert fresh(controller, source) is None
+    details = controller.observation_diagnostics(source)
+    assert 'no eligible messages' in details
+    assert 'raw_received=1' in details
+    assert 'raw_receive_gap=0.00s' in details
+    assert 'raw_image_age=0.00s' in details
+    executive.now += 0.2
+    executive._detection_candidates_callback(batch(executive, source, ()), source)
+    details = controller.observation_diagnostics(source)
+    assert 'raw_received=2' in details
+    assert 'raw_image_age=0.00s' in details
+    assert controller.raw_candidates(source) == []
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+@pytest.mark.parametrize('use_array', [False, True])
+def test_unassociated_new_frame_preserves_prior_fresh_guidance_without_renewing_it(
+        system, source, use_array):
+    executive, controller = system
+    previous = observation(executive, source)
+    receive_primary(executive, previous, source)
+    previous_ns = controller._stamp_ns(previous)
+    executive._completed_candidate_decision = lambda m, _source: (
+        'novel' if controller._stamp_ns(m) == previous_ns else 'unknown')
+    executive._verify_candidate_is_eligible = lambda m, s: (
+        executive._completed_candidate_decision(m, s) == 'novel')
+    executive.now += 0.1
+    newest = observation(executive, source)
+    if use_array:
+        executive._detection_candidates_callback(batch(executive, source, (newest,)), source)
+    else:
+        receive_primary(executive, newest, source)
+    assert fresh(controller, source) == previous
+    assert controller._observation_info[source]['accepted'] == 1
+    executive.now += controller.config['verify_observation_timeout'] + 0.01
+    assert fresh(controller, source) is None
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+@pytest.mark.parametrize('decision', ['completed', 'ambiguous'])
+@pytest.mark.parametrize('use_array', [False, True])
+def test_definite_completed_coverage_revokes_prior_guidance(system, source, decision, use_array):
+    executive, controller = system
+    previous = observation(executive, source)
+    receive_primary(executive, previous, source)
+    executive._completed_candidate_decision = lambda *_: decision
+    executive._verify_candidate_is_eligible = lambda *_: False
+    executive.now += 0.1
+    newest = observation(executive, source)
+    if use_array:
+        executive._detection_candidates_callback(batch(executive, source, (newest,)), source)
+    else:
+        receive_primary(executive, newest, source)
+    assert fresh(controller, source) is None
+    assert controller._observations[source] is None
+
+
+@pytest.mark.parametrize('source', ['smoke', 'fire'])
+def test_uninspected_component_priority_precedes_existing_sticky_track(system, source):
+    executive, controller = system
+    primary = observation(executive, source)
+    receive_primary(executive, primary, source)
+    executive._completed_candidate_priority = lambda m, _source: (
+        (0, 0.0) if m.yaw_correction_rad < -0.4 else (2, 0.0))
+    for reverse in (False, True):
+        executive.now += 0.1
+        old = observation(executive, source)
+        new = observation(executive, source, yaw=-0.5, track=99)
+        messages = (new, old) if reverse else (old, new)
+        executive._detection_candidates_callback(batch(executive, source, messages), source)
+        assert fresh(controller, source) == new

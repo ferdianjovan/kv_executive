@@ -28,6 +28,7 @@ class Harness(InspectionDepartureMixin):
         self.moves = []
         self.turns = []
         self.settles = []
+        self.holds = []
         self.settle = True
         self.allow = lambda *_: True
         self.on_check = lambda: None
@@ -61,6 +62,10 @@ class Harness(InspectionDepartureMixin):
         guard()
         self.turns.append(bearing)
 
+    def _verify_hold(self, duration, guard):
+        guard()
+        self.holds.append(duration)
+
     def _verify_image_bearing(self, candidate):
         assert candidate is self.candidate
         return candidate.bearing
@@ -86,10 +91,11 @@ def test_completed_positive_and_negative_findings_depart_outward_before_explorat
     node = Harness(fire)
     node._verify_depart_completed_site(node.report)
     assert node.report.published and node.report.fire_found is fire
-    assert len(node.moves) == 4
+    assert len(node.moves) == 5
     assert node.current.position.x == pytest.approx(27.0)
-    assert all(end.x > start.x and end.z == start.z for start, end in node.moves)
-    assert node.turns[-1] == pytest.approx(0.0)
+    assert all(end.x > start.x and end.z == start.z for start, end in node.moves[:-1])
+    assert node.moves[-1][1].y - node.moves[-1][0].y == pytest.approx(3.0)
+    assert node.turns[-1] == pytest.approx(math.atan2(3.0, 27.0))
     assert node.settles[-1]['align_fire'] is False
     assert node.settles[-1]['wait_for_map'] is False
     assert any('handoff complete' in message for message in node.events)
@@ -175,8 +181,10 @@ def test_wall_front_geometry_never_forces_observer_to_retreat_before_exploration
     node.current.position.x = 0.0
     node.regions = [region(x=wall + 25.0, radius=25.0)]
     node._verify_depart_completed_site(node.report)
-    assert not node.moves
-    assert node.turns[-1] == pytest.approx(math.pi)
+    assert len(node.moves) == 1
+    assert node.moves[0][1].x == pytest.approx(0.0)
+    assert abs(node.moves[0][1].y) == pytest.approx(3.0)
+    assert abs(node.turns[-1]) > math.pi / 2
     assert any('handoff complete' in event for event in node.events)
     assert any(f'clearance={wall:.2f} m' in event for event in node.events)
 
@@ -191,8 +199,8 @@ def test_final_rotation_drift_requires_another_checked_exit_before_handoff():
 
     node.on_settle = drift_once
     node._verify_depart_completed_site(node.report)
-    assert len(node.settles) == 2 and len(node.moves) == 1
-    assert node.current.position.x == pytest.approx(27.8)
+    assert len(node.settles) == 2 and len(node.moves) == 2
+    assert math.hypot(node.current.position.x, node.current.position.y) >= 26.0
     assert any('drifted inside exit margin' in event for event in node.events)
     assert sum('handoff complete' in event for event in node.events) == 1
 

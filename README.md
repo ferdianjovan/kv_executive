@@ -879,9 +879,14 @@ a completed cluster does not bypass it.
 Completed clusters survive movement, new mission requests and new Verify
 episodes while the executive remains running. An actual ROS clock rewind
 clears the registry; a node restart also loses it because it is not stored on
-disk or reloaded. A later report within the core distance of a saved wall point
-enriches that fixed record without moving its wall point, direction or routing center, or
-expanding its footprint through a chain of nearby reports. The older bearing-only
+disk or reloaded. A later confirmed wall within the core distance of a saved wall
+is checked before inspection and again before either report publisher allocates
+an identity. Repeated findings reuse the saved identity for departure without
+publishing another report. A confirmed fire can upgrade an earlier negative
+inspection under the original site ID. A known positive site cannot receive a
+replacement negative finding. Upgrades enrich the fixed record without moving
+its wall point, direction or routing center, or expanding its footprint through
+a chain of nearby reports. The older bearing-only
 compatibility gate and deferred unsuccessful viewpoints still expire after 2 m
 of observer translation; that expiry does not remove measured completed clusters.
 
@@ -895,10 +900,13 @@ collision and mission-interrupt checks. Defaults are 3 m legs, at most 12 legs
 and 180 wall-clock seconds, with 1 m clearance beyond every buffered footprint.
 Each candidate path is planned and validated before turning and flying; a
 refused candidate does not trigger a separate preliminary yaw correction.
-Outside the zones, the drone turns toward an eligible source or away from
-completed space, settles, and rechecks its actual distance from every zone
-before resuming Exploration. In the example above, the drone is already outside
-the zone and need not translate merely because the report was published.
+Outside the zones, departure tries a short checked leg toward an eligible new
+source or sideways into uninspected space before another full sweep. A queued
+overlapping direction instead receives a lateral observation when a safe route
+is available. The drone settles and rechecks its actual distance from every
+zone before resuming Exploration. A blocked discretionary observation does not
+invalidate the published finding; ordinary outward escape remains mandatory
+when inside a protected footprint.
 Departure ignores completed-source steering. If no safe route exists or its
 budget expires, the mission holds in `AUTO.LOITER`; the already published inspection remains valid and available to
 the image viewer. Departure diagnostics distinguish current position/clearance
@@ -908,25 +916,62 @@ The executive also consumes `smoke/detection_candidates` and
 `fire/detection_candidates` in the drone namespace. Their arrays contain at most
 16 independently confirmed components, allowing a distinct neighboring plume
 to remain selectable when the primary detector target belongs to a completed
-cluster. Each source is filtered before guidance, recovery and reporting; a
+cluster. Each source is filtered before navigation guidance and recovery; a
 saved source cannot steal a new target's steering after a detector gap. With
-usable association, a new target needs three distinct fresh observations
-outside saved cluster associations. Duplicate images add no votes. Saved
-coordinates and image-time views support that association; a bearing alone
-does not localize a new plume. Missing image-time association permits fresh
-re-observation during Exploration, while an already bound inspection holds
-guidance until association is available. Existing primary detector topics
+usable association, a clearly separated target needs three distinct fresh
+observations. A smoke candidate's image bounds plus a 3-degree margin are projected
+against bounded completed-site coverage in the ROS map frame, using the camera
+pose and map alignment at image time. Thermal detections currently supply a
+center bearing with the margin; they do not provide angular image bounds.
+The navigation cylinders' unlimited height is not used as
+visual coverage. Projection has no 70 m cutoff and starts no LiDAR query: a
+known site farther away remains known, while image overlap alone cannot prove
+depth or clear a navigation corridor. Duplicate images add no votes. Missing
+image-time association waits for a still-fresh image to become associable,
+rather than starting another inspection with an unknown target.
+
+Overlapping directions retain bounded alternate-view tasks, independent of
+detector track IDs. This includes a possible farther plume aligned behind an
+already reported plume. Departure and subsequent Exploration sweeps schedule
+checked sideways observations around the protected zones. Defaults are a 6 m
+horizontal baseline, a 2-second observation hold, and two attempts per completed
+site/source/direction. Fire observations have priority when both streams need
+an alternate view. Successful
+settled observations grant a bounded investigation opportunity: three fresh
+ambiguous observations can become eligible, with the measured-wall duplicate
+check still protecting the old report. The opportunity expires after 60 wall
+seconds in Exploration and remains valid through its admitted Verify episode.
+Among eligible components, visibly uninspected directions take priority over
+sticky tracks associated with inspected coverage. Used directions and attempt
+counts survive new mission requests; every frame
+cannot recreate the task. No useful safe viewpoint means the task consumes a
+bounded attempt and ordinary exploration can continue. These observations give
+aligned smoke another opportunity; RGB alone cannot guarantee separating two
+plumes from every viewing angle.
+
+Report-only smoke visibility and image evidence use fresh raw observations when
+navigation has filtered a completed site, allowing a genuine negative-to-fire
+upgrade while preserving normal settled-view and source-time checks. A newer
+image waiting for its transform does not erase earlier still-fresh associated
+guidance or renew that guidance's receipt age. Explicit negative observations
+still revoke guidance. Diagnostics
+separate raw reception from eligible guidance and explain association outcomes.
+Existing primary detector topics
 remain supported when no current candidate feed is available.
 
 These candidate messages and shared planning interfaces require rebuilding
 `kv_perception` and `kv_executive` and restarting their consumers together.
 When those interfaces are already installed, the directional correction adds no
 message or service fields and only requires rebuilding `kv_executive`.
+The checkpoint before projected association and alternate-view follow-up is
+`checkpoint-before-projected-completed-site-20261104` in all three relevant
+repositories: executive `d74806f`, perception `5738d9b`, simulator `6d2796d`.
 The checkpoint before the directional zone correction is
 `checkpoint-before-directional-smoke-zone-20261104` in all relevant package
 repositories: executive `ab90314`, perception `5738d9b`, simulator `6d2796d`.
 See the [cluster departure validation report](test/reports/cluster_departure_validation_20261104.md)
-and [wall-front geometry validation](test/reports/wall_front_geometry_validation_20261104.md)
+and [wall-front geometry validation](test/reports/wall_front_geometry_validation_20261104.md),
+plus [projected completed-site validation](test/reports/projected_completed_sites_validation_20261104.md)
 for regression coverage, default limits and test scope.
 
 ### PX4 returning home during or after Exploration
