@@ -67,6 +67,48 @@ def test_escape_from_one_region_never_waives_another_completed_region():
                                  regions, Point(z=2.0))
 
 
+@pytest.mark.parametrize('wall_distance', [15.0, 20.0])
+@pytest.mark.parametrize('angle', [0.0, math.pi / 3.0, math.pi / 2.0, -math.pi / 4.0])
+def test_shifted_circle_starts_at_real_wall_and_keeps_observer_side_open(wall_distance, angle):
+    nx, ny = math.cos(angle), math.sin(angle)
+    tx, ty = -ny, nx
+    radius = 25.0
+    wall = Point(x=wall_distance * nx, y=wall_distance * ny, z=4.0)
+    circle = region(x=wall.x + radius * nx, y=wall.y + radius * ny, radius=radius)
+    assert (circle['center'].point.x - radius * nx,
+            circle['center'].point.y - radius * ny) == pytest.approx((wall.x, wall.y))
+    assert math.hypot(circle['center'].point.x, circle['center'].point.y) > radius
+    tangent = [Point(x=wall.x + side * tx, y=wall.y + side * ty, z=4.0)
+               for side in (-10.0, 10.0)]
+    assert cluster_path_safe(tangent, [circle])
+    toward_front = [
+        Point(z=4.0), Point(x=wall.x - 0.01 * nx, y=wall.y - 0.01 * ny, z=4.0)]
+    assert cluster_path_safe(toward_front, [circle])
+    for height in (4.0, 50.0):
+        through_front = [Point(x=wall.x - 0.01 * nx, y=wall.y - 0.01 * ny, z=height),
+                         Point(x=wall.x + 0.01 * nx, y=wall.y + 0.01 * ny, z=height)]
+        assert not cluster_path_safe(through_front, [circle])
+
+
+@pytest.mark.parametrize('buffer', [0.0, 5.0, 10.0])
+def test_larger_cluster_buffer_remains_tangent_to_wall_without_expanding_toward_drone(buffer):
+    wall_x = 15.0
+    radius = 20.0 + buffer
+    circle = region(x=wall_x + radius, radius=radius)
+    assert cluster_path_safe([Point(x=wall_x, y=-5.0), Point(x=wall_x, y=5.0)], [circle])
+    assert cluster_path_safe([Point(), Point(x=wall_x - 0.001)], [circle])
+    assert not cluster_path_safe([Point(x=wall_x - 0.001), Point(x=wall_x + 0.001)], [circle])
+
+
+def test_seeded_position_behind_shifted_front_keeps_existing_outward_only_escape_rule():
+    circle = region(x=40.0, radius=25.0)
+    anchor = Point(x=16.0, z=4.0)
+    outward = [anchor, Point(x=13.0, z=4.0)]
+    assert not cluster_path_safe(outward, [circle])
+    assert cluster_path_safe(outward, [circle], escape_origin=anchor)
+    assert not cluster_path_safe([anchor, Point(x=17.0, z=4.0)], [circle], escape_origin=anchor)
+
+
 class Harness(InspectionDepartureMixin, InspectionNavigationMixin):
     def __init__(self):
         self.config = {
@@ -234,7 +276,7 @@ def test_exploration_actual_to_target_cannot_cross_old_cluster_at_any_altitude(a
     node._target = path((2, 0, altitude)).poses[0].pose
     with pytest.raises(MissionError, match='remaining route enters a completed smoke cluster'):
         node._check_completed_motion()
-    assert node.escape_arguments == [None]
+    assert node.escape_arguments and all(anchor is None for anchor in node.escape_arguments)
 
 
 def test_exploration_checks_later_route_segments_beyond_the_immediate_target():
@@ -246,7 +288,7 @@ def test_exploration_checks_later_route_segments_beyond_the_immediate_target():
     node._target = deepcopy(route.poses[1].pose)
     with pytest.raises(MissionError, match='remaining route enters'):
         node._check_completed_motion()
-    assert node.escape_arguments == [None]
+    assert node.escape_arguments and all(anchor is None for anchor in node.escape_arguments)
 
 
 def test_exploration_remaining_route_supersedes_stale_previous_setpoint():
@@ -297,7 +339,7 @@ def test_exploration_rechecks_new_registry_after_offboard_priming_before_first_m
         node._execute_path({})
     assert node.events == ['offboard']
     assert node._exploration_remaining is None
-    assert node.escape_arguments == [None, None]
+    assert node.escape_arguments and all(anchor is None for anchor in node.escape_arguments)
 
 
 def test_exploration_motion_hook_rechecks_actual_drift_against_whole_remaining_route():
@@ -312,10 +354,21 @@ def test_exploration_motion_hook_rechecks_actual_drift_against_whole_remaining_r
             node.current.position = Point(y=0.9, z=4.0)
 
     node.on_fly = drift_after_first_stationary_target
-    with pytest.raises(MissionError, match='remaining route enters'):
+    with pytest.raises(
+            MissionError, match='current position is already inside completed smoke zone'):
         node._execute_path({})
     assert node.events == ['offboard', 'fly']
     assert node._exploration_remaining is None
+    assert all(anchor is None for anchor in node.escape_arguments)
+
+
+def test_exploration_current_inside_diagnostic_identifies_zone_and_signed_clearance():
+    node = ExplorationHarness()
+    node.regions = [region(site_id=7)]
+    node.current = path((0.5, 0, 4)).poses[0].pose
+    node._target = path((2, 0, 4)).poses[0].pose
+    with pytest.raises(MissionError, match=r'zone 7 \(clearance=-0.50 m\)'):
+        node._check_completed_motion()
     assert all(anchor is None for anchor in node.escape_arguments)
 
 

@@ -785,8 +785,43 @@ class MissionExecutive(
         corridor.poses = [PoseStamped(pose=deepcopy(p))
                           for p in (odometry.pose.pose, *remaining)]
         if not self._verify_cluster_path(corridor):
+            current_only = Path(header=deepcopy(corridor.header), poses=corridor.poses[:1])
+            if not self._verify_cluster_path(current_only):
+                points, _ = self._departure_map_path(current_only)
+                clearance, site_id = min((
+                    math.hypot(points[0].x - r['center'].point.x,
+                               points[0].y - r['center'].point.y) - r['radius'], r['site_id'])
+                    for r in regions)
+                raise MissionError(
+                    f'Exploration: current position is already inside completed smoke zone '
+                    f'{site_id} (clearance={clearance:.2f} m); holding')
             raise MissionError(
                 'Exploration: remaining route enters a completed smoke cluster; holding')
+
+    def _resume_completed_departure(self):
+        """Exit a retained zone before ordinary Exploration admission on an airborne retry."""
+        from types import SimpleNamespace
+        from kv_executive.mission_navigation import _inverse
+        regions = getattr(self, '_completed_cluster_regions', lambda: [])()
+        if not regions or not self._airborne_ready:
+            return
+        _, odometry = self._snapshot('AUTO.LOITER', require_armed=True)
+        current = transform_pose(odometry.pose.pose, _inverse(self._path_frame_transform(
+            self.config['verify_planning_frame']))).position
+        clearance, site_id = min((
+            math.hypot(current.x - r['center'].point.x,
+                       current.y - r['center'].point.y) - r['radius'], r['site_id'])
+            for r in regions)
+        if clearance >= self.config['verify_departure_clearance']:
+            return
+        # Publish Verify phase before any wait/motion so the ordinary
+        # Exploration guard cannot reject a sanctioned outward-only escape.
+        self._verify_parent_entry('Verify')
+        self._verify.release_inspection_target()
+        self._report(f'Verify/DEPART_SITE: resuming saved cluster {site_id} departure before '
+                     f'Exploration; clearance={clearance:.2f} m')
+        self._verify_depart_completed_site(
+            SimpleNamespace(site_id=site_id), guard=self._check_running)
 
     def _wait_until(self, predicate, timeout, description):
         deadline = time.monotonic() + timeout
@@ -1354,6 +1389,7 @@ class MissionExecutive(
                 self._snapshot('AUTO.LOITER', require_armed=True)
                 self._owns_flight = True
                 self._airborne_ready = True
+            MissionExecutive._resume_completed_departure(self)
             self._report('Exploration: started; repeating SWEEP and EXECUTE_PATH')
             self._state_machine = build_state_machine(
                 self, skip_takeoff=goal_handle.request.skip_takeoff,

@@ -534,6 +534,10 @@ def _measured_report(executive, *, center=(30.0, 0.0, 5.0), fire=True, site_id=1
         header=Header(frame_id='px4_odom', stamp=stamp(executive.seconds)),
         point=Point(**dict(zip('xyz', center))))
     report.smoke_uncertainty_m = 0.0
+    report.observer_planning_pose.header = Header(
+        frame_id='px4_odom', stamp=stamp(executive.seconds))
+    report.observer_planning_pose.pose.position = Point(x=0.0, y=0.0, z=5.0)
+    report.observer_planning_pose.pose.orientation = quaternion_from_yaw(0.0)
     executive.smoke = executive.detection('smoke')
     executive.fire = executive.detection() if fire else None
     return report
@@ -628,7 +632,7 @@ def test_delayed_report_saves_real_point_even_with_stale_passed_image(executive)
     executive.smoke = executive.detection('smoke')
     assert executive._verify_complete_site(report, message=old, source='fire')
     entry = executive._completed_clusters[0]
-    assert entry['center'] == original_point
+    assert entry['wall_point'] == original_point
     assert entry['views']['fire'][0]['message'].header.stamp == stamp(23.0)
     assert entry['views']['smoke'][0]['message'].header.stamp == stamp(23.0)
 
@@ -705,10 +709,12 @@ def test_registry_snapshot_preserves_point_stamp_and_returns_independent_copies(
     snapshot = executive._completed_cluster_snapshot()
     assert snapshot.header.frame_id == 'px4_odom'
     assert snapshot.header.stamp == stamp(30.0)
-    assert snapshot.clusters[0].center == report.smoke_planning_position
+    assert snapshot.clusters[0].center.header == report.smoke_planning_position.header
+    assert snapshot.clusters[0].center.point.x == 55.0
+    assert report.smoke_planning_position.point.x == 30.0
     assert snapshot.clusters[0].radius == 25.0
     snapshot.clusters[0].center.point.x = -900.0
-    assert executive._completed_cluster_regions()[0]['center'].point.x == 30.0
+    assert executive._completed_cluster_regions()[0]['center'].point.x == 55.0
 
 
 def test_reordered_odometry_does_not_erase_completed_registry(executive):
@@ -780,6 +786,7 @@ def test_map_cluster_is_compared_to_current_transformed_camera_ray(executive):
     report = _measured_report(executive)
     executive.config['verify_planning_frame'] = 'map'
     report.smoke_planning_position.header.frame_id = 'map'
+    report.observer_planning_pose.header.frame_id = 'map'
     executive._path_frame_transform = lambda _frame: Transform(
         translation=Vector3(x=10.0), rotation=quaternion_from_yaw(0.0))
     assert executive._verify_complete_site(report)
@@ -793,6 +800,7 @@ def test_report_transform_snapshot_and_nonblocking_candidate_hook_are_used(execu
     report = _measured_report(executive)
     executive.config['verify_planning_frame'] = 'map'
     report.smoke_planning_position.header.frame_id = 'map'
+    report.observer_planning_pose.header.frame_id = 'map'
     conversion = Transform(translation=Vector3(x=10.0), rotation=quaternion_from_yaw(0.0))
 
     def blocking_lookup(_frame):
@@ -870,3 +878,137 @@ def test_large_independent_position_jump_breaks_completed_continuity(executive):
     for index in range(3):
         candidate = _next_cluster_frame(executive, point=(130.0, 0.0, 5.0))
         assert executive._verify_candidate_is_eligible(candidate, 'fire') == (index == 2)
+
+
+def _wall_observer(report, point):
+    return PointStamped(header=deepcopy(report.smoke_planning_position.header),
+                        point=Point(**dict(zip('xyz', point))))
+
+
+@pytest.mark.parametrize('distance', [15.0, 20.0])
+@pytest.mark.parametrize('bearing', [0.0, math.pi / 2, -math.pi / 3, math.pi])
+def test_directional_routing_circle_is_entirely_behind_original_wall(
+        executive, distance, bearing):
+    observer = (11.0, -7.0, 60.0)
+    normal = math.cos(bearing), math.sin(bearing)
+    wall = (observer[0] + distance * normal[0], observer[1] + distance * normal[1], -10.0)
+    report = _measured_report(executive, center=wall)
+    original = deepcopy(report.smoke_planning_position)
+    executive._verify_report_completion_context = {
+        'wall_observer': _wall_observer(report, observer)}
+    assert executive._verify_complete_site(report)
+    entry = executive._completed_clusters[0]
+    circle = executive._completed_cluster_regions()[0]
+    center, radius = circle['center'].point, circle['radius']
+    assert radius == 25.0
+    assert (center.x, center.y, center.z) == pytest.approx(
+        (wall[0] + radius * normal[0], wall[1] + radius * normal[1], wall[2]))
+    assert entry['wall_point'] == original
+    assert report.smoke_planning_position == original
+    assert entry['front_normal'] == pytest.approx(normal)
+    assert math.hypot(center.x - observer[0], center.y - observer[1]) == pytest.approx(
+        distance + radius)
+    assert circle['center'].header == original.header
+    # Sample the core, buffer and full outer boundary in the map XY plane.
+    for radial in (0.0, 20.0, radius):
+        for step in range(64):
+            angle = step * math.tau / 64
+            point = center.x + radial * math.cos(angle), center.y + radial * math.sin(angle)
+            depth = (point[0] - wall[0]) * normal[0] + (point[1] - wall[1]) * normal[1]
+            assert depth >= -1e-12
+    before_wall = wall[0] - 0.001 * normal[0], wall[1] - 0.001 * normal[1]
+    assert math.hypot(before_wall[0] - center.x, before_wall[1] - center.y) > radius
+    assert math.hypot(wall[0] - center.x, wall[1] - center.y) == pytest.approx(radius)
+
+
+def test_retained_measurement_observer_wins_after_report_viewpoint_moves(executive):
+    report = _measured_report(executive, center=(17.0, -4.0, -10.0))
+    original = _wall_observer(report, (2.0, -4.0, 100.0))
+    executive._verify_report_completion_context = {'wall_observer': original}
+    _move_observer(executive, seconds=23.0, x=13.0, y=13.0, z=27.0, yaw=1.2)
+    report.observer_planning_pose.header.stamp = stamp(23.0)
+    report.observer_planning_pose.pose.position = Point(x=13.0, y=13.0, z=27.0)
+    report.observer_planning_pose.pose.orientation = quaternion_from_yaw(1.2)
+    assert executive._verify_complete_site(report)
+    entry = executive._completed_clusters[0]
+    assert entry['wall_observer'] == original
+    assert entry['center'].point == Point(x=42.0, y=-4.0, z=-10.0)
+    assert entry['center'].header.stamp == stamp(20.0)
+
+
+def test_legacy_observer_fallback_uses_positions_instead_of_camera_yaw(executive):
+    report = _measured_report(executive, center=(30.0, 0.0, 5.0))
+    report.observer_planning_pose.pose.orientation = quaternion_from_yaw(math.pi / 2)
+    assert executive._verify_complete_site(report)
+    assert executive._completed_cluster_regions()[0]['center'].point == Point(x=55.0, z=5.0)
+
+
+@pytest.mark.parametrize('invalid', [
+    'missing', 'frame', 'nan_xy', 'nan_z', 'zero_stamp', 'future_stamp',
+    'coincident_xy', 'almost_coincident_xy',
+])
+def test_invalid_retained_direction_never_invents_routing_zone_or_legacy_completion(
+        executive, invalid):
+    report = _measured_report(executive)
+    observer = _wall_observer(report, (0.0, 0.0, 5.0))
+    if invalid == 'missing':
+        observer = None
+    elif invalid == 'frame':
+        observer.header.frame_id = 'another_map'
+    elif invalid == 'nan_xy':
+        observer.point.x = math.nan
+    elif invalid == 'nan_z':
+        observer.point.z = math.nan
+    elif invalid == 'zero_stamp':
+        observer.header.stamp = stamp(0.0)
+    elif invalid == 'future_stamp':
+        observer.header.stamp = stamp(30.0)
+    elif invalid == 'coincident_xy':
+        observer.point = Point(x=30.0, z=100.0)
+    else:
+        observer.point = Point(x=30.0 - 1e-10, z=5.0)
+    executive._verify_report_completion_context = {'wall_observer': observer}
+    assert not executive._verify_complete_site(report)
+    assert report.smoke_location_valid  # The published finding and measured point remain valid.
+    assert not executive._completed_cluster_regions()
+    assert not executive._completed_sites
+    assert executive._completed_cluster_failure_reason
+
+
+def test_missing_retained_origin_and_invalid_report_pose_hold_without_yaw_guess(executive):
+    report = _measured_report(executive)
+    report.observer_planning_pose.header.frame_id = ''
+    assert not executive._verify_complete_site(report)
+    assert not executive._completed_cluster_regions()
+
+
+def test_semantic_association_uses_wall_instead_of_shifted_routing_center(executive):
+    executive._verify_complete_site(_measured_report(executive))
+    assert executive._completed_cluster_regions()[0]['center'].point.x == 55.0
+    front_source = _next_cluster_frame(executive, point=(10.0, 0.0, 5.0))
+    assert executive._verify_is_completed_detection(front_source, 'fire')
+    # This point is inside the shifted routing footprint, but lies 45 m from
+    # the measured source anchor. Routing geometry must not veto its discovery.
+    for index in range(3):
+        other = _next_cluster_frame(executive, point=(75.0, 0.0, 5.0), track_id=42)
+        assert executive._verify_candidate_is_eligible(other, 'fire') == (index == 2)
+
+
+def test_merging_uses_original_wall_separation_instead_of_routing_centers(executive):
+    executive._verify_complete_site(_measured_report(executive, center=(30.0, 0.0, 5.0)))
+    executive._verify_complete_site(_measured_report(
+        executive, center=(55.0, 0.0, 5.0), site_id=2))
+    assert [entry['wall_point'].point.x for entry in executive._completed_clusters] == [30.0, 55.0]
+    assert [entry['center'].point.x for entry in executive._completed_clusters] == [55.0, 80.0]
+
+
+def test_routing_geometry_is_logged_once_when_new_circle_is_created(executive):
+    logs = []
+    executive._report = logs.append
+    executive._verify_complete_site(_measured_report(executive))
+    executive._verify_complete_site(_measured_report(executive, site_id=2))
+    assert len(logs) == 1
+    assert 'wall=(30.00, 0.00, 5.00)' in logs[0]
+    assert 'center=(55.00, 0.00, 5.00)' in logs[0]
+    assert 'radius=25.00' in logs[0]
+    assert 'front_normal=(+1.000, +0.000)' in logs[0]

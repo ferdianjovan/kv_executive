@@ -23,12 +23,16 @@ from kv_executive.mission_geometry import (
     angular_distance, quaternion_from_yaw, yaw_from_quaternion,
 )
 from kv_executive.verification import VERIFY_DEFAULTS
+import pytest
 import rclpy
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 
 from test_mission_action import cancel_goal, send_goal, SimulatedFcu, wait_for
-from test_verify_ros import _install_camera_transforms, _with_wall_hit, MonitoringSensors
+from test_verify_ros import (
+    _assert_directional_cluster, _install_camera_transforms, _point_position,
+    _with_wall_hit, MonitoringSensors,
+)
 
 
 def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch, tmp_path):
@@ -75,11 +79,10 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
         'planning_timeout': 5.0,
         'mode_timeout': 5.0,
         'telemetry_timeout': 3.0,
-        # Keep real mode handoffs while bounding three full departure cycles.
+        # Keep real mode handoffs while bounding three inspection/handoff cycles.
         'offboard_warmup': 1.0,
         'hold_duration': 0.05,
         'setpoint_rate': 30.0,
-        'verify_departure_step': 12.0,
     }
     for name, value in settings.items():
         arguments.extend(['-p', f'{name}:={value}'])
@@ -117,6 +120,7 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
         sensors.detection_latency = 0.08
         _install_camera_transforms(sensors)
         original_geometry = fcu.query_inspection_geometry
+        measured_wall_origins = {}
 
         def near_smoke_wall(request, response):
             response = original_geometry(request, response)
@@ -127,7 +131,12 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
                     request.origin.header.frame_id == 'test_thermal_camera' or near_fire)
                 response.smoke_wall_range = response.smoke_wall_nearest_range = (
                     VERIFY_DEFAULTS['verify_smoke_standoff'] + 0.4)
-            return _with_wall_hit(response)
+            response = _with_wall_hit(response)
+            if request.smoke_wall_width and response.smoke_wall_valid:
+                stamp = response.map_header.stamp
+                measured_wall_origins[stamp.sec * 10**9 + stamp.nanosec] = deepcopy(
+                    response.ray_origin.point)
+            return response
 
         fcu.geometry_service.callback = near_smoke_wall
         sensors.smoke_regions = [1, 2]
@@ -291,15 +300,26 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
             alive_wait(lambda: any(
                 text == 'Verify/DEPART_SITE: handoff complete; resuming Exploration'
                 for _, text in fcu.statuses[first_status:]),
-                90.0, 'checked outward departure before the next Exploration phase')
+                20.0, 'settled directional-zone handoff before the next Exploration phase')
             alive_wait(lambda: bool(sensors.cluster_snapshots)
                        and len(sensors.cluster_snapshots[-1].clusters) == repetition + 1,
                        5.0, 'retained completed locations across mission requests')
             with fcu.lock:
                 departed = deepcopy(fcu.pose.position)
                 statuses = list(fcu.statuses[first_status:])
-            center = report.smoke_planning_position.point
-            assert ((departed.x - center.x)**2 + (departed.y - center.y)**2)**0.5 >= 26.0
+            cluster = next(value for value in sensors.cluster_snapshots[-1].clusters
+                           if value.site_id == report.site_id)
+            measured_stamp = report.smoke_planning_position.header.stamp
+            measured_origin = measured_wall_origins[
+                measured_stamp.sec * 10**9 + measured_stamp.nanosec]
+            _assert_directional_cluster(report, cluster, measured_origin)
+            assert math.hypot(departed.x - cluster.center.point.x,
+                              departed.y - cluster.center.point.y) >= cluster.radius + 1.0
+            assert _point_position(departed) == pytest.approx(
+                _point_position(report.observer_local_pose.pose.position), abs=0.03)
+            with fcu.lock:
+                assert not any(request.allow_completed_cluster_escape
+                               for request in fcu.inspection_planning_requests)
             departure_at = next(stamp for stamp, text in statuses
                                 if text == 'Verify/DEPART_SITE: started')
             handoff_at = next(stamp for stamp, text in statuses

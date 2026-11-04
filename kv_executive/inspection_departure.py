@@ -97,27 +97,26 @@ class InspectionDepartureMixin:
         heading = math.atan2(target.position.y - current.position.y,
                              target.position.x - current.position.x)
         target.orientation = quaternion_from_yaw(heading)
-        # Departure deliberately ignores fire/smoke steering, including remembered rays.
+        # The flight helper validates the plan before OFFBOARD, then turns
+        # toward this fixed heading before translating. Do not enter OFFBOARD
+        # twice or turn toward a candidate that planning will refuse.
         stationary = Path()
         stationary.header.frame_id = self.config['local_frame']
         stationary.poses = [PoseStamped(pose=deepcopy(current))]
         if not self._inspection_map_corridor(stationary, terrain_envelope=True):
             return False
-        self._verify_rotate(heading, guard=guard)
         return self._verify_plan_to(
             target, guard=guard, allow_plan_failure=True,
             path_validator=validate, heading_provider=lambda _pose: heading,
             planning_client=self._inspection_planning_client, request_builder=request,
             maximum_path_length=self.config['verify_departure_step'] * 3.0,
-            motion_timeout=min(45.0, self.config['verify_departure_timeout']))
+            motion_timeout=min(45.0, self.config['verify_departure_timeout']),
+            motion_label='DEPART_SITE')
 
     def _verify_depart_completed_site(self, report, guard=None):
         from kv_executive.mission_executive import MissionError
         from kv_executive.mission_navigation import _inverse
-        from kv_executive.verification import (
-            VerificationMapUnavailable, VerificationRecoveryUnavailable,
-            VerificationStartUnavailable,
-        )
+        from kv_executive.verification import VerificationObservationLost
         regions = self._departure_regions()
         if not any(r['site_id'] == report.site_id for r in regions):
             raise MissionError('DEPART_SITE: completed report has no saved cluster; holding')
@@ -143,6 +142,10 @@ class InspectionDepartureMixin:
             inside = [(c, radius) for c, radius in centers
                       if math.hypot(map_position.x - c.x, map_position.y - c.y)
                       < radius + self.config['verify_departure_clearance']]
+            nearest_clearance = min(math.hypot(map_position.x - c.x, map_position.y - c.y)
+                                    - radius for c, radius in centers)
+            self._report(f'Verify/DEPART_SITE: nearest zone clearance={nearest_clearance:.2f} m; '
+                         f'exit margin={self.config["verify_departure_clearance"]:.2f} m')
             if not inside:
                 self._report('Verify/DEPART_SITE: outside completed cluster buffers; '
                              'looking toward uninspected space')
@@ -163,6 +166,19 @@ class InspectionDepartureMixin:
                 if not self._verify_prepare_wall_observation(
                         guard=check, align_fire=False, wait_for_map=False):
                     raise MissionError('DEPART_SITE: final viewpoint failed to settle; holding')
+                # Braking or a final yaw can drift back across the exit margin.
+                # Recheck at the actual settled pose before admitting Exploration.
+                check()
+                _, settled = self._verify_control_pose()
+                settled_map = transform_pose(settled, _inverse(self._path_frame_transform(
+                    self.config['verify_planning_frame']))).position
+                if any(math.hypot(settled_map.x - r['center'].point.x,
+                                  settled_map.y - r['center'].point.y)
+                       < r['radius'] + self.config['verify_departure_clearance']
+                       for r in self._departure_regions()):
+                    self._report('Verify/DEPART_SITE: settled viewpoint drifted inside exit '
+                                 'margin; continuing checked departure')
+                    continue
                 self._report('Verify/DEPART_SITE: handoff complete; resuming Exploration')
                 return
             if leg == self.config['verify_departure_max_legs']:
@@ -190,12 +206,27 @@ class InspectionDepartureMixin:
                 self._report(f'Verify/DEPART_SITE: checking outward leg {leg + 1}; '
                              'routing around completed clusters')
                 try:
-                    if self._verify_departure_leg(target, current, check) is not False:
-                        moved = True
-                        break
-                except (VerificationMapUnavailable, VerificationStartUnavailable,
-                        VerificationRecoveryUnavailable) as error:
+                    result = self._verify_departure_leg(target, current, check)
+                except VerificationObservationLost as error:
+                    # The flight helper first recovers LOITER. Never retry a
+                    # stopped/partial leg until the actual FCU state confirms it.
+                    self._snapshot('AUTO.LOITER', require_armed=True)
                     self._report(f'Verify/DEPART_SITE: candidate unavailable: {error}')
+                    result = False
+                if result is not False:
+                    moved = True
+                    break
+                _, actual = self._verify_control_pose()
+                actual_map = transform_pose(actual, _inverse(self._path_frame_transform(
+                    self.config['verify_planning_frame']))).position
+                if (math.hypot(actual_map.x - map_position.x,
+                               actual_map.y - map_position.y) >= 0.1
+                        and cluster_path_safe([map_position, actual_map],
+                                              self._departure_regions(), map_position)):
+                    self._report('Verify/DEPART_SITE: retaining checked outward progress; '
+                                 'refreshing departure viewpoint')
+                    moved = True
+                    break
             if not moved:
                 raise MissionError('DEPART_SITE: no safe outward route; '
                                    'inspection remains reported; holding')

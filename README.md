@@ -853,9 +853,23 @@ before OFFBOARD, after warmup, during flight and on arrival. Revalidation pins
 the original escape anchor and cannot restart the below-floor escape after it
 has completed.
 
-A completed inspection saves a cluster around its retained measured smoke-wall
-point, with a 20 m core and 5 m routing buffer by default. This is a conservative
-inspection footprint, not a measured fire boundary or an exact plume extent.
+A completed inspection retains the measured smoke-wall hit `W` and the observer
+position at that measurement. Its routing circle extends away from that observer:
+`C = W + R*n`, where `n` is the horizontal unit direction from the saved observer
+to `W`, and `R` is the 20 m core plus 5 m routing buffer by default. The front
+edge stays at `W`; the circle does not place an extra buffer behind the wall
+toward the approaching drone. For a straight approach along one axis:
+
+```text
+Drone O=0      Wall W=20        Centre C=45          Far edge=70
+   o ----------- |==================o==================|
+                 <---------- protected [20,70] -------->
+```
+
+The report continues to contain the actual measured hit `W`. The shifted routing
+center `C` is a conservative planning choice, not an estimated fire position or
+an exact plume extent. The original measurement observer remains fixed even if
+the drone moves before publishing its report.
 The executive shares its bounded registry with the native planner through
 `completed_inspection_clusters` (`CompletedInspectionClusters`, retained latest
 snapshot). The same footprints apply to every native planned path segment and
@@ -865,23 +879,30 @@ a completed cluster does not bypass it.
 Completed clusters survive movement, new mission requests and new Verify
 episodes while the executive remains running. An actual ROS clock rewind
 clears the registry; a node restart also loses it because it is not stored on
-disk or reloaded. A later report within an existing core enriches that fixed
-record without moving its original point or expanding its footprint through a
-chain of nearby reports. The older bearing-only compatibility gate and deferred
-unsuccessful viewpoints still expire after 2 m of observer translation; that
-expiry does not remove measured completed clusters.
+disk or reloaded. A later report within the core distance of a saved wall point
+enriches that fixed record without moving its wall point, direction or routing center, or
+expanding its footprint through a chain of nearby reports. The older bearing-only
+compatibility gate and deferred unsuccessful viewpoints still expire after 2 m
+of observer translation; that expiry does not remove measured completed clusters.
 
-After publishing either completed result, Verify enters `DEPART_SITE`. When
-inside a buffered footprint, only a checked outward escape prefix is allowed;
+After publishing either completed result, Verify enters `DEPART_SITE`. An
+airborne retry (`skip_takeoff: true`) that starts inside a saved zone also
+completes the checked departure before beginning Exploration. When inside a buffered
+footprint, only a checked outward escape prefix is allowed;
 the aircraft must not move deeper into that footprint or re-enter after leaving.
 Departure tries short outward alternatives while retaining map, terrain,
 collision and mission-interrupt checks. Defaults are 3 m legs, at most 12 legs
 and 180 wall-clock seconds, with 1 m clearance beyond every buffered footprint.
-Outside them, the drone turns toward an eligible source or away from completed
-space, settles, then resumes Exploration. Departure ignores completed-source
-steering. If no safe route exists or its budget expires, the mission holds in
-`AUTO.LOITER`; the already published inspection remains valid and available to
-the image viewer.
+Each candidate path is planned and validated before turning and flying; a
+refused candidate does not trigger a separate preliminary yaw correction.
+Outside the zones, the drone turns toward an eligible source or away from
+completed space, settles, and rechecks its actual distance from every zone
+before resuming Exploration. In the example above, the drone is already outside
+the zone and need not translate merely because the report was published.
+Departure ignores completed-source steering. If no safe route exists or its
+budget expires, the mission holds in `AUTO.LOITER`; the already published inspection remains valid and available to
+the image viewer. Departure diagnostics distinguish current position/clearance
+from proposed route endpoints, so a planned endpoint does not count as an exit.
 
 The executive also consumes `smoke/detection_candidates` and
 `fire/detection_candidates` in the drone namespace. Their arrays contain at most
@@ -899,10 +920,13 @@ remain supported when no current candidate feed is available.
 
 These candidate messages and shared planning interfaces require rebuilding
 `kv_perception` and `kv_executive` and restarting their consumers together.
-The checkpoint before cluster departure is
-`checkpoint-before-cluster-departure-20261104` in all relevant package
-repositories: executive `1c7e3e3`, perception `4631828`, simulator `6d2796d`.
+When those interfaces are already installed, the directional correction adds no
+message or service fields and only requires rebuilding `kv_executive`.
+The checkpoint before the directional zone correction is
+`checkpoint-before-directional-smoke-zone-20261104` in all relevant package
+repositories: executive `ab90314`, perception `5738d9b`, simulator `6d2796d`.
 See the [cluster departure validation report](test/reports/cluster_departure_validation_20261104.md)
+and [wall-front geometry validation](test/reports/wall_front_geometry_validation_20261104.md)
 for regression coverage, default limits and test scope.
 
 ### PX4 returning home during or after Exploration

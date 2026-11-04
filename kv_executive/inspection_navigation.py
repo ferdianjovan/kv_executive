@@ -992,7 +992,9 @@ class InspectionNavigationMixin(
                 'camera_associated': roi_source is not None,
                 'smoke_camera_stamp_ns': _stamp_ns(roi_source.header) if roi_source else 0,
                 'nearest_point_valid': nearest_point_valid,
-                'nearest_point': deepcopy(nearest_point) if nearest_point_valid else None}
+                'nearest_point': deepcopy(nearest_point) if nearest_point_valid else None,
+                'map_origin': PointStamped(header=deepcopy(response.map_header),
+                                           point=deepcopy(origin))}
 
     @staticmethod
     def _verify_valid_wall(wall):
@@ -1808,6 +1810,9 @@ class InspectionNavigationMixin(
                 'smoke': deepcopy(self._verify.fresh_smoke()),
                 'fire': deepcopy(latest) if report.fire_found else None,
                 'planning_to_local': deepcopy(conversion)}
+            if retained_wall.get('map_origin') is not None:
+                self._verify_report_completion_context['wall_observer'] = deepcopy(
+                    retained_wall['map_origin'])
             try:
                 saved = complete(report, message=latest if report.fire_found else current_smoke,
                                  source='fire' if report.fire_found else 'smoke')

@@ -3078,3 +3078,81 @@ def test_probe_only_navigation_never_promotes_a_legacy_ray_to_a_wall(executive, 
     assert executive._verify_navigation_viewpoint(0.0, geometry=geometry, forward_only=True)
     expected = 0.5 if aperture else 3.0
     assert executive.odometry.pose.pose.position.x == pytest.approx(expected)
+
+
+@pytest.mark.parametrize('rotated_alignment', [False, True])
+def test_wall_measurement_retains_original_map_observer_at_map_stamp(
+    executive, rotated_alignment,
+):
+    executive.smoke_wall_valid = True
+    executive.ray_origin = (5.0, -7.0, 11.0)
+    if rotated_alignment:
+        executive.conversion.rotation = quaternion_from_yaw(math.pi / 2)
+        executive.conversion.translation = Vector3(x=100.0, y=-50.0, z=2.0)
+    responses = []
+
+    def measured_before_query(request, response):
+        response.map_header = header(executive.now - 0.4, 'map')
+        responses.append(response)
+
+    executive.on_query = measured_before_query
+    wall = executive._verify_measure_wall('rgb_camera')
+    assert wall is not None
+    observer = wall['map_origin']
+    assert isinstance(observer, PointStamped)
+    assert observer.header == wall['map_header'] == wall['nearest_point'].header
+    assert observer.header.stamp == header(99.6).stamp
+    assert observer.point == Point(x=5.0, y=-7.0, z=11.0)
+    expected_local = (Point(x=107.0, y=-45.0, z=13.0) if rotated_alignment
+                      else Point(x=5.0, y=-7.0, z=11.0))
+    for axis in 'xyz':
+        assert getattr(wall['origin'], axis) == pytest.approx(getattr(expected_local, axis))
+    assert responses[0].ray_origin.header.stamp == Header().stamp
+    assert observer.header.stamp != responses[0].ray_origin.header.stamp
+    responses[0].ray_origin.point.x = 999.0
+    responses[0].map_header.frame_id = 'changed_after_measurement'
+    assert observer.header.frame_id == 'map'
+    assert observer.point == Point(x=5.0, y=-7.0, z=11.0)
+
+
+@pytest.mark.parametrize('fire_found', [False, True])
+@pytest.mark.parametrize('retained_origin_available', [False, True])
+def test_report_completion_passes_retained_measurement_observer_without_moving_report_hit(
+    executive, fire_found, retained_origin_available,
+):
+    wall = _confirmed_report_wall(executive, stamp=90.0)
+    original_hit = deepcopy(wall['nearest_point'])
+    source_observer = PointStamped(
+        header=deepcopy(wall['map_header']), point=Point(x=-7.0, y=1.0, z=12.0))
+    if retained_origin_available:
+        wall['map_origin'] = deepcopy(source_observer)
+    executive.odometry.pose.pose.position = Point(x=3.0, y=-4.0, z=20.0)
+    executive.odometry.header = header(executive.now)
+    executive.fire = _persistent_fire(executive.now) if fire_found else None
+    contexts = []
+
+    def complete(report, message=None, source=None):
+        context = executive._verify_report_completion_context
+        contexts.append(deepcopy(context))
+        assert source == ('fire' if fire_found else 'smoke')
+        assert report.smoke_planning_position == original_hit
+        if context.get('wall_observer') is not None:
+            context['wall_observer'].point.x = 999.0
+        return True
+
+    executive._verify_complete_site = complete
+    report = executive._verify_report_inspection(
+        {}, fire_message=executive.fire, attempts=3, wall=wall)
+    assert report.fire_found is fire_found
+    assert report.smoke_planning_position == original_hit
+    assert report.smoke_local_position.point == original_hit.point
+    assert report.smoke_planning_position.point != report.observer_planning_pose.pose.position
+    assert len(contexts) == 1
+    if retained_origin_available:
+        assert contexts[0]['wall_observer'] == source_observer
+        assert contexts[0]['wall_observer'].header.stamp == header(90.0).stamp
+        assert contexts[0]['wall_observer'].point != report.observer_planning_pose.pose.position
+        assert wall['map_origin'] == source_observer
+    else:
+        assert contexts[0].get('wall_observer') is None
+    assert executive._verify_report_completion_context is None

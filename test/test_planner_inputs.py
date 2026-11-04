@@ -600,6 +600,111 @@ def test_cluster_escape_never_waives_occupied_collision_clearance(planner_factor
     assert 'occupied' in result.message
 
 
+def _wall_front_circle(distance, angle=0.0, site_id=1, radius=25.0):
+    """Keep the true front at W; route around the circle centred beyond that front."""
+    nx, ny = math.cos(angle), math.sin(angle)
+    return site_id, (distance + radius) * nx, (distance + radius) * ny, radius
+
+
+@pytest.mark.parametrize('wall_distance', [15.0, 20.0])
+@pytest.mark.parametrize('angle', [0.0, math.pi / 2.0])
+def test_shifted_wall_front_leaves_observer_outside_without_forced_retreat(
+        planner_factory, wall_distance, angle):
+    planner = _strict_planner(planner_factory, wall=False, planner_parameters={
+        'inspection_require_observed_free_space': False})
+    circles = [_wall_front_circle(wall_distance, angle)]
+    _publish_completed_clusters(planner, circles)
+    request = PlanInspectionPath.Request(target=planner.target(
+        x=3.0 * math.cos(angle), y=3.0 * math.sin(angle)))
+    assert not request.allow_completed_cluster_escape
+    result = planner.plan_inspection(request)
+    assert result.success, result.message
+    start = result.path.poses[0].pose.position
+    assert (start.x, start.y, start.z) == pytest.approx((0.0, 0.0, 2.0))
+    _assert_path_outside_circles(result.path, circles)
+    assert planner.plan().success
+
+
+@pytest.mark.parametrize('wall_distance', [15.0, 20.0])
+@pytest.mark.parametrize('angle', [0.0, math.pi / 3.0])
+def test_shifted_front_allows_tangent_plane_but_blocks_penetration_and_overflight(
+        planner_factory, wall_distance, angle):
+    planner = _strict_planner(planner_factory, wall=False, planner_parameters={
+        'inspection_require_observed_free_space': False})
+    _publish_completed_clusters(planner, [_wall_front_circle(wall_distance, angle)])
+    nx, ny = math.cos(angle), math.sin(angle)
+    tx, ty = -ny, nx
+    request = QueryInspectionGeometry.Request()
+    request.corridor.poses = [planner.target(
+        x=wall_distance * nx + side * tx, y=wall_distance * ny + side * ty)
+        for side in (-2.0, 2.0)]
+    result = planner.query_geometry(request)
+    assert result.success and result.corridor_safe, result.message
+    for altitude in (2.0, 6.0):
+        request.corridor.poses = [planner.target(
+            x=distance * nx, y=distance * ny, z=altitude)
+            for distance in (wall_distance - 0.1, wall_distance + 0.1)]
+        result = planner.query_geometry(request)
+        assert result.success and not result.corridor_safe
+        assert 'completed smoke-cluster keepout' in result.message
+
+
+def test_multiple_shifted_fronts_independently_protect_their_behind_wall_volume(planner_factory):
+    planner = _strict_planner(planner_factory, wall=False, planner_parameters={
+        'inspection_require_observed_free_space': False})
+    circles = [_wall_front_circle(15.0), _wall_front_circle(20.0, math.pi / 2.0, site_id=2)]
+    _publish_completed_clusters(planner, circles)
+    request = QueryInspectionGeometry.Request()
+    request.corridor.poses = [planner.target(), planner.target(x=14.5),
+                              planner.target(y=19.5)]
+    result = planner.query_geometry(request)
+    assert result.success and result.corridor_safe, result.message
+    for target in (planner.target(x=15.1), planner.target(y=20.1)):
+        request.corridor.poses = [planner.target(), target]
+        result = planner.query_geometry(request)
+        assert result.success and not result.corridor_safe
+        assert 'completed smoke-cluster keepout' in result.message
+
+
+def test_start_seeded_behind_shifted_front_still_requires_checked_outward_escape(planner_factory):
+    planner = _strict_planner(planner_factory, wall=False, planner_parameters={
+        'inspection_require_observed_free_space': False})
+    _publish_completed_clusters(planner, [_wall_front_circle(15.0)])
+    planner.odometry_message.pose.pose.position.x = 16.0
+    planner.repeat_odometry()
+    request = PlanInspectionPath.Request(target=planner.target(x=13.0))
+    planner.wait_for(
+        lambda: planner.plan_inspection(request).error_code
+        == PlanInspectionPath.Response.START_INVALID,
+        'actual start behind the shifted wall front')
+    request.allow_completed_cluster_escape = True
+    result = planner.plan_inspection(request)
+    assert result.success, result.message
+    assert result.path.poses[0].pose.position.x == pytest.approx(16.0)
+    assert result.path.poses[-1].pose.position.x == pytest.approx(13.0)
+    check = QueryInspectionGeometry.Request(corridor=result.path)
+    assert not planner.query_geometry(check).corridor_safe
+    check.allow_completed_cluster_escape = True
+    check.escape_origin = _geometry_point(x=16.0, y=0.0, z=2.0)
+    assert planner.query_geometry(check).corridor_safe
+    check.corridor.poses = [planner.target(x=16.0), planner.target(x=17.0)]
+    assert not planner.query_geometry(check).corridor_safe
+
+
+@pytest.mark.parametrize('x,safe', [(2.7, True), (2.9, False), (3.125, False)])
+def test_shifted_semantic_front_never_waives_actual_wall_body_clearance(planner_factory, x, safe):
+    planner = _strict_planner(planner_factory, wall=True)
+    circles = [_wall_front_circle(3.125)]
+    _publish_completed_clusters(planner, circles)
+    request = QueryInspectionGeometry.Request()
+    request.corridor.poses = [planner.target(x=x, y=-0.5), planner.target(x=x, y=0.5)]
+    _assert_path_outside_circles(request.corridor, circles)
+    result = planner.query_geometry(request)
+    assert result.success and result.corridor_safe is safe, result.message
+    if not safe:
+        assert 'occupied' in result.message
+
+
 @pytest.mark.parametrize('invalid', ['frame', 'point_frame', 'radius', 'ids', 'count', 'older'])
 def test_invalid_cluster_snapshot_blocks_transit_until_valid_snapshot_replaces_it(
         planner_factory, invalid):

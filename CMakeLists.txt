@@ -130,6 +130,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(candidate_selection test/test_candidate_selection.py TIMEOUT 45)
   ament_add_pytest_test(cluster_motion test/test_cluster_motion.py TIMEOUT 45)
   ament_add_pytest_test(inspection_departure test/test_inspection_departure.py TIMEOUT 45)
+  ament_add_pytest_test(departure_resume test/test_departure_resume.py TIMEOUT 45)
   ament_add_pytest_test(motion_policy test/test_motion_policy.py TIMEOUT 45)
   # Real mode handoffs and the committed-climb case make this a long DDS suite.
   ament_add_pytest_test(verify_ros test/test_verify_ros.py TIMEOUT 3600)

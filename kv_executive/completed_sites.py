@@ -4,7 +4,7 @@ from collections import deque, OrderedDict
 from copy import deepcopy
 import math
 
-from geometry_msgs.msg import Point, Pose, Transform, Vector3
+from geometry_msgs.msg import Point, PointStamped, Pose, Transform, Vector3
 from kv_executive.mission_geometry import (
     interpolate_pose, quaternion_from_yaw, transform_pose,
 )
@@ -355,7 +355,9 @@ class CompletedSitesMixin:
             # and report context on this frequent path.
             clusters = [{**{name: entry[name] for name in (
                 'radius', 'core_radius', 'uncertainty')},
-                'center': deepcopy(entry['center']),
+                # Detection identity stays anchored to the measured wall,
+                # independently of the shifted circle used only for routing.
+                'center': deepcopy(entry.get('wall_point', entry['center'])),
                 'views': {kind: [{name: view[name] for name in (
                     'anchor', 'horizontal', 'vertical')} for view in entries]
                           for kind, entries in entry['views'].items()}}
@@ -584,27 +586,64 @@ class CompletedSitesMixin:
             })
         return result
 
+    def _completed_wall_direction(self, report, wall):
+        """Use the original measurement observer to place the whole circle behind the wall."""
+        context = getattr(self, '_verify_report_completion_context', None) or {}
+        observer = context.get('wall_observer')
+        if 'wall_observer' not in context:
+            viewpoint = getattr(report, 'observer_planning_pose', None)
+            if viewpoint is None:
+                return None
+            observer = PointStamped(header=deepcopy(viewpoint.header),
+                                    point=deepcopy(viewpoint.pose.position))
+        if (observer is None or observer.header.frame_id != wall.header.frame_id
+                or _stamp_ns(observer) <= 0
+                or _stamp_ns(observer) > self.get_clock().now().nanoseconds
+                + self.config['verify_future_tolerance'] * 1e9
+                or not _finite_point(observer.point)):
+            return None
+        dx, dy = wall.point.x - observer.point.x, wall.point.y - observer.point.y
+        distance = math.hypot(dx, dy)
+        if not math.isfinite(distance) or distance <= 1e-6:
+            return None
+        return deepcopy(observer), (dx / distance, dy / distance)
+
     def _completed_save_cluster(self, report, message, source):
+        self._completed_cluster_failure_reason = ''
         measured = self._completed_report_point(report, 'smoke')
         if measured is None or not getattr(report, 'smoke_wall_confirmed', False):
             return False
-        center, uncertainty = measured
+        wall, uncertainty = measured
         core = self.config.get('verify_completed_cluster_radius', 20.0)
         buffer = self.config.get('verify_completed_cluster_buffer', 5.0)
         if (not all(math.isfinite(value) and value >= 0.0 for value in (core, buffer))
                 or core <= 0.0):
             raise ValueError('Completed cluster core and buffer must be finite and nonnegative')
-        views = self._completed_report_views(report, center, message, source)
-        entry = {'site_id': int(report.site_id), 'center': deepcopy(center),
+        direction = self._completed_wall_direction(report, wall)
+        if direction is None:
+            self._completed_cluster_failure_reason = (
+                'retained smoke wall has no valid horizontal measurement-observer direction')
+            logger = getattr(self, '_report', None)
+            if logger is not None:
+                logger('Verify: completed routing zone unavailable: '
+                       + self._completed_cluster_failure_reason)
+            return False
+        observer, normal = direction
+        center = deepcopy(wall)
+        center.point.x += (core + buffer) * normal[0]
+        center.point.y += (core + buffer) * normal[1]
+        views = self._completed_report_views(report, wall, message, source)
+        entry = {'site_id': int(report.site_id), 'center': center, 'wall_point': deepcopy(wall),
+                 'wall_observer': observer, 'front_normal': normal,
                  'uncertainty': uncertainty, 'core_radius': core, 'radius': core + buffer,
                  'fire_found': report.status == 'fire_found', 'views': views,
                  'reports': [{'site_id': int(report.site_id), 'status': report.status,
-                              'point': deepcopy(center)}]}
+                              'point': deepcopy(wall)}]}
         with self._data_lock:
             self._completed_clock_locked()
             previous = next((old for old in self._completed_clusters
-                             if math.hypot(old['center'].point.x - center.point.x,
-                                           old['center'].point.y - center.point.y)
+                             if math.hypot(old['wall_point'].point.x - wall.point.x,
+                                           old['wall_point'].point.y - wall.point.y)
                              <= old['core_radius']), None)
             if previous is None:
                 self._completed_clusters.append(entry)
@@ -618,6 +657,14 @@ class CompletedSitesMixin:
                     previous['views'][kind] = (previous['views'][kind] + views[kind])[-4:]
             self._completed_candidate_history.clear()
             self._completed_clusters_version += 1
+        logger = getattr(self, '_report', None)
+        if previous is None and logger is not None:
+            logger(f'Verify: completed smoke routing zone site_id={entry["site_id"]}; '
+                   f'wall=({wall.point.x:.2f}, {wall.point.y:.2f}, {wall.point.z:.2f}) m; '
+                   f'center=({center.point.x:.2f}, {center.point.y:.2f}, '
+                   f'{center.point.z:.2f}) m; radius={entry["radius"]:.2f} m; '
+                   f'front_normal=({normal[0]:+.3f}, {normal[1]:+.3f}); '
+                   'routing footprint starts at the measured wall and extends behind it')
         return True
 
     def _verify_complete_site(self, report, message=None, source=None):
@@ -629,6 +676,8 @@ class CompletedSitesMixin:
             return False
         source = expected_source
         saved = self._completed_save_cluster(report, message, source)
+        if not saved and self._completed_cluster_failure_reason:
+            return False
         if message is None:
             message = self._completed_raw_observation(source)
         if source == 'fire' and message is not None:

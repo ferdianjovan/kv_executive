@@ -51,6 +51,21 @@ def _with_wall_hit(response):
     return response
 
 
+def _assert_directional_cluster(report, cluster, measured_observer):
+    """Keep the routing circle tangent to the actual reported wall front."""
+    wall = report.smoke_planning_position
+    assert cluster.center.header == wall.header
+    assert cluster.radius == 25.0
+    dx, dy = wall.point.x - measured_observer.x, wall.point.y - measured_observer.y
+    distance = math.hypot(dx, dy)
+    assert distance > 0.0
+    nx, ny = dx / distance, dy / distance
+    assert _point_position(cluster.center.point) == pytest.approx((
+        wall.point.x + cluster.radius * nx, wall.point.y + cluster.radius * ny, wall.point.z),
+        abs=1e-6)
+    return nx, ny
+
+
 class MonitoringSensors(Node):
     """Publish confirmed detector observations and typed battery estimates."""
 
@@ -1957,9 +1972,9 @@ def test_report_embeds_source_images_and_retained_wall_after_final_view(
         if not correct_height:
             assert len(probes) == confirmed[0][1]
         else:
-            # Keep the existing fresh wall check for the optional movement;
-            # completion and image capture perform no additional ranging.
-            assert len(probes) == confirmed[0][1] + 1
+            # The optional height leg can retain its committed wall plane or
+            # obtain one fresh aperture. Reporting itself never ranges again.
+            assert confirmed[0][1] <= len(probes) <= confirmed[0][1] + 1
         wall = confirmed[0][0]
         assert len(set(wall['confirmation_stamps'])) == 2
         assert report.smoke_wall_confirmed and report.smoke_location_valid
@@ -2017,6 +2032,19 @@ def test_report_embeds_source_images_and_retained_wall_after_final_view(
                     assert evidence.track_id == 42 and evidence.source_count == 2
                     assert (evidence.bbox_x, evidence.bbox_y, evidence.bbox_width,
                             evidence.bbox_height) == (27, 20, 10, 8)
+        wait_for(lambda: any(text == 'Verify/DEPART_SITE: handoff complete; resuming Exploration'
+                             for _, text in fcu.statuses),
+                 15.0, 'positive or negative finding to hand off without a forced retreat')
+        wait_for(lambda: bool(sensors.cluster_snapshots)
+                 and bool(sensors.cluster_snapshots[-1].clusters),
+                 3.0, 'completed directional routing snapshot')
+        _assert_directional_cluster(report, sensors.cluster_snapshots[-1].clusters[0],
+                                    wall['map_origin'].point)
+        with fcu.lock:
+            assert _point_position(fcu.pose.position) == pytest.approx(
+                _point_position(report.observer_local_pose.pose.position), abs=0.03)
+            assert not any(request.allow_completed_cluster_escape
+                           for request in fcu.inspection_planning_requests)
         assert not result.done()
     finally:
         if not result.done():
@@ -2071,8 +2099,9 @@ def test_smoke_then_fire_is_approached_before_recording_the_same_mission_goal(
 def test_completed_report_departure_precedes_exploration_and_survives_blocked_exit(
     mission, monitoring_sensors, route,
 ):
-    """A committed finding survives a checked departure, failed exit, or cancellation."""
+    """Retain findings and check real inside-zone departure on a later airborne goal."""
     sensors, fcu, executive = monitoring_sensors, mission.fcu, mission.executive
+    executive.config['mode_timeout'] = 8.0
     with fcu.lock:
         pose = deepcopy(fcu.pose)
         yaw = yaw_from_quaternion(pose.orientation)
@@ -2090,7 +2119,16 @@ def test_completed_report_departure_precedes_exploration_and_survives_blocked_ex
             yaw_from_quaternion(current.orientation))
 
     original_plan = fcu.inspection_planning_service.callback
-    departure_plans = []
+    original_geometry = fcu.geometry_service.callback
+    departure_plans, measured_observers = [], {}
+
+    def record_measurement(request, response):
+        response = original_geometry(request, response)
+        if request.smoke_wall_width and response.smoke_wall_valid:
+            stamp = response.map_header.stamp
+            measured_observers[stamp.sec * 10**9 + stamp.nanosec] = deepcopy(
+                response.ray_origin.point)
+        return response
 
     def checked_departure(request, response):
         response = original_plan(request, response)
@@ -2103,6 +2141,7 @@ def test_completed_report_departure_precedes_exploration_and_survives_blocked_ex
         return response
 
     fcu.inspection_planning_service.callback = checked_departure
+    fcu.geometry_service.callback = record_measurement
     goal = _start_visible_fire(mission, sensors)
     result = goal.get_result_async()
     try:
@@ -2110,68 +2149,103 @@ def test_completed_report_departure_precedes_exploration_and_survives_blocked_ex
                  'a successful inspection before departure begins')
         report = sensors.inspection_snapshot()[0]
         assert report.fire_found and report.smoke_location_valid
-        observer = report.observer_local_pose.pose
-        heading = yaw_from_quaternion(observer.orientation)
-        physical_fire = Point(x=observer.position.x + 20.0 * math.cos(heading),
-                              y=observer.position.y + 20.0 * math.sin(heading),
-                              z=observer.position.z)
         with sensors.lock:
             sensors.fire_guidance = sensors.smoke_guidance = lambda: (source_bearing(), 0.0)
             sensors.source_visibility = lambda _source: abs(source_bearing()) < 0.6
-        wait_for(lambda: any(text == 'Verify/DEPART_SITE: started' for _, text in fcu.statuses),
-                 5.0, 'published result to enter DEPART_SITE')
         wait_for(lambda: bool(sensors.cluster_snapshots)
                  and bool(sensors.cluster_snapshots[-1].clusters),
                  3.0, 'latched completed-cluster snapshot')
-        assert sensors.cluster_snapshots[-1].clusters[0].center == report.smoke_planning_position
+        cluster = sensors.cluster_snapshots[-1].clusters[0]
+        stamp = report.smoke_planning_position.header.stamp
+        observer = measured_observers[stamp.sec * 10**9 + stamp.nanosec]
+        nx, ny = _assert_directional_cluster(report, cluster, observer)
+        wait_for(lambda: _states(sensors)[:3] == ['Exploration', 'Verify', 'Exploration'],
+                 30.0, 'directional-zone handoff without an unnecessary outward flight')
+        with fcu.lock:
+            assert _point_position(fcu.pose.position) == pytest.approx(
+                _point_position(report.observer_local_pose.pose.position), abs=0.03)
+            statuses = list(fcu.statuses)
+        assert departure_plans == []
+        handoff = next(stamp for stamp, text in statuses
+                       if text == 'Verify/DEPART_SITE: handoff complete; resuming Exploration')
+        assert not any(sensors.inspection_report_times[0] < stamp < handoff
+                       and text == 'Exploration: entered' for stamp, text in statuses)
+        _assert_same_goal_phases(sensors, goal)
+        with sensors.lock:
+            sensors.source = None
+        cancel_goal(goal)
+
+        # A fresh goal starts genuinely inside the saved routing circle, rather
+        # than relying on the former circle that extended behind the wall.
+        inside = Point(x=cluster.center.point.x - 22.0 * nx,
+                       y=cluster.center.point.y - 22.0 * ny, z=pose.position.z)
+        with fcu.lock:
+            fcu.pose.position = deepcopy(inside)
+            first_status = len(fcu.statuses)
+        fcu.publish_telemetry()
+
+        def position_received():
+            with executive._data_lock:
+                current = executive._odometry
+                return current is not None and math.dist(
+                    _point_position(current.pose.pose.position), _point_position(inside)) < 0.03
+
+        wait_for(position_received, 3.0, 'inside-zone telemetry before the new airborne request')
+        goal = send_goal(mission, skip_takeoff=True)
+        assert goal.accepted
+        result = goal.get_result_async()
+        goal_id = tuple(goal.goal_id.uuid)
+        wait_for(
+            lambda: any('resuming saved cluster' in text
+                        for _, text in fcu.statuses[first_status:]),
+            5.0, 'new request to resume DEPART_SITE before Exploration')
+        wait_for(lambda: bool(departure_plans), 8.0, 'a checked outward startup leg')
         if route == 'cancel':
+            wait_for(lambda: received_state(mission, mode='OFFBOARD'),
+                     12.0, 'departure prefix OFFBOARD before cancellation')
             canceled = cancel_goal(goal)
             assert canceled.status == GoalStatus.STATUS_CANCELED
         elif route == 'blocked':
-            wait_for(result.done, 90.0, 'blocked departure to finish with LOITER recovery')
+            wait_for(result.done, 30.0, 'blocked departure to finish with LOITER recovery')
             aborted = result.result()
             assert aborted.status == GoalStatus.STATUS_ABORTED
             assert 'DEPART_SITE: no safe outward route' in aborted.result.message
             wait_for(lambda: received_state(mission, mode='AUTO.LOITER'),
                      3.0, 'blocked departure to remain safely in LOITER')
-            assert departure_plans
-            assert executive._completed_cluster_regions()
         else:
             def handed_off():
                 assert not result.done(), result.result().result.message if result.done() else ''
                 return any(text == 'Verify/DEPART_SITE: handoff complete; resuming Exploration'
-                           for _, text in fcu.statuses)
+                           for _, text in fcu.statuses[first_status:])
 
-            wait_for(handed_off, 90.0, 'checked outward flight beyond the completed buffer')
-            wait_for(lambda: _states(sensors)[:3] == ['Exploration', 'Verify', 'Exploration'],
-                     5.0, 'Exploration only after departure completes')
+            wait_for(handed_off, 90.0, 'inside-zone startup escape and settled handoff')
+
+            def retry_exploration_ready():
+                return [phase.state for phase in sensors.snapshot()[0]
+                        if tuple(phase.goal_id.uuid) == goal_id][:2] == ['Verify', 'Exploration']
+
+            wait_for(retry_exploration_ready, 5.0,
+                     'the retry to enter Exploration only after DEPART_SITE')
             with fcu.lock:
                 current = deepcopy(fcu.pose.position)
-                statuses = list(fcu.statuses)
-            center = report.smoke_planning_position.point
-            assert math.hypot(current.x - center.x, current.y - center.y) >= 26.0
-            assert departure_plans and all(request.terrain_envelope
-                                           and request.minimum_agl >= 3.0
-                                           for request in departure_plans)
-            handoff = next(stamp for stamp, text in statuses
-                           if text == 'Verify/DEPART_SITE: handoff complete; resuming Exploration')
-            assert not any(stamp > sensors.inspection_report_times[0] and stamp < handoff
-                           and text == 'Exploration: entered' for stamp, text in statuses)
-            # The sweep sees the physical old source again after turning. The
-            # durable cluster must prevent another Verify/report at its new pose.
-            time.sleep(4.0)
-            with fcu.lock:
-                assert sum(text == 'Verify: entered' for _, text in fcu.statuses) == 1
+            assert math.hypot(current.x - cluster.center.point.x,
+                              current.y - cluster.center.point.y) >= cluster.radius + 1.0
             cancel_goal(goal)
+        phases = [phase for phase in sensors.snapshot()[0] if tuple(phase.goal_id.uuid) == goal_id]
+        assert phases and phases[0].state == 'Verify'
+        if route != 'free':
+            assert all(phase.state != 'Exploration' for phase in phases)
+        assert all(request.terrain_envelope and request.minimum_agl >= 3.0
+                   for request in departure_plans)
         assert len(sensors.inspection_snapshot()) == 1
         assert executive._completed_cluster_regions()
-        _assert_same_goal_phases(sensors, goal)
     finally:
         with sensors.lock:
             sensors.source = None
         if not result.done():
             cancel_goal(goal)
         fcu.inspection_planning_service.callback = original_plan
+        fcu.geometry_service.callback = original_geometry
     _assert_airborne_safety(mission)
 
 
