@@ -10,6 +10,7 @@ import threading
 import time
 
 from kv_executive.inspection_navigation import smoke_wall_standoff_reached
+from kv_executive.inspection_report_view import retained_wall_valid
 from kv_executive.mission_geometry import yaw_from_quaternion
 from yasmin import State, StateMachine
 
@@ -36,6 +37,8 @@ VERIFY_DEFAULTS = {
     'verify_settle_speed': 0.10,
     'verify_settle_angular_rate': math.radians(3.0),
     'verify_settle_clock_timeout': 5.0,
+    'verify_report_view_timeout': 15.0,
+    'verify_report_view_yaw_tolerance': math.radians(30.0),
     'verify_retry_cooldown': 2.0,
     'verify_smoke_center_timeout': 30.0,
     'verify_smoke_loss_grace': 5.0,
@@ -572,7 +575,9 @@ class VerifyController:
 
         pending = (_bb_get(blackboard, 'verify_wall_recheck_deadline', None) is not None
                    or _bb_get(blackboard, 'verify_wall_recheck_after_settle', False))
-        if self.executive._verify_prepare_wall_observation(guard=guard, align_fire=not pending):
+        options = {'wait_for_map': False} if self._report_wall(blackboard) else {}
+        if self.executive._verify_prepare_wall_observation(
+                guard=guard, align_fire=not pending, **options):
             if _bb_get(blackboard, 'verify_wall_recheck_after_settle', False):
                 blackboard['verify_wall_recheck_deadline'] = (
                     time.monotonic() + self.config['verify_wall_recheck_timeout'])
@@ -626,6 +631,33 @@ class VerifyController:
         blackboard['verify_smoke_wall_probe'] = wall
         blackboard['verify_smoke_walls'] = [wall]
 
+    def _report_wall(self, blackboard):
+        """Read a historical confirmed hit without projecting its range from a new pose."""
+        wall = _bb_get(blackboard, 'verify_report_wall', None)
+        if not retained_wall_valid(
+                wall, self.config.get('verify_planning_frame', 'map'),
+                self.config['verify_inspection_max_uncertainty']):
+            return None
+        return wall
+
+    def _clear_report_wall(self, blackboard):
+        blackboard['verify_report_wall'] = None
+        self.executive._verify_retained_report_wall = None
+
+    def _confirm_report_wall(self, blackboard, wall, previous_stamp):
+        if self._report_wall(blackboard) is None:
+            retained = deepcopy(wall)
+            retained['confirmed'] = True
+            retained['confirmation_stamps'] = (previous_stamp, wall['map_stamp_ns'])
+            if not retained_wall_valid(
+                    retained, self.config.get('verify_planning_frame', 'map'),
+                    self.config['verify_inspection_max_uncertainty']):
+                return
+            blackboard['verify_report_wall'] = retained
+            self.executive._verify_retained_report_wall = deepcopy(retained)
+            self.executive._report(
+                'Verify: confirmed smoke-wall coordinate retained for inspection reporting')
+
     def _record_wall_observation(self, blackboard, wall):
         """Confirm proximity using two newly supported near measurements."""
         self._check_wall_recheck_deadline(blackboard)
@@ -636,6 +668,8 @@ class VerifyController:
             return
         if wall is None:
             blackboard['verify_wall_latest'] = None
+            if self._report_wall(blackboard) is not None:
+                return
             pending = _bb_get(blackboard, 'verify_wall_recheck_deadline', None) is not None
             confirmed = _bb_get(blackboard, 'verify_smoke_boundary_reached', False)
             if not pending or (
@@ -677,6 +711,7 @@ class VerifyController:
             f'conservative distance={distance:.2f} m; '
             f'inspection band={self.config["verify_smoke_standoff"]:g}–{limit:g} m')
         if distance > limit:
+            self._clear_report_wall(blackboard)
             was_near = (_bb_get(blackboard, 'verify_smoke_boundary_reached', False)
                         or _bb_get(blackboard, 'verify_wall_recheck_deadline', None) is not None)
             blackboard['verify_wall_near_count'] = 0
@@ -696,6 +731,8 @@ class VerifyController:
             min(2, _bb_get(blackboard, 'verify_wall_close_count', 0) + 1)
             if distance < self.config['verify_smoke_standoff'] else 0)
         close_count = blackboard['verify_wall_close_count']
+        if distance < self.config['verify_smoke_standoff']:
+            self._clear_report_wall(blackboard)
         self.executive._report(
             f'Verify: wall confirmation {count}/2 from new map observations'
             + (f'; close confirmation {close_count}/2 before retreat'
@@ -704,12 +741,17 @@ class VerifyController:
             blackboard['verify_smoke_boundary_reached'] = True
             blackboard['verify_wall_recheck_deadline'] = None
             self._inspection_begin(blackboard)
+            if distance >= self.config['verify_smoke_standoff']:
+                self._confirm_report_wall(blackboard, wall, last)
         elif _bb_get(blackboard, 'verify_wall_recheck_deadline', None) is None:
             blackboard['verify_wall_recheck_deadline'] = (
                 time.monotonic() + self.config['verify_wall_recheck_timeout'])
 
     def _probe_smoke_wall(self, blackboard, message, bearing):
         """Probe once; missing distant range leaves normal approach available."""
+        retained = self._report_wall(blackboard)
+        if retained is not None:
+            return retained
         wall = self.executive._verify_opportunistic_wall(message.header.frame_id, bearing)
         self._record_wall_observation(blackboard, wall)
         return wall
@@ -721,6 +763,8 @@ class VerifyController:
 
     def _at_known_wall(self, blackboard):
         """Require confirmed, current proximity instead of projecting an old plane."""
+        if self._report_wall(blackboard) is not None:
+            return self.executive._verify_wall_observation_ready()
         wall = _bb_get(blackboard, 'verify_wall_latest', None)
         return bool(_bb_get(blackboard, 'verify_smoke_boundary_reached', False)
                     and _bb_get(blackboard, 'verify_wall_near_count', 0) >= 2
@@ -736,6 +780,10 @@ class VerifyController:
                 'holding for operator')
 
     def _wait_for_wall(self, blackboard):
+        if self._report_wall(blackboard) is not None:
+            self.executive._verify_hold(
+                0.25, guard=lambda: self._check_inspection_deadline(blackboard))
+            return 'reacquire'
         if _bb_get(blackboard, 'verify_wall_recheck_after_settle', False):
             self.executive._verify_hold(
                 0.25, guard=lambda: self._check_inspection_deadline(blackboard))
@@ -758,6 +806,8 @@ class VerifyController:
             return 'reacquire'
         # Preparation alone is not progress if its proof is lost during ranging.
         blackboard['verify_settle_failures'] = 0
+        if self._report_wall(blackboard) is not None:
+            return 'ready'
         wall = _bb_get(blackboard, 'verify_wall_latest', None)
         limit = self.config['verify_smoke_inspection_max_distance']
         if wall is not None:
@@ -791,6 +841,7 @@ class VerifyController:
         distance = self._wall_distance(wall)
         if distance >= self.config['verify_smoke_standoff']:
             return False
+        self._clear_report_wall(blackboard)
         target = self._pose()
         retreat = min(self.config['verify_navigation_step'],
                       self.config['verify_smoke_standoff']
@@ -996,6 +1047,8 @@ class VerifyController:
 
     def _recover_fire_height(self, blackboard):
         """Use remembered height alone only when no fresh bearing permits a combined leg."""
+        if self._report_wall(blackboard) is not None:
+            return False
         if (_bb_get(blackboard, 'verify_wall_recheck_deadline', None) is not None
                 or _bb_get(blackboard, 'verify_wall_recheck_after_settle', False)):
             # Wall reconfirmation holds all optional translation. Retain the
@@ -1411,7 +1464,7 @@ class VerifyController:
 
     def _inspection_geometry(self, blackboard, message=None, source='smoke'):
         geometry = None
-        if message is not None:
+        if message is not None and not (source == 'smoke' and self._report_wall(blackboard)):
             geometry = self.executive._verify_target_geometry(message, source=source)
         blackboard['verify_inspection_geometry'] = geometry
         return geometry or {'point': None, 'ground_z': None, 'source': source}
@@ -1595,8 +1648,11 @@ class VerifyController:
             current_fire = self._inspection_fire(blackboard)
             if current_fire is None:
                 return None
-            wall = self.executive._verify_center_fire_wall(current_fire.header.frame_id)
-            self._record_wall_observation(blackboard, wall)
+            retained = self._report_wall(blackboard)
+            wall = retained or self.executive._verify_center_fire_wall(
+                current_fire.header.frame_id)
+            if retained is None:
+                self._record_wall_observation(blackboard, wall)
             action = self._wall_action(blackboard)
             if wall is None:
                 if action == 'approach':
@@ -1619,7 +1675,7 @@ class VerifyController:
                 f'Verify/CENTER_FIRE: 7 x 7 rays across 4.5 x 4.5 m smoke wall '
                 f'mean={wall["mean"]:.2f} m, '
                 f'nearest={wall["nearest"]:.2f} m, uncertainty={wall["uncertainty"]:.2f} m')
-            at_standoff = smoke_wall_standoff_reached(
+            at_standoff = retained is not None or smoke_wall_standoff_reached(
                 wall, standoff, tolerance,
                 max_distance=self.config['verify_smoke_inspection_max_distance'])
             if height_blocked and not at_standoff:
@@ -1816,7 +1872,8 @@ class VerifyController:
                 geometry = self._inspection_geometry(blackboard, centered, source='fire')
                 report = self.executive._verify_report_inspection(
                     geometry, fire_message=centered,
-                    attempts=max(1, _bb_get(blackboard, 'verify_inspection_attempts', 0)))
+                    attempts=max(1, _bb_get(blackboard, 'verify_inspection_attempts', 0)),
+                    guard=lambda: self._inspection_guard(blackboard))
                 self.executive._verify_complete_site(report, message=centered, source='fire')
                 return 'explore'
             if _bb_get(blackboard, 'verify_fire_observed', False) or self.had_fire_confirmation():
@@ -1868,7 +1925,8 @@ class VerifyController:
                 return 'reacquire'
             geometry = self._inspection_geometry(blackboard, smoke, source='smoke')
             report = self.executive._verify_report_inspection(
-                geometry, attempts=blackboard['verify_inspection_attempts'], wall=wall)
+                geometry, attempts=blackboard['verify_inspection_attempts'], wall=wall,
+                guard=lambda: self._inspection_guard(blackboard))
             self.executive._verify_complete_site(report, message=smoke, source='smoke')
             return 'explore'
         except _FireFound:

@@ -1886,6 +1886,7 @@ def test_wall_camera_association_rejects_hits_outside_detected_smoke(planner_fac
     request.smoke_yaw_min_rad, request.smoke_yaw_max_rad = 1.0, 1.2
     rejected = planner.query_geometry(request)
     assert rejected.success and not rejected.smoke_wall_valid, rejected.message
+    assert not rejected.smoke_wall_nearest_point_valid
     assert 'camera-associated rays=0' in rejected.message
 
 
@@ -1911,6 +1912,10 @@ def test_wall_camera_association_uses_translated_and_rotated_source_frame(planne
     response = planner.query_geometry(request)
     assert response.success and response.smoke_wall_valid, response.message
     assert response.smoke_wall_samples == 25
+    assert response.smoke_wall_nearest_point_valid
+    assert response.smoke_wall_nearest_point.header == response.map_header
+    assert response.smoke_wall_nearest_point.header.frame_id != camera.child_frame_id
+    assert response.smoke_wall_nearest_point.point.y > 2.5
     assert 'camera-associated rays=25' in response.message
 
 
@@ -2186,6 +2191,8 @@ def test_wall_depth_groups_do_not_use_an_isolated_nearest_return(planner_factory
     assert response.smoke_wall_samples == 48
     assert response.smoke_wall_nearest_range > 17.5
     assert response.smoke_wall_range == pytest.approx(18.0, abs=0.2)
+    assert response.smoke_wall_nearest_point_valid
+    assert response.smoke_wall_nearest_point.point.x > 17.5
     assert 'depth groups=2, qualified depth groups=1' in response.message
 
 
@@ -2198,6 +2205,7 @@ def test_wall_depth_groups_cannot_combine_coverage_across_fronts(planner_factory
     assert response.success and not response.smoke_wall_valid, response.message
     assert response.smoke_wall_samples == response.smoke_wall_mixed_samples == 0
     assert response.smoke_wall_rows == response.smoke_wall_columns == 0
+    assert not response.smoke_wall_nearest_point_valid
     assert 'depth groups=2, qualified depth groups=0' in response.message
     assert ('largest group rays=4, largest group rows=2, largest group columns=2'
             in response.message)
@@ -2215,6 +2223,8 @@ def test_wall_depth_groups_cannot_borrow_a_distant_groups_mixed_history(planner_
     assert response.smoke_wall_evidence == response.WALL_EVIDENCE_FLICKER
     assert response.smoke_wall_samples == response.smoke_wall_mixed_samples == 3
     assert response.smoke_wall_nearest_range > 29.5
+    assert response.smoke_wall_nearest_point_valid
+    assert response.smoke_wall_nearest_point.point.x > 29.5
     assert 'depth groups=2, qualified depth groups=1' in response.message
 
 
@@ -2282,4 +2292,76 @@ def test_wall_depth_groups_leave_legacy_range_pooling_unchanged(planner_factory)
     assert legacy.smoke_wall_samples == legacy.smoke_wall_mixed_samples == 25
     assert legacy.smoke_wall_range == pytest.approx((9 * 18.0 + 16 * 30.0) / 25, abs=0.2)
     assert legacy.smoke_wall_uncertainty > 5.0
+    assert legacy.smoke_wall_nearest_point_valid
     assert 'depth groups=' not in legacy.message
+
+
+def _wall_voxel_center(sample, depth):
+    from test_smoke_wall_false_positives import ORIGIN, RESOLUTION, _float32, _key
+    row, column = sample
+    coordinates = (ORIGIN[0] + depth,
+                   _float32(_float32(ORIGIN[1]) + column * 0.75),
+                   _float32(_float32(ORIGIN[2]) + row * 0.75))
+    return tuple((_key(value) - 32768 + 0.5) * RESOLUTION for value in coordinates)
+
+
+@pytest.mark.parametrize('route', ['flicker', 'persistent'])
+def test_wall_point_uses_euclidean_nearest_hit_without_changing_nearest_depth(
+        planner_factory, route):
+    planner = planner_factory()
+    frame = 'wall_point_euclidean_nearest'
+    depths = {(-3, -3): 17.8, (0, 0): 18.0, (3, 3): 18.6,
+              (-3, 0): 18.4, (0, 3): 18.4, (3, -3): 18.4}
+    response = _observe_wall_depths(
+        planner, frame, depths, mixed_samples=((-3, -3),) if route == 'flicker' else ())
+    assert response.success and response.smoke_wall_valid, response.message
+    assert response.smoke_wall_nearest_point_valid
+    assert response.smoke_wall_evidence == (
+        response.WALL_EVIDENCE_FLICKER if route == 'flicker'
+        else response.WALL_EVIDENCE_PERSISTENT)
+    point = response.smoke_wall_nearest_point
+    assert point.header == response.map_header
+    assert point.header.frame_id == frame
+    assert point.header.stamp.sec > 0
+    assert tuple(getattr(point.point, axis) for axis in 'xyz') == pytest.approx(
+        _wall_voxel_center((0, 0), 18.0), abs=1e-4)
+    assert response.smoke_wall_nearest_range == pytest.approx(17.8, abs=0.11)
+    assert point.point.x - response.ray_origin.point.x > response.smoke_wall_nearest_range + 0.1
+    assert response.smoke_wall_samples == 6
+
+
+@pytest.mark.parametrize('route', ['flicker', 'persistent'])
+def test_wall_point_preserves_the_actual_off_axis_qualified_hit(planner_factory, route):
+    from test_smoke_wall_false_positives import ORIGIN
+    planner = planner_factory()
+    frame = 'wall_point_off_axis_hit'
+    samples = ((-1, -1), (0, 1), (1, 0), (-1, 1), (0, -1), (1, 1))
+    depths = {sample: 18.0 for sample in samples}
+    depths[(0, 1)] = 17.5
+    response = _observe_wall_depths(
+        planner, frame, depths, mixed_samples=((0, 1),) if route == 'flicker' else ())
+    assert response.success and response.smoke_wall_valid, response.message
+    assert response.smoke_wall_nearest_point_valid
+    point = response.smoke_wall_nearest_point
+    assert point.header == response.map_header
+    assert tuple(getattr(point.point, axis) for axis in 'xyz') == pytest.approx(
+        _wall_voxel_center((0, 1), 17.5), abs=1e-4)
+    assert point.point.y - ORIGIN[1] > 0.5
+    assert response.smoke_wall_nearest_range == pytest.approx(17.5, abs=0.2)
+
+
+def test_wall_point_stays_invalid_for_a_surface_query_without_wall_evidence(planner_factory):
+    planner = planner_factory()
+    # Ordinary single-ray queries stop at unknown cells. Use the dense
+    # observed-free fixture so this test really reaches an unrelated surface.
+    _publish_inspection_map(planner, wall=False)
+    _publish_inspection_map(planner, wall=True)
+    request = _inspection_request()
+    request.smoke_wall_width = 3.0
+    qualified = planner.query_geometry(request)
+    assert qualified.smoke_wall_valid and qualified.smoke_wall_nearest_point_valid
+    request.smoke_wall_width = 0.0
+    surface = planner.query_geometry(request)
+    assert surface.success and surface.surface_valid, surface.message
+    assert not surface.smoke_wall_valid
+    assert not surface.smoke_wall_nearest_point_valid

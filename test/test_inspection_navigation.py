@@ -126,6 +126,27 @@ class Harness(InspectionNavigationMixin):
     def _verify_wall_observation_ready(self):
         return self.wall_observation_ready
 
+    def _verify_prepare_report_view(self, *args, guard=None, **kwargs):
+        """Protocol tests supply a stopped visual view; physical/yaw tests are separate."""
+        from kv_executive.verification import VerificationObservationLost
+        if guard:
+            guard()
+        self.events.append(('report_view',))
+        if not self.wall_observation_ready or not self._inspection_detection_valid(
+                self.smoke, 'smoke'):
+            raise VerificationObservationLost('Fresh smoke in a settled report view is required')
+        self._verify_report_view_after_ns = 0
+        return deepcopy(self.smoke)
+
+    def _inspection_capture_evidence(self, report, fire_message=None, guard=None, *, after_ns=0):
+        """Keep image waiting out of geometry/report protocol tests."""
+        if guard:
+            guard()
+        self.events.append(('capture',))
+        report.evidence_complete = False
+        report.evidence_status = 'images absent in report protocol fixture'
+        report.rgb_evidence.status = report.thermal_evidence.status = 'missing image'
+
     def _snapshot(self, require_armed=False):
         assert require_armed
         return None, deepcopy(self.odometry)
@@ -155,6 +176,10 @@ class Harness(InspectionNavigationMixin):
             smoke_wall_uncertainty=0.2, smoke_wall_samples=25,
             smoke_wall_evidence=1, smoke_wall_mixed_samples=25,
             smoke_wall_rows=5, smoke_wall_columns=5,
+            smoke_wall_nearest_point_valid=True,
+            smoke_wall_nearest_point=PointStamped(
+                header=header(self.now, 'map'),
+                point=Point(x=self.smoke_wall_nearest, z=20.0)),
         )
         ray_header = deepcopy(request.origin.header)
         ray_header.frame_id = 'map'
@@ -165,7 +190,11 @@ class Harness(InspectionNavigationMixin):
         response.ray_direction = Vector3Stamped(
             header=deepcopy(ray_header), vector=Vector3(
                 **dict(zip('xyz', (value / norm for value in direction)))))
+        point_header = deepcopy(response.smoke_wall_nearest_point.header)
         self.on_query(request, response)
+        if (response.smoke_wall_nearest_point is not None
+                and response.smoke_wall_nearest_point.header == point_header):
+            response.smoke_wall_nearest_point.header = deepcopy(response.map_header)
         return response
 
     def _report(self, text):
@@ -214,6 +243,32 @@ def executive(monkeypatch):
     harness = Harness()
     monkeypatch.setattr(inspection.time, 'monotonic', lambda: harness.now)
     return harness
+
+
+def _confirmed_report_wall(executive, *, nearest=None, stamp=None):
+    """Seed explicit historical two-map proof only for report protocol cases."""
+    from kv_executive.mission_navigation import _inverse
+    nearest = executive.smoke_wall_nearest if nearest is None else nearest
+    stamp = executive.now - 10.0 if stamp is None else stamp
+    origin = deepcopy(executive.odometry.pose.pose.position)
+    local = Point(x=origin.x + nearest, y=origin.y, z=origin.z)
+    point = inspection.transform_pose(Pose(
+        position=local, orientation=quaternion_from_yaw(0.0)),
+        _inverse(executive.conversion)).position
+    measured = header(stamp, 'map')
+    measured_ns = inspection._stamp_ns(measured)
+    wall = {
+        'confirmed': True, 'confirmation_stamps': (measured_ns - 1, measured_ns),
+        'nearest_point_valid': True,
+        'nearest_point': PointStamped(header=deepcopy(measured), point=point),
+        'origin': origin, 'axis': (1.0, 0.0, 0.0), 'nearest': nearest,
+        'mean': nearest, 'uncertainty': 0.2, 'map_header': measured,
+        'map_stamp_ns': measured_ns, 'camera_frame': 'rgb_camera', 'bearing': 0.0,
+        'evidence': 'flicker', 'evidence_code': 1, 'samples': 6,
+        'mixed_samples': 1, 'rows': 3, 'columns': 3,
+    }
+    executive._verify_retained_report_wall = deepcopy(wall)
+    return executive._verify_retained_report_wall
 
 
 def test_source_stamped_camera_ray_is_not_replaced_with_current_drone_position(executive):
@@ -320,7 +375,7 @@ def test_near_tree_or_flickering_surface_never_becomes_the_smoke_target(executiv
     assert not executive._verify_source_at_standoff(geometry)
 
 
-def test_fresh_history_associated_smoke_wall_records_an_explicit_proxy_position(executive):
+def test_single_ray_proxy_does_not_replace_the_confirmed_wall_report_position(executive):
     executive.smoke_wall_valid = True
 
     def observed_plume(request, response):
@@ -332,10 +387,12 @@ def test_fresh_history_associated_smoke_wall_records_an_explicit_proxy_position(
 
     executive.on_query = observed_plume
     geometry = executive._verify_target_geometry(executive.smoke)
+    assert geometry['method'] == 'lidar_smoke_plume_proxy'
+    retained = _confirmed_report_wall(executive)
     report = executive._verify_report_inspection(geometry, attempts=3)
     assert report.smoke_location_valid
-    assert report.smoke_location_method == 'lidar_smoke_plume_proxy'
-    assert report.smoke_local_position.point == Point(x=8.0, z=20.0)
+    assert report.smoke_location_method == 'confirmed_smoke_wall_nearest_hit'
+    assert report.smoke_local_position.point == retained['nearest_point'].point
     assert report.smoke_local_position.point != report.observer_local_pose.pose.position
     assert not report.fire_found and not report.fire_location_valid
 
@@ -1567,7 +1624,7 @@ def test_no_fire_report_accepts_observed_smoke_boundary_without_fire_localizatio
     report = executive._verify_report_inspection({}, attempts=3)
 
     assert not report.fire_found and report.status == 'fire_not_found'
-    assert not report.fire_location_valid and not report.smoke_location_valid
+    assert not report.fire_location_valid and report.smoke_location_valid
     assert report.observer_global_valid
 
 
@@ -1646,9 +1703,9 @@ def test_geolocation_rejects_unsupported_reference_or_offset(executive, invalid)
     assert enu_offset_to_fix(fix, east, 0.0, 0.0) is None
 
 
-def test_smoke_only_without_semantic_range_cannot_complete_an_inspection(executive):
+def test_smoke_only_without_confirmed_wall_history_cannot_complete_an_inspection(executive):
     from kv_executive.verification import VerificationObservationLost
-    with pytest.raises(VerificationObservationLost, match='fresh observed smoke boundary'):
+    with pytest.raises(VerificationObservationLost):
         executive._verify_report_inspection(target_geometry(), attempts=3)
     assert not any(event[0] in {'report', 'legacy_report'} for event in executive.events)
 
@@ -1660,9 +1717,11 @@ def test_report_never_relabels_a_stale_anchor_or_obstacle_as_current_smoke(execu
 
     report = executive._verify_report_inspection(stale_anchor, executive.fire, attempts=3)
 
-    assert not report.smoke_location_valid and not report.smoke_global_valid
+    assert report.smoke_location_valid and report.smoke_global_valid
     assert report.fire_found and report.fire_location_valid
-    assert math.isnan(report.smoke_local_position.point.x)
+    retained = executive._verify_retained_report_wall['nearest_point']
+    assert report.smoke_planning_position == retained
+    assert report.smoke_local_position.point != stale_anchor['point']
 
 
 @pytest.mark.parametrize('horizontal', [0.01, 0.3])
@@ -1695,22 +1754,25 @@ def test_missing_surface_and_gps_publish_explicit_unknown_coordinates(executive)
     report = executive._verify_report_inspection({'point': None}, executive.fire, attempts=3)
 
     assert not report.observer_global_valid
-    assert not report.smoke_location_valid and not report.smoke_global_valid
+    assert report.smoke_location_valid and not report.smoke_global_valid
     assert math.isnan(report.smoke_global_position.latitude)
-    assert math.isnan(report.smoke_local_position.point.x)
+    assert math.isfinite(report.smoke_local_position.point.x)
     assert report.fire_location_valid and not report.fire_global_valid
 
 
-def test_fire_becoming_persistent_during_final_query_is_never_reported_not_found(executive):
+def test_fire_becoming_persistent_during_final_view_is_never_reported_not_found(executive):
     executive.smoke_wall_valid = True
     _seed_localized_fire(executive)
     confirmed = deepcopy(executive.fire)
     executive.fire = None
 
-    def fire_arrives(request, response):
-        executive.fire = deepcopy(confirmed)
+    original_view = executive._verify_prepare_report_view
 
-    executive.on_query = fire_arrives
+    def fire_arrives(*args, **kwargs):
+        executive.fire = deepcopy(confirmed)
+        return original_view(*args, **kwargs)
+
+    executive._verify_prepare_report_view = fire_arrives
 
     report = executive._verify_report_inspection(target_geometry(), attempts=3)
 
@@ -1719,7 +1781,7 @@ def test_fire_becoming_persistent_during_final_query_is_never_reported_not_found
     assert report.fire_location_valid
 
 
-@pytest.mark.parametrize('phase', ['query', 'observer_transform'])
+@pytest.mark.parametrize('phase', ['capture', 'observer_transform'])
 def test_confirmed_then_lost_fire_during_report_work_cannot_publish_not_found(executive, phase):
     from kv_executive.verification import VerificationObservationLost
     _trust_smoke_for_commit(executive)
@@ -1729,8 +1791,14 @@ def test_confirmed_then_lost_fire_during_report_work_cannot_publish_not_found(ex
         executive.fire_confirmed = True
         executive.fire = None  # A newer negative detector frame clears guidance.
 
-    if phase == 'query':
-        executive.on_query = lambda request, response: confirmation_then_negative()
+    if phase == 'capture':
+        original_capture = executive._inspection_capture_evidence
+
+        def during_capture(*args, **kwargs):
+            original_capture(*args, **kwargs)
+            confirmation_then_negative()
+
+        executive._inspection_capture_evidence = during_capture
     else:
         original_transform = executive._path_frame_transform
         calls = []
@@ -1756,6 +1824,7 @@ def test_fire_loss_during_geometry_queries_cannot_publish_a_found_report(executi
         header=header(frame='thermal_camera'), detected=True, status=2, CONFIRMED=2,
         yaw_correction_rad=0.0, vertical_correction_rad=-0.5, source_count=1, track_id=42)
     original = deepcopy(executive.fire)
+    _confirmed_report_wall(executive)
 
     def lose_fire(request, response):
         if request.origin.header.frame_id == 'thermal_camera':
@@ -1782,32 +1851,27 @@ def _seed_localized_fire(executive, message=None):
         executive.ray_origin = (25.0, y, 20.0)
         geometry = executive._verify_target_geometry(executive.fire, 'fire')
     assert geometry['target_valid']
+    _confirmed_report_wall(executive)
 
 
 def _trust_smoke_for_commit(executive):
-    """Supply a fresh observed smoke wall to exercise final classification guards."""
-    original = executive._verify_target_geometry
-
-    def localized(message, source='smoke'):
-        geometry = original(message, source)
-        if source == 'smoke':
-            geometry = smoke_boundary_geometry(executive.now)
-        return geometry
-    executive._verify_target_geometry = localized
+    """Supply historical wall proof to exercise final visual/classification guards."""
+    return _confirmed_report_wall(executive)
 
 
-def test_fire_location_used_for_navigation_cannot_be_reported_as_smoke(executive):
+def test_fire_location_used_for_navigation_cannot_replace_retained_smoke(executive):
     executive.smoke_wall_valid = True
     _seed_localized_fire(executive)
-    executive.smoke = None
     fire_anchor = target_geometry(x=35.0)
     fire_anchor['source'] = 'fire'
 
     report = executive._verify_report_inspection(fire_anchor, deepcopy(executive.fire), attempts=3)
 
     assert report.fire_found and report.fire_location_valid
-    assert not report.smoke_location_valid and not report.smoke_global_valid
-    assert math.isnan(report.smoke_local_position.point.x)
+    assert report.smoke_location_valid and report.smoke_global_valid
+    retained = executive._verify_retained_report_wall['nearest_point']
+    assert report.smoke_planning_position == retained
+    assert report.smoke_local_position.point != fire_anchor['point']
 
 
 def test_fire_at_observed_wall_standoff_can_have_distant_localized_coordinates(executive):
@@ -1823,6 +1887,7 @@ def test_fire_at_observed_wall_standoff_can_have_distant_localized_coordinates(e
 def test_visible_fire_can_complete_with_unknown_target_coordinates(executive):
     executive.smoke_wall_valid = True
     executive.fire = _persistent_fire()
+    _confirmed_report_wall(executive)
     report = executive._verify_report_inspection({}, executive.fire)
     assert report.fire_found and not report.fire_location_valid
     assert report.observer_global_valid
@@ -1830,81 +1895,107 @@ def test_visible_fire_can_complete_with_unknown_target_coordinates(executive):
     assert any(event[0] == 'legacy_report' for event in executive.events)
 
 
-@pytest.mark.parametrize('wall_failure', [
-    'missing', 'far', 'too_close', 'uncertain', 'few_samples', 'stale_map'])
-def test_visible_fire_cannot_report_without_fresh_wall_standoff(executive, wall_failure):
-    from kv_executive.verification import VerificationMapUnavailable, VerificationObservationLost
+def test_retained_smoke_point_uses_current_frame_transform_and_gps_offset(executive):
+    retained = deepcopy(_confirmed_report_wall(executive))
+    executive.conversion.translation.x = 100.0
+    executive.conversion.translation.y = -5.0
+    executive.odometry.pose.pose.position = Point(x=104.0, y=-1.0, z=20.0)
+    report = executive._verify_report_inspection({}, attempts=3)
+    assert report.smoke_planning_position == retained['nearest_point']
+    assert report.smoke_local_position.point == Point(x=110.5, y=-5.0, z=20.0)
+    assert report.smoke_local_position.header.stamp == retained['nearest_point'].header.stamp
+    assert report.smoke_global_valid
+    assert report.smoke_global_position.latitude < executive._global_position.latitude
+    assert report.smoke_global_position.longitude > executive._global_position.longitude
+    assert report.smoke_global_position.altitude == executive._global_position.altitude
+    assert not any(event[0] == 'query' for event in executive.events)
+
+
+def test_positive_report_also_requires_fresh_visible_smoke(executive):
+    from kv_executive.verification import VerificationObservationLost
+    _confirmed_report_wall(executive)
     executive.fire = _persistent_fire()
-    executive.smoke_wall_valid = wall_failure != 'missing'
+    executive.smoke = None
+    with pytest.raises(VerificationObservationLost, match='Fresh smoke'):
+        executive._verify_report_inspection({}, executive.fire)
+    assert not any(event[0] in {'report', 'legacy_report'} for event in executive.events)
 
-    def invalidate_wall(request, response):
-        if not request.smoke_wall_width:
-            return
-        if wall_failure == 'far':
-            response.smoke_wall_range = response.smoke_wall_nearest_range = 19.81
-        elif wall_failure == 'too_close':
-            response.smoke_wall_range = response.smoke_wall_nearest_range = 9.0
-        elif wall_failure == 'uncertain':
-            response.smoke_wall_uncertainty = 3.0
-        elif wall_failure == 'few_samples':
-            response.smoke_wall_samples = 1
-        elif wall_failure == 'stale_map':
-            response.map_header = header(executive.now - 6.0, 'map')
 
-    executive.on_query = invalidate_wall
-    with pytest.raises((VerificationObservationLost, VerificationMapUnavailable)):
+@pytest.mark.parametrize('wall_failure', [
+    'missing', 'unconfirmed', 'single_map', 'missing_point', 'wrong_frame', 'nonfinite',
+    'uncertain', 'bad_depth', 'point_stamp'])
+def test_visible_fire_cannot_report_without_confirmed_wall_coordinate(executive, wall_failure):
+    from kv_executive.verification import VerificationObservationLost
+    executive.fire = _persistent_fire()
+    retained = _confirmed_report_wall(executive)
+    if wall_failure == 'missing':
+        executive._verify_retained_report_wall = None
+    elif wall_failure == 'unconfirmed':
+        retained['confirmed'] = False
+    elif wall_failure == 'single_map':
+        retained['confirmation_stamps'] = (1, 1)
+    elif wall_failure == 'missing_point':
+        retained['nearest_point_valid'] = False
+    elif wall_failure == 'wrong_frame':
+        retained['nearest_point'].header.frame_id = 'another_map'
+    elif wall_failure == 'uncertain':
+        retained['uncertainty'] = 3.0
+    elif wall_failure == 'bad_depth':
+        retained['nearest'] = 0.0
+    elif wall_failure == 'point_stamp':
+        retained['nearest_point'].header = header(executive.now - 11.0, 'map')
+    else:
+        retained['nearest_point'].point.x = math.nan
+
+    with pytest.raises(VerificationObservationLost):
         executive._verify_report_inspection({}, executive.fire)
 
     assert not any(event[0] in {'report', 'legacy_report'} for event in executive.events)
     requests = [event[1] for event in executive.events if event[0] == 'query']
-    assert any(request.smoke_wall_width == 4.5 for request in requests)
+    assert not any(request.smoke_wall_width for request in requests)
 
 
-@pytest.mark.parametrize('late_change', ['missing_wall', 'distant_wall', 'fire_lost'])
-def test_found_report_rechecks_wall_and_fire_after_legacy_work(executive, late_change):
+@pytest.mark.parametrize('late_change', ['smoke_lost', 'fire_lost', 'track_changed'])
+def test_found_report_rechecks_visual_evidence_after_legacy_work(executive, late_change):
     from kv_executive.verification import VerificationObservationLost
     executive.fire = _persistent_fire()
-    executive.smoke_wall_valid = True
-    wall_queries = []
+    _confirmed_report_wall(executive)
+    legacy = executive._verify_record_fire
 
-    def change_at_commit(request, response):
-        if not request.smoke_wall_width:
-            return
-        wall_queries.append(request)
-        if len(wall_queries) == 2:
-            if late_change == 'missing_wall':
-                response.smoke_wall_valid = False
-            elif late_change == 'distant_wall':
-                response.smoke_wall_range = response.smoke_wall_nearest_range = 19.81
-            else:
-                executive.fire = None
+    def change_at_commit(*args, **kwargs):
+        result = legacy(*args, **kwargs)
+        if late_change == 'smoke_lost':
+            executive.smoke = None
+        elif late_change == 'fire_lost':
+            executive.fire = None
+        else:
+            executive.fire.track_id += 1
+        return result
 
     original_fire = deepcopy(executive.fire)
-    executive.on_query = change_at_commit
+    executive._verify_record_fire = change_at_commit
     with pytest.raises(VerificationObservationLost):
         executive._verify_report_inspection({}, original_fire)
 
-    assert len(wall_queries) == 2
+    assert not any(event[0] == 'query' and event[1].smoke_wall_width
+                   for event in executive.events)
     assert not any(event[0] in {'report', 'legacy_report'} for event in executive.events)
     assert executive._site_sequence == 0
 
 
-def test_slow_wall_queries_refresh_fire_and_observer_before_commit(executive):
+def test_slow_evidence_capture_refreshes_fire_and_observer_before_commit(executive):
     executive.fire = _persistent_fire()
-    executive.smoke_wall_valid = True
-    wall_queries = []
+    retained = deepcopy(_confirmed_report_wall(executive))
+    capture = executive._inspection_capture_evidence
 
-    def receive_fresh_data_while_waiting(request, response):
-        if not request.smoke_wall_width:
-            return
-        wall_queries.append(request)
+    def receive_fresh_data_while_waiting(*args, **kwargs):
         executive.now += 3.0
         executive.fire.header = header(executive.now, 'thermal_camera')
         executive.smoke.header = header(executive.now, 'rgb_camera')
         executive.odometry.header = header(executive.now)
         executive._global_position.header = header(executive.now, 'gps')
         executive._global_position_received = executive.now
-        response.map_header = header(executive.now, 'map')
+        return capture(*args, **kwargs)
 
     prepare = executive._verify_record_fire
 
@@ -1912,11 +2003,13 @@ def test_slow_wall_queries_refresh_fire_and_observer_before_commit(executive):
         assert (executive.now - inspection._stamp_ns(message) / 1e9) < 2.0
         return prepare(message, *args, **kwargs)
 
-    executive.on_query = receive_fresh_data_while_waiting
+    executive._inspection_capture_evidence = receive_fresh_data_while_waiting
     executive._verify_record_fire = require_current_fire
     report = executive._verify_report_inspection({}, deepcopy(executive.fire))
 
-    assert len(wall_queries) == 2
+    assert not any(event[0] == 'query' and event[1].smoke_wall_width
+                   for event in executive.events)
+    assert report.smoke_planning_position == retained['nearest_point']
     assert inspection._stamp_ns(report.observer_local_pose) == int(executive.now * 1e9)
     assert report.observer_global_valid
     assert report.site_id == 1
@@ -1924,19 +2017,53 @@ def test_slow_wall_queries_refresh_fire_and_observer_before_commit(executive):
         'legacy_report', 'report']
 
 
-def test_stale_observer_after_final_wall_query_prevents_both_reports(executive):
+def test_alignment_change_during_capture_reprojects_targets_and_observer_together(executive):
+    _seed_localized_fire(executive)
+    retained = deepcopy(executive._verify_retained_report_wall['nearest_point'])
+    capture = executive._inspection_capture_evidence
+
+    def realign_during_capture(*args, **kwargs):
+        capture(*args, **kwargs)
+        executive.conversion.translation.x = 5.0
+        executive.conversion.translation.y = -3.0
+        executive.conversion.translation.z = 2.0
+        executive.odometry.pose.pose.position = Point(x=26.0, y=1.0, z=19.0)
+
+    executive._inspection_capture_evidence = realign_during_capture
+    report = executive._verify_report_inspection({}, deepcopy(executive.fire))
+
+    assert report.smoke_planning_position == retained
+    assert report.fire_location_valid
+    assert (report.fire_planning_position.point.x, report.fire_planning_position.point.y,
+            report.fire_planning_position.point.z) == pytest.approx((35.0, 2.0, 2.0))
+    assert report.smoke_local_position.point == Point(x=40.5, y=-3.0, z=22.0)
+    assert (report.fire_local_position.point.x, report.fire_local_position.point.y,
+            report.fire_local_position.point.z) == pytest.approx((40.0, -1.0, 4.0))
+    assert report.observer_local_pose.pose.position == Point(x=26.0, y=1.0, z=19.0)
+    assert report.observer_planning_pose.pose.position == Point(x=21.0, y=4.0, z=17.0)
+    assert report.smoke_local_position.header.stamp == retained.header.stamp
+    for prefix, offset in [('smoke', (14.5, -4.0, 3.0)), ('fire', (14.0, -2.0, -15.0))]:
+        assert getattr(report, prefix + '_global_valid')
+        expected = enu_offset_to_fix(executive._global_position, *offset)
+        actual = getattr(report, prefix + '_global_position')
+        assert actual.latitude == pytest.approx(expected.latitude, rel=0.0, abs=1e-12)
+        assert actual.longitude == pytest.approx(expected.longitude, rel=0.0, abs=1e-12)
+        assert actual.altitude == pytest.approx(expected.altitude)
+    assert not any(event[0] == 'query' and event[1].smoke_wall_width
+                   for event in executive.events)
+
+
+def test_stale_observer_after_evidence_capture_prevents_both_reports(executive):
     from kv_executive.mission_executive import MissionError
     executive.fire = _persistent_fire()
-    executive.smoke_wall_valid = True
-    wall_queries = []
+    _confirmed_report_wall(executive)
+    capture = executive._inspection_capture_evidence
 
-    def lose_telemetry(request, response):
-        if request.smoke_wall_width:
-            wall_queries.append(request)
-            if len(wall_queries) == 2:
-                executive.odometry.header = header(executive.now - 3.0)
+    def lose_telemetry(*args, **kwargs):
+        capture(*args, **kwargs)
+        executive.odometry.header = header(executive.now - 3.0)
 
-    executive.on_query = lose_telemetry
+    executive._inspection_capture_evidence = lose_telemetry
     with pytest.raises(MissionError, match='Observation pose became stale'):
         executive._verify_report_inspection({}, deepcopy(executive.fire))
     assert executive._site_sequence == 0
@@ -2043,6 +2170,36 @@ def test_center_fire_wall_rejects_unverified_distance(executive, reason):
         response.smoke_wall_samples = 1 if reason == 'few_samples' else 25
     executive.on_query = wall
     assert executive._verify_center_fire_wall('thermal_camera') is None
+
+
+@pytest.mark.parametrize('problem', ['missing', 'frame', 'stamp', 'nonfinite'])
+def test_wall_client_rejects_malformed_nearest_hit_coordinates(executive, problem):
+    executive.fire = _persistent_fire()
+    executive.smoke_wall_valid = True
+
+    def malformed(request, response):
+        point = response.smoke_wall_nearest_point
+        if problem == 'missing':
+            response.smoke_wall_nearest_point = None
+        elif problem == 'frame':
+            point.header.frame_id = 'wrong_map'
+        elif problem == 'stamp':
+            point.header = header(executive.now - 1.0, 'map')
+        else:
+            point.point.z = math.nan
+
+    executive.on_query = malformed
+    assert executive._verify_center_fire_wall('thermal_camera') is None
+
+
+def test_wall_without_a_reportable_point_retains_only_its_navigation_depth(executive):
+    executive.fire = _persistent_fire()
+    executive.smoke_wall_valid = True
+    executive.on_query = lambda request, response: setattr(
+        response, 'smoke_wall_nearest_point_valid', False)
+    wall = executive._verify_center_fire_wall('thermal_camera')
+    assert wall is not None and wall['nearest'] == executive.smoke_wall_nearest
+    assert not wall['nearest_point_valid'] and wall['nearest_point'] is None
 
 
 def test_center_fire_wall_rejects_map_aging_during_transform(executive):
@@ -2410,23 +2567,18 @@ def test_smoke_boundary_arrival_avoids_a_final_sub_tolerance_leg(
     assert executive._verify_smoke_boundary_reached(geometry) is arrived
 
 
-@pytest.mark.parametrize('distance,accepted', [
-    (10.5, False), (19.81, False), (20.19, False), (20.2, True), (20.8, True), (20.81, False),
-])
-def test_twenty_metre_setting_applies_to_both_positive_report_publishers(
-        executive, distance, accepted):
-    from kv_executive.verification import VerificationObservationLost
-    executive.config['verify_smoke_standoff'] = 20.0
+@pytest.mark.parametrize('observer_x', [-10.0, -5.0, 0.0, 3.0, 5.0, 8.0])
+def test_report_publishers_preserve_fixed_smoke_coordinate_when_observer_moves(
+        executive, observer_x):
     executive.fire = _persistent_fire()
-    executive.smoke_wall_valid = True
-    executive.smoke_wall_nearest = distance
-    if accepted:
-        assert executive._verify_report_inspection({}, executive.fire).fire_found
-        assert any(e[0] == 'legacy_report' for e in executive.events)
-    else:
-        with pytest.raises(VerificationObservationLost, match='fresh smoke wall'):
-            executive._verify_report_inspection({}, executive.fire)
-        assert not any(e[0] in {'report', 'legacy_report'} for e in executive.events)
+    retained = deepcopy(_confirmed_report_wall(executive))
+    executive.odometry.pose.pose.position.x = observer_x
+    report = executive._verify_report_inspection({}, executive.fire)
+    assert report.fire_found
+    assert report.smoke_planning_position == retained['nearest_point']
+    assert report.observer_local_pose.pose.position.x == observer_x
+    assert any(e[0] == 'legacy_report' for e in executive.events)
+    assert not any(e[0] == 'query' and e[1].smoke_wall_width for e in executive.events)
 
 
 @pytest.mark.parametrize('invalid', [
@@ -2598,39 +2750,38 @@ def test_wall_violation_allows_monotonic_retreat_but_not_deeper_entry(executive)
     assert not executive._verify_wall_plane_path(path(1.0, 0.5, 0.7, 0.0), wall)
 
 
-def test_no_fire_report_accepts_partial_smoke_with_remeasured_wall(executive):
+def test_no_fire_report_accepts_partial_smoke_with_retained_wall(executive):
     executive.smoke.coverage = 0.05
     executive.smoke.regions = [1]
     executive.smoke_wall_valid = True
-    wall = _measured_navigation_wall(executive)
-    wall['map_header'] = header(executive.now - 20.0, 'map')
+    wall = _confirmed_report_wall(executive, stamp=executive.now - 20.0)
     report = executive._verify_report_inspection({}, attempts=3, wall=wall)
     assert report.status == 'fire_not_found' and not report.fire_found
+    assert report.smoke_location_valid
+    assert report.smoke_planning_position == wall['nearest_point']
     probes = [event for event in executive.events if event[0] == 'query'
               and event[1].smoke_wall_width]
-    assert len(probes) == 2
+    assert not probes
 
 
-@pytest.mark.parametrize('failure', ['unavailable', 'far', 'close', 'late_loss', 'prior_fire',
-                                     'unfinished_search'])
-def test_no_fire_report_needs_completed_search_and_current_wall(executive, failure):
+@pytest.mark.parametrize('failure', ['missing', 'single_map', 'wrong_frame', 'nonfinite',
+                                     'smoke_lost', 'prior_fire', 'unfinished_search'])
+def test_no_fire_report_needs_completed_search_confirmed_history_and_current_smoke(
+        executive, failure):
     from kv_executive.verification import VerificationObservationLost
-    executive.smoke_wall_valid = failure != 'unavailable'
+    wall = _confirmed_report_wall(executive)
     executive.fire_confirmed = failure == 'prior_fire'
-    if failure == 'far':
-        executive.smoke_wall_nearest = 30.0
-    elif failure == 'close':
-        executive.smoke_wall_nearest = 8.0
-    probes = []
-
-    def late_loss(request, response):
-        if request.smoke_wall_width:
-            probes.append(request)
-            if failure == 'late_loss' and len(probes) == 2:
-                response.smoke_wall_valid = False
-
-    executive.on_query = late_loss
-    wall = _measured_navigation_wall(executive)
+    if failure == 'missing':
+        executive._verify_retained_report_wall = None
+        wall = None
+    elif failure == 'single_map':
+        wall['confirmation_stamps'] = (1, 1)
+    elif failure == 'wrong_frame':
+        wall['nearest_point'].header.frame_id = 'unknown'
+    elif failure == 'nonfinite':
+        wall['nearest_point'].point.z = math.nan
+    elif failure == 'smoke_lost':
+        executive.smoke = None
     with pytest.raises(VerificationObservationLost):
         executive._verify_report_inspection(
             {}, attempts=2 if failure == 'unfinished_search' else 3, wall=wall)
@@ -2871,43 +3022,42 @@ def test_invalid_camera_request_remains_a_programming_error(executive):
 
 def test_legacy_single_ray_cannot_authorize_a_negative_report_without_aperture(executive):
     from kv_executive.verification import VerificationObservationLost
-    _trust_smoke_for_commit(executive)
     assert executive._verify_smoke_boundary_reached(smoke_boundary_geometry())
     assert not executive.smoke_wall_valid
-    with pytest.raises(VerificationObservationLost, match='fresh observed smoke boundary'):
+    with pytest.raises(VerificationObservationLost):
         executive._verify_report_inspection({}, attempts=3)
     assert not any(event[0] == 'report' for event in executive.events)
 
 
-def test_negative_report_remeasures_fifteen_meter_wall_without_legacy_geometry(executive):
+def test_negative_report_reuses_fifteen_meter_wall_without_ranging_again(executive):
     executive.config['verify_smoke_standoff'] = 15.0
     executive.smoke_wall_valid = True
     executive.smoke_wall_nearest = 15.5
+    retained = _confirmed_report_wall(executive, stamp=executive.now - 60.0)
     report = executive._verify_report_inspection({}, attempts=3)
     assert not report.fire_found
     assert report.status == 'fire_not_found'
     wall_requests = [event[1] for event in executive.events
                      if event[0] == 'query' and event[1].smoke_wall_width]
-    assert len(wall_requests) == 2
-    assert all(request.origin.header.frame_id == executive.smoke.header.frame_id
-               for request in wall_requests)
+    assert not wall_requests
+    assert report.smoke_planning_position == retained['nearest_point']
+    assert inspection._stamp_ns(report.smoke_planning_position) == int(40.0 * 1e9)
 
 
-def test_fire_appearing_during_final_negative_wall_probe_prevents_publication(executive):
+def test_fire_appearing_during_final_negative_capture_prevents_publication(executive):
     from kv_executive.verification import VerificationObservationLost
-    executive.smoke_wall_valid = True
-    probes = []
+    _confirmed_report_wall(executive)
+    capture = executive._inspection_capture_evidence
 
-    def fire_arrives(request, response):
-        if request.smoke_wall_width:
-            probes.append(request)
-            if len(probes) == 2:
-                executive.fire = _persistent_fire(executive.now)
+    def fire_arrives(*args, **kwargs):
+        capture(*args, **kwargs)
+        executive.fire = _persistent_fire(executive.now)
 
-    executive.on_query = fire_arrives
-    with pytest.raises(VerificationObservationLost, match='Smoke or no-fire evidence changed'):
+    executive._inspection_capture_evidence = fire_arrives
+    with pytest.raises(VerificationObservationLost):
         executive._verify_report_inspection({}, attempts=3)
-    assert len(probes) == 2
+    assert not any(event[0] == 'query' and event[1].smoke_wall_width
+                   for event in executive.events)
     assert not any(event[0] == 'report' for event in executive.events)
 
 

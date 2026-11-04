@@ -1440,6 +1440,21 @@ private:
             depth_spread = std::sqrt(variance / ranges.size());
             response->smoke_wall_uncertainty = voxel_uncertainty + depth_spread;
             response->smoke_wall_valid = true;
+            // Preserve the actual sampled 3-D hit. The minimum parallel-ray
+            // depth can belong to an off-axis ray whose Euclidean range is
+            // greater; do not replace the existing conservative depth metric.
+            const auto & qualified = groups[selected].support;
+            const auto nearest = std::min_element(qualified.begin(), qualified.end(),
+                [&](size_t left, size_t right) {
+                  return (hits[left].hit - ray_origin).norm() <
+                         (hits[right].hit - ray_origin).norm();
+                });
+            const auto & nearest_hit = hits[*nearest].hit;
+            response->smoke_wall_nearest_point.header = latest.header;
+            response->smoke_wall_nearest_point.point.x = nearest_hit.x();
+            response->smoke_wall_nearest_point.point.y = nearest_hit.y();
+            response->smoke_wall_nearest_point.point.z = nearest_hit.z();
+            response->smoke_wall_nearest_point_valid = true;
           }
           const char * evidence = "NONE";
           if (response->smoke_wall_evidence == Response::WALL_EVIDENCE_FLICKER) {

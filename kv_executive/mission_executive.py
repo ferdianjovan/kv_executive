@@ -15,6 +15,7 @@ from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import Pose, PoseStamped
 from kv_executive.action import ExecuteMission
 from kv_executive.completed_sites import COMPLETED_SITE_DEFAULTS, CompletedSitesMixin
+from kv_executive.inspection_evidence import EVIDENCE_DEFAULTS
 from kv_executive.inspection_navigation import InspectionNavigationMixin
 from kv_executive.mission_geometry import (
     angular_distance,
@@ -44,7 +45,7 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, qos_profile_sensor_data, QoSProfile
 from rclpy.time import Time
-from sensor_msgs.msg import NavSatFix
+from sensor_msgs.msg import Image, NavSatFix
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
 from yasmin import Blackboard, State, StateMachine
@@ -187,6 +188,8 @@ class MissionExecutive(
         defaults = {
             **VERIFY_DEFAULTS,
             **COMPLETED_SITE_DEFAULTS,
+            **EVIDENCE_DEFAULTS,
+            'inspection_report_history': 2,
             'auto_start_mission': False,
             'robot_base_frame': 'kv_drone/base_link',
             'local_odometry_topic': '/mavros/local_position/odom',
@@ -250,6 +253,8 @@ class MissionExecutive(
                 raise ValueError(f'{name} must not be empty')
         if self.config['setpoint_rate'] <= 2.0:
             raise ValueError('setpoint_rate must exceed the PX4 2 Hz minimum')
+        if self.config['inspection_report_history'] > 10:
+            raise ValueError('inspection_report_history must not exceed ten compressed reports')
         if self.config['offboard_warmup'] < 1.0:
             raise ValueError('offboard_warmup must be at least one second')
         if self.config['verify_step_min'] > self.config['verify_step_max']:
@@ -312,6 +317,8 @@ class MissionExecutive(
         self._site_sequence = 0
         self._initialize_completed_sites()
         self._verify = VerifyController(self, error_type=MissionError)
+        self._inspection_evidence_init()
+        self._inspection_evidence_limits()
 
         # Match MAVROS's reliable, latched state publisher; odometry stays sensor QoS.
         self._state_subscription = self.create_subscription(
@@ -333,11 +340,11 @@ class MissionExecutive(
             10, callback_group=self._callbacks,
         )
         self._smoke_subscription = self.create_subscription(
-            SmokeDetection, self.config['smoke_detection_topic'], self._verify.smoke_callback,
+            SmokeDetection, self.config['smoke_detection_topic'], self._smoke_detection_callback,
             1, callback_group=self._callbacks,
         )
         self._fire_subscription = self.create_subscription(
-            FireDetection, self.config['fire_detection_topic'], self._verify.fire_callback,
+            FireDetection, self.config['fire_detection_topic'], self._fire_detection_callback,
             1, callback_group=self._callbacks,
         )
         self._global_position_subscription = self.create_subscription(
@@ -369,8 +376,18 @@ class MissionExecutive(
         )
         self._inspection_report_publisher = self.create_publisher(
             InspectionReport, 'inspection_reports',
-            QoSProfile(depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+            QoSProfile(depth=self.config['inspection_report_history'],
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
+        image_qos = QoSProfile(
+            depth=1, reliability=qos_profile_sensor_data.reliability,
+            durability=qos_profile_sensor_data.durability)
+        self._rgb_evidence_subscription = self.create_subscription(
+            Image, self.config['inspection_evidence_rgb_topic'],
+            self._inspection_rgb_image_callback, image_qos, callback_group=self._callbacks)
+        self._thermal_evidence_subscription = self.create_subscription(
+            Image, self.config['inspection_evidence_thermal_topic'],
+            self._inspection_thermal_image_callback, image_qos, callback_group=self._callbacks)
         self._setpoint_timer = self.create_timer(
             1.0 / self.config['setpoint_rate'], self._publish_setpoint,
             callback_group=self._callbacks,
@@ -448,6 +465,14 @@ class MissionExecutive(
             self._global_position = deepcopy(message)
             self._global_position_received = time.monotonic()
 
+    def _smoke_detection_callback(self, message):
+        self._inspection_evidence_detection_callback(message, 'smoke')
+        self._verify.smoke_callback(message)
+
+    def _fire_detection_callback(self, message):
+        self._inspection_evidence_detection_callback(message, 'fire')
+        self._verify.fire_callback(message)
+
     def _odometry_callback(self, message):
         input_frame = message.header.frame_id
         is_alias = (
@@ -464,6 +489,7 @@ class MissionExecutive(
             report_alias = is_alias and input_frame not in self._odometry_aliases_reported
             if report_alias:
                 self._odometry_aliases_reported.add(input_frame)
+        self._inspection_evidence_odom_callback(message)
         if report_alias:
             self._report(
                 f'ODOMETRY: MAVROS local label {input_frame!r} uses '
@@ -621,6 +647,9 @@ class MissionExecutive(
         blackboard['verify_wall_close_count'] = 0
         blackboard['verify_wall_recheck_deadline'] = None
         blackboard['verify_wall_recheck_after_settle'] = False
+        blackboard['verify_report_wall'] = None
+        self._verify_retained_report_wall = None
+        self._inspection_reset_evidence()
         blackboard['verify_settle_failures'] = 0
         blackboard['verify_height_hint'] = None
         blackboard['verify_height_hint_consumed'] = 0

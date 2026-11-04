@@ -377,12 +377,13 @@ qualifying rows/columns, range uncertainty and unavailable query results, so a
 missing measurement can be distinguished from insufficient ray coverage.
 The mean range is logged, while the nearest sampled range, measurement
 uncertainty and tracking margin limit approach to `verify_smoke_standoff` (15 m).
-A positive report's conservative distance (nearest range minus uncertainty) must
-be inside the configured inspection band, 15–20 m by default. The maximum
-accepted uncertainty remains 2 m.
+Arrival requires conservative distance (nearest range minus uncertainty) in the
+configured inspection band, 15–20 m by default. The maximum accepted uncertainty
+remains 2 m. Two independent qualifying near observations retain the actual
+nearest hit from the second observation as a fixed map coordinate for reporting.
 
-`APPROACH_SMOKE` probes along the next approach bearing. `SEARCH_FIRE` revalidates
-the nearby wall before entering inspection. Trusted wall observations first
+`APPROACH_SMOKE` probes along the next approach bearing. Until arrival has been
+confirmed, `SEARCH_FIRE` also checks the nearby wall. Trusted wall observations first
 require physical settling in LOITER: at least three distinct fresh odometry
 samples and one continuous wall second below 0.10 m/s translation and 3 degrees/s
 rotation. Pose-derived rates include roll/pitch; stable nonzero tilt is allowed.
@@ -404,8 +405,10 @@ probe timeout leave the ordinary checked forward approach available, including
 when smoke lies beyond the 40 m measurement range. They do not increment a
 range-failure counter or start the inspection clock. Explicit stale-map errors
 still invoke map recovery, and ordinary terrain/corridor checks remain mandatory.
-In `CENTER_FIRE`, missing wall evidence still prevents distance-based completion;
-it does not prevent a separately validated height correction.
+Before arrival is confirmed, missing wall evidence prevents distance-based
+completion in `CENTER_FIRE`; it does not prevent a separately validated height
+correction. After confirmation, missing probes do not erase the retained coordinate
+or impose another ranging requirement on report publication.
 
 A single far candidate can shorten its selected leg, but cannot be projected
 through later legs to declare arrival. Two near observations from distinct
@@ -432,8 +435,12 @@ The viewpoint keeps its heading while a first near vote awaits confirmation.
 After confirmed retreat, the new 20-second recheck starts after physical
 settling, rather than while the vehicle is braking. The overall 600-second
 inspection clock continues through alignment, settling and observation waits.
-Publication still remeasures the boundary: cached observations cannot authorize
-a completed report, and no fire report is inferred from proximity alone.
+Publication reuses the confirmed coordinate and its original measurement time.
+It requires a physically settled viewpoint and a new confirmed forward RGB smoke
+image, in any quadrant, rather than another wall range. When fire is not visible,
+one bounded yaw attempt can face the retained coordinate; visible fire retains
+heading priority. Optional movement still passes the existing terrain, collision
+and clearance checks. Proximity alone cannot establish that fire was found.
 
 Fire-loss retries and blocked movement use independent counters, each bounded by
 `verify_search_recovery_max` (3 by default). A newly accepted persistent fire
@@ -537,10 +544,11 @@ and cannot cut a climb.
 Ordinary fire-guided legs and successful arrival reports require fresh post-stop
 fire guidance; the one-shot edge-recovery search is the bounded exception above.
 The approach is bounded by 64 legs and a 600-second real-time inspection deadline.
-A positive report requires fresh confirmed fire and a fresh wall measurement in
-the configured 15–20 m inspection band, checked again before publication. The
-distance used is the nearest qualifying return minus its uncertainty; the
-maximum accepted uncertainty remains 2 m. Blocked movement,
+A positive report requires fresh confirmed fire, a retained coordinate from two
+qualified arrival observations in the configured 15–20 m band, and fresh forward
+RGB smoke at the settled report viewpoint. Arrival uses the nearest qualifying
+return minus its uncertainty; maximum accepted uncertainty remains 2 m. The
+historical coordinate is not reprojected from the current drone pose. Blocked movement,
 step exhaustion and timeout do not authorize success. A zero step limit permits
 reporting only when already at the measured standoff. Fire coordinates, when
 independently available, remain optional report metadata. The inspection timer
@@ -625,8 +633,8 @@ camera association. An image rectangle is not proof of smoke at a specific depth
 One close observation holds position for reconfirmation. Wall-based retreat
 requires two fresh close observations below 15 m; two prior observations in the
 inspection band do not authorize retreat on one later close glitch. Two fresh
-observations at or within 20 m confirm proximity; inspection requires the current
-measurement to be in the 15–20 m band. This permits `CENTER_FIRE` with confirmed
+observations at or within 20 m confirm proximity; retaining a report coordinate
+requires the confirming measurement to be in the 15–20 m band. This permits `CENTER_FIRE` with confirmed
 fire or `SEARCH_FIRE` otherwise. Fresh evidence beyond 20 m resumes approach. The
 20-second stationary recheck window starts again after a required retreat
 finishes; that movement does not consume its reconfirmation time. The overall
@@ -706,10 +714,10 @@ Without visible fire, measured smoke-boundary proximity permits up to three obse
 windows, with safe lateral viewpoint changes between them. Rejected or
 unfinished viewpoint movements do not count as completed negative inspections.
 A negative report requires all configured observation attempts to finish,
-current confirmed smoke, fresh measured boundary/standoff evidence, and no
+current confirmed smoke, a retained qualified arrival coordinate, and no
 confirmed fire during the inspection. Smoke need not cover all quadrants.
-For an opportunistically measured boundary, the publisher probes again before
-and after other report preparation; a cached plane cannot authorize the result.
+The final visual check uses the retained map coordinate without new wall ranging;
+it cannot authorize a report before the two-observation arrival confirmation.
 Otherwise the result is inconclusive. Previously confirmed fire cannot become
 a negative report during a detector gap: bounded reacquisition either recovers
 fresh fire or finishes as an incomplete, aborted mission holding `AUTO.LOITER`,
@@ -728,17 +736,54 @@ fire localization no longer gates flight or completion.
 
 The retained `inspection_reports` topic publishes
 `kv_executive/msg/InspectionReport`, separating observer pose/GPS from optional
-smoke/fire target coordinates. A positive report also requires a fresh 3 by 3 m
-smoke-wall measurement at the configured standoff. A positive report can have
+fire coordinates and the retained smoke-wall coordinate. The smoke estimate is
+the nearest actual 3D hit in the selected qualified group of the 7 by 7 rays
+across 4.5 by 4.5 m; it is not the wall's mean range added to the drone position.
+Its method is `confirmed_smoke_wall_nearest_hit`, and the point headers retain
+the original map measurement time. `smoke_wall_nearest_depth_m` is historical
+axial depth, not current clearance. A positive report can have
 `fire_location_valid=false`; unknown coordinates remain NaN, never the UAV's
-position relabeled as fire. Missing GPS invalidates only global coordinates.
+position relabeled as fire. Local targets use a current map-to-local transform;
+global targets use the same alignment and a fresh observer GPS fix plus the
+current local displacement to each fixed target. Missing GPS invalidates only
+global coordinates. A smoke-wall point estimates the last confirmed plume
+boundary, not the emitter or the plume's present extent.
 The legacy `fire_sources` topic still reports the observation viewpoint when
 fresh GPS is available. Its exploration exclusion circle is not a fire boundary.
 
+Reports embed original RGB and thermal camera evidence, without burning overlays
+into the pixels. `rgb_evidence` uses JPEG (at most 256 KiB and 1280 pixels on the
+longest side by default); `thermal_evidence` uses lossless PNG (at most 1 MiB),
+preserving original 16-bit samples when provided. Thermal images that cannot fit
+are explicitly unavailable rather than silently reduced or made lossy. Original
+dimensions, encoding, source headers, matching detection bounds/identity and
+image-time local poses accompany each image. Detection bounds refer to the
+original image dimensions. A pose is marked invalid if no sufficiently close
+odometry bracket exists; the current pose is never substituted for capture pose.
+
+Capture waits at most three wall seconds, requires fresh images after the final
+viewpoint is settled, and checks source and receipt age. RGB and thermal source
+stamps must be within 0.5 seconds for `evidence_complete=true`. Missing, stale,
+oversized or unpaired images are described in per-stream `status` and
+`evidence_status`; available images are retained and an otherwise valid finding
+can still publish. Raw image caches are bounded to 16 MiB total and three frames
+per stream; subscriptions keep one sample. `inspection_report_history` retains
+two complete reports by default (maximum ten), rather than 100 image-bearing
+reports. Record `inspection_reports` with rosbag if longer-term review is needed.
+Camera topics can be set with `inspection_evidence_rgb_topic` and
+`inspection_evidence_thermal_topic` launch arguments.
+
+This changes the inspection report and geometry service interfaces: rebuild
+`kv_executive` and restart autonomy and report/service consumers together.
+The pre-change rollback tag is
+`checkpoint-before-inspection-evidence-20261104` (executive commit `85369af`),
+also present in the relevant perception and simulator repositories. See the
+[validation report](test/reports/inspection_evidence_validation_20261104.md).
+
 `query_inspection_geometry` retains source-stamped camera rays for optional
-multi-view estimation. A fresh nearby, history-associated plume wall can be
-recorded with method `lidar_smoke_plume_proxy`; it is an observed wall estimate,
-not a measured emitter location. Unassociated obstacles are not smoke positions.
+multi-view fire estimation. Its older single-ray plume proxy remains available
+to geometry clients but is not the smoke coordinate used in completed inspection
+reports. Unassociated obstacles are not smoke positions.
 Terrain heights select candidate altitudes; the full corridor must independently
 pass the configured collision and terrain policy
 before OFFBOARD, after warmup, during flight and on arrival. Revalidation pins

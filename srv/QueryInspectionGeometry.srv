@@ -87,6 +87,13 @@ uint8 smoke_wall_evidence
 float64 smoke_wall_range
 float64 smoke_wall_nearest_range
 float64 smoke_wall_uncertainty
+# Actual occupied hit nearest to ray_origin in Euclidean distance, selected
+# only from the independently qualified depth group. Header is map_header:
+# this preserves the map measurement time, separately from the camera ray time.
+# This point does not change smoke_wall_nearest_range, which remains the
+# minimum parallel-ray depth used by existing motion/standoff checks.
+bool smoke_wall_nearest_point_valid
+geometry_msgs/PointStamped smoke_wall_nearest_point
 uint32 smoke_wall_samples
 # Mixed occupied/free support is a subset of extended current occupied support.
 uint32 smoke_wall_mixed_samples

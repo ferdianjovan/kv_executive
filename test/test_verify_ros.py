@@ -6,6 +6,7 @@ import threading
 import time
 
 from action_msgs.msg import GoalStatus
+import cv2
 from geometry_msgs.msg import Point, PointStamped, TransformStamped
 from kv_executive.detection_monitor import DetectionMonitor
 from kv_executive.mission_geometry import (
@@ -17,10 +18,12 @@ from kv_executive.msg import (
 from kv_executive.srv import QueryInspectionGeometry
 from kv_perception.msg import FireDetection, SmokeDetection
 from nav_msgs.msg import Odometry
+import numpy as np
 import pytest
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
+from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
 from test_mission_action import (
@@ -31,6 +34,20 @@ from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 
 mission = mission_fixture
+
+
+def _with_wall_hit(response):
+    """Export the explicit synthetic map hit measured by this test service."""
+    if not hasattr(response, 'smoke_wall_valid'):
+        return response
+    response.smoke_wall_nearest_point_valid = bool(response.smoke_wall_valid)
+    if response.smoke_wall_valid:
+        response.smoke_wall_nearest_point.header = deepcopy(response.map_header)
+        origin, axis = response.ray_origin.point, response.ray_direction.vector
+        response.smoke_wall_nearest_point.point = Point(**{
+            name: getattr(origin, name) + response.smoke_wall_nearest_range * getattr(axis, name)
+            for name in 'xyz'})
+    return response
 
 
 class MonitoringSensors(Node):
@@ -55,6 +72,12 @@ class MonitoringSensors(Node):
         self.smoke_wall_range = None
         self.approach_wall_range = None
         self.detection_latency = 0.0
+        self.image_streams = set()
+        self.evidence_width, self.evidence_height = 64, 48
+        self.rgb_pixels = np.zeros((48, 64, 3), dtype=np.uint8)
+        self.rgb_pixels[:] = (30, 80, 170)
+        self.thermal_pixels = (1000 + np.arange(48 * 64, dtype=np.uint16).reshape(48, 64) * 13)
+        self.image_stamps = {'rgb': [], 'thermal': []}
         self.closed = False
         self.phases = []
         self.reports = []
@@ -75,6 +98,10 @@ class MonitoringSensors(Node):
         self.fire_publisher = self.create_publisher(
             FireDetection, 'fire/detection', reliable,
         )
+        self.rgb_image_publisher = self.create_publisher(
+            Image, '/kv_drone/rgb_camera/image', qos_profile_sensor_data)
+        self.thermal_image_publisher = self.create_publisher(
+            Image, '/kv_drone/thermal_camera/image', qos_profile_sensor_data)
         self.battery_publisher = self.create_publisher(
             BatteryReturnEstimate, 'battery_return_estimate', reliable,
         )
@@ -175,7 +202,29 @@ class MonitoringSensors(Node):
                     (fire.yaw_correction_rad,
                      fire.vertical_correction_rad) = self.fire_guidance()
                 self.fire_positive_times.append(time.monotonic())
+            if self.image_streams and fire.detected:
+                fire.image_width, fire.image_height = self.evidence_width, self.evidence_height
+                fire.bbox_x, fire.bbox_y = 27, 20
+                fire.bbox_width, fire.bbox_height = 10, 8
+                fire.center_x, fire.center_y = 31.5, 23.5
+                fire.area_px = 80
             self.fire_publisher.publish(fire)
+            if self.image_streams:
+                # Match the actual source image, not the later detector arrival.
+                for stream, pixels, header in (
+                        ('rgb', self.rgb_pixels, smoke.header),
+                        ('thermal', self.thermal_pixels, fire.header)):
+                    if stream not in self.image_streams:
+                        continue
+                    message = Image(header=deepcopy(header), height=pixels.shape[0],
+                                    width=pixels.shape[1], is_bigendian=False,
+                                    encoding='rgb8' if stream == 'rgb' else 'mono16',
+                                    step=pixels.shape[1] * (3 if stream == 'rgb' else 2),
+                                    data=pixels.tobytes())
+                    publisher = (self.rgb_image_publisher if stream == 'rgb'
+                                 else self.thermal_image_publisher)
+                    publisher.publish(message)
+                    self.image_stamps[stream].append(deepcopy(header.stamp))
 
     def battery_alert(self, fcu, *, available=True):
         with fcu.lock:
@@ -299,7 +348,7 @@ def monitoring_sensors(mission):
                 distance is not None and 0.0 < distance <= request.max_range)
             if response.smoke_wall_valid:
                 response.smoke_wall_range = response.smoke_wall_nearest_range = distance
-        return response
+        return _with_wall_hit(response)
 
     fcu.geometry_service.callback = measured_smoke_wall
     _install_camera_transforms(sensors, executive.config['robot_base_frame'])
@@ -541,7 +590,7 @@ def _use_fixed_smoke_wall(fcu, initial_distance):
             response.ray_direction.vector = deepcopy(axis)
             response.smoke_wall_valid = 0.0 < distance <= request.max_range
             response.smoke_wall_range = response.smoke_wall_nearest_range = distance
-        return response
+        return _with_wall_hit(response)
 
     fcu.geometry_service.callback = query
     return wall
@@ -638,10 +687,10 @@ def _delay_inspection_maps(fcu, *, duration=None):
             response.map_header.frame_id = 'px4_odom'
             response.map_header.stamp = fcu.get_clock().now().to_msg()
             response.map_header.stamp.sec -= 10
-            return response
+            return _with_wall_hit(response)
         response = original(request, response)
         fresh.append(now)
-        return response
+        return _with_wall_hit(response)
 
     fcu.geometry_service.callback = delayed
     return rejected, fresh
@@ -743,7 +792,7 @@ def test_repeated_map_outages_resume_after_offboard_warmup_outlasts_first_budget
             response.map_header.frame_id = 'px4_odom'
             response.map_header.stamp = fcu.get_clock().now().to_msg()
             response.map_header.stamp.sec -= 10
-            return response
+            return _with_wall_hit(response)
         return original(request, response)
 
     fcu.geometry_service.callback = interrupted_maps
@@ -1189,7 +1238,7 @@ def test_approach_uses_lower_right_slope_when_straight_and_left_are_higher(
                 if point.z - sloping_terrain(point.x, point.y) < request.minimum_agl - 1e-6:
                     response.corridor_safe = False
                     response.message = 'The sampled ridge/tree-side corridor lacks clearance'
-        return response
+        return _with_wall_hit(response)
 
     def recorded_plan(request, response):
         with fcu.lock:
@@ -1717,8 +1766,18 @@ def test_smoke_occlusion_hold_keeps_fire_and_cancellation_priority(
     else:
         with sensors.lock:
             sensors.source = 'fire'
-        wait_for(lambda: bool(sensors.inspection_snapshot()), 4.0,
-                 'visible fire to interrupt the smoke grace hold immediately')
+        wait_for(
+            lambda: any(stamp > interrupted_at and 'stopped fire heading aligned' in text
+                        for stamp, text in fcu.statuses),
+            4.0, 'visible fire to interrupt the smoke grace hold immediately')
+        assert not sensors.inspection_snapshot()
+        # Persistent thermal fire keeps its priority during the RGB gap, but
+        # final reporting also needs fresh smoke in the forward RGB camera.
+        with sensors.lock:
+            sensors.smoke_suppressed_until = 0.0
+            sensors.source = 'smoke_fire'
+        wait_for(lambda: bool(sensors.inspection_snapshot()), 15.0,
+                 'returned RGB smoke to permit the retained-wall fire report')
         assert sensors.inspection_snapshot()[0].fire_found
         with fcu.lock:
             assert len(fcu.target_requests) == misses[0][3]
@@ -1800,6 +1859,158 @@ def test_visible_fire_inside_inspection_band_reports_without_translation(
         assert any('2/2' in text for text in confirmations)
     finally:
         cancel_goal(goal)
+    _assert_airborne_safety(mission)
+
+
+@pytest.mark.parametrize('fire_visible,streams', [
+    (True, {'rgb', 'thermal'}), (True, {'rgb'}), (True, {'thermal'}),
+    (True, set()), (False, {'rgb', 'thermal'}),
+], ids=['fire_both', 'fire_rgb_only', 'fire_thermal_only', 'fire_no_images', 'no_fire_both'])
+def test_report_embeds_source_images_and_retained_wall_after_final_view(
+    mission, monitoring_sensors, fire_visible, streams,
+):
+    """DDS reports preserve historical geometry and independently qualified images."""
+    sensors, fcu, executive = monitoring_sensors, mission.fcu, mission.executive
+    controller = executive._verify
+    original_confirm = controller._confirm_report_wall
+    original_report = executive._verify_report_inspection
+    original_geometry = fcu.geometry_service.callback
+    confirmed, probes, report_queries = [], [], []
+    correct_height = fire_visible and streams == {'rgb', 'thermal'}
+    with fcu.lock:
+        initial = deepcopy(fcu.pose)
+        fcu.inspection_terrain_z = initial.position.z - 7.0
+    desired_z = initial.position.z + (0.5 if correct_height else 0.0)
+
+    def guidance():
+        with fcu.lock:
+            difference = desired_z - fcu.pose.position.z
+        return 0.0, math.copysign(0.2, difference) if abs(difference) > 0.03 else 0.0
+
+    def record_geometry(request, response):
+        response = original_geometry(request, response)
+        if request.smoke_wall_width:
+            probes.append(deepcopy(response.map_header))
+        return _with_wall_hit(response)
+
+    def record_confirmation(board, wall, previous_stamp):
+        original_confirm(board, wall, previous_stamp)
+        if executive._verify_retained_report_wall is not None and not confirmed:
+            confirmed.append((deepcopy(executive._verify_retained_report_wall), len(probes)))
+
+    def record_report(*args, **kwargs):
+        before = len(probes)
+        report = original_report(*args, **kwargs)
+        report_queries.append((before, len(probes)))
+        return report
+
+    for config in (executive.config, controller.config):
+        config.update(verify_fire_approach_max_steps=3 if correct_height else 0,
+                      verify_viewpoint_lateral_step=0.4, mode_timeout=8.0)
+    with sensors.lock:
+        sensors.image_streams = streams
+        # Images arrive after their source exposure and have real bracketing
+        # odometry, rather than pretending the report pose was the image pose.
+        sensors.detection_latency = 0.08
+        sensors.smoke_regions = [SmokeDetection.BOTTOM_RIGHT]
+        sensors.smoke_coverage = 0.02
+        sensors.fire_guidance = guidance
+        sensors.approach_wall_range = 18.1
+    controller._confirm_report_wall = record_confirmation
+    executive._verify_report_inspection = record_report
+    fcu.geometry_service.callback = record_geometry
+    if fire_visible:
+        goal = _start_visible_fire(mission, sensors)
+    else:
+        goal = _start_airborne_exploration(mission)
+        with sensors.lock:
+            sensors.source = 'smoke'
+    result = goal.get_result_async()
+
+    def inspected():
+        assert not result.done(), result.result().result.message if result.done() else ''
+        return bool(sensors.inspection_snapshot()) and bool(report_queries)
+
+    try:
+        wait_for(inspected, executive.config['verify_inspection_timeout'],
+                 'retained wall, final fresh visual smoke, and bounded source-image capture')
+        with sensors.lock:
+            sensors.source = None
+        report = sensors.inspection_snapshot()[0]
+        assert report.fire_found == fire_visible
+        assert report.inspection_attempts == (1 if fire_visible else 3)
+        assert confirmed
+        assert report_queries and all(before == after for before, after in report_queries)
+        if not correct_height:
+            assert len(probes) == confirmed[0][1]
+        else:
+            # Keep the existing fresh wall check for the optional movement;
+            # completion and image capture perform no additional ranging.
+            assert len(probes) == confirmed[0][1] + 1
+        wall = confirmed[0][0]
+        assert len(set(wall['confirmation_stamps'])) == 2
+        assert report.smoke_wall_confirmed and report.smoke_location_valid
+        assert report.smoke_location_method == 'confirmed_smoke_wall_nearest_hit'
+        assert report.smoke_planning_position == wall['nearest_point']
+        assert report.smoke_local_position == wall['nearest_point']
+        assert report.smoke_global_valid
+        assert report.smoke_uncertainty_m == wall['uncertainty']
+        assert report.observer_local_pose.pose.position.z == pytest.approx(desired_z, abs=0.03)
+        if correct_height:
+            # The wall hit stays at its measured height while the drone moves;
+            # adding the old range to this newer pose would change that hit.
+            assert report.observer_local_pose.pose.position.z - wall['origin'].z > 0.45
+            assert report.smoke_planning_position.point.z == initial.position.z
+        assert report.evidence_complete == (streams == {'rgb', 'thermal'})
+        final_epoch = executive._verify_report_view_after_ns
+        for stream, evidence in (('rgb', report.rgb_evidence),
+                                 ('thermal', report.thermal_evidence)):
+            assert evidence.valid == (stream in streams)
+            assert evidence.status
+            if stream not in streams:
+                assert not evidence.image.data
+                continue
+            assert evidence.image.header.stamp in sensors.image_stamps[stream]
+            stamp = evidence.image.header.stamp
+            source_ns = stamp.sec * 10**9 + stamp.nanosec
+            assert source_ns > final_epoch
+            assert evidence.observer_pose_valid
+            assert evidence.observer_local_pose.header.stamp == stamp
+            assert evidence.observer_local_pose.header.frame_id == 'px4_odom'
+            assert evidence.observer_local_pose.pose.position.z == pytest.approx(
+                desired_z, abs=0.03)
+            assert evidence.detection_valid
+            assert evidence.detection_header == evidence.image.header
+            assert evidence.original_width == evidence.stored_width == 64
+            assert evidence.original_height == evidence.stored_height == 48
+            decoded = cv2.imdecode(np.frombuffer(bytes(evidence.image.data), dtype=np.uint8),
+                                   cv2.IMREAD_UNCHANGED)
+            if stream == 'rgb':
+                assert evidence.image.header.frame_id == 'test_rgb_camera'
+                assert evidence.original_encoding == 'rgb8'
+                assert '; jpeg compressed bgr8' in evidence.image.format
+                assert decoded.shape == (48, 64, 3)
+                assert np.max(np.abs(decoded.astype(int)
+                                     - sensors.rgb_pixels[:, :, ::-1].astype(int))) <= 3
+                assert evidence.detected
+            else:
+                assert evidence.image.header.frame_id == 'test_thermal_camera'
+                assert evidence.original_encoding == 'mono16'
+                assert '; png compressed mono16' in evidence.image.format
+                assert decoded.dtype == np.uint16
+                assert np.array_equal(decoded, sensors.thermal_pixels)
+                assert evidence.detected == fire_visible
+                if fire_visible:
+                    assert evidence.track_id == 42 and evidence.source_count == 2
+                    assert (evidence.bbox_x, evidence.bbox_y, evidence.bbox_width,
+                            evidence.bbox_height) == (27, 20, 10, 8)
+        assert not result.done()
+    finally:
+        if not result.done():
+            cancel_goal(goal)
+        controller._confirm_report_wall = original_confirm
+        executive._verify_report_inspection = original_report
+        fcu.geometry_service.callback = original_geometry
     _assert_airborne_safety(mission)
 
 
@@ -1958,17 +2169,17 @@ def test_settled_fire_recovery_restarts_only_fire_loss_retries(
                     sensors.source = 'smoke_fire'
             elif len(losses) == 3:
                 final_loss.set()
-                # Keep a fourth loss from racing the test observer; wall
-                # revalidation remains unavailable so no report can slip out.
+                # Keep a fourth thermal loss from racing the observer, while
+                # withholding final RGB visual proof so no report can slip out.
                 with sensors.lock:
-                    sensors.source = 'smoke_fire'
+                    sensors.source = 'fire'
         original_report(message, error=error)
 
     def final_wall_unavailable(request, response):
         response = original_geometry(request, response)
         if final_loss.is_set() and request.smoke_wall_width:
             response.smoke_wall_valid = False
-        return response
+        return _with_wall_hit(response)
 
     controller._search_blocked = observed_blocked
     controller._recover_fire_loss = observed_recovered
@@ -2246,7 +2457,7 @@ def test_opportunistic_wall_arrival_searches_and_reports_without_broad_smoke(
             distance = standoff + (2.15 if len(probes) == 1 else 2.12)
             response.smoke_wall_valid = True
             response.smoke_wall_range = response.smoke_wall_nearest_range = distance
-        return response
+        return _with_wall_hit(response)
 
     fcu.geometry_service.callback = moving_near_wall
     goal = _start_airborne_exploration(mission)
@@ -2264,7 +2475,7 @@ def test_opportunistic_wall_arrival_searches_and_reports_without_broad_smoke(
         report = sensors.inspection_snapshot()[0]
         assert not report.fire_found and report.status == 'fire_not_found'
         assert report.inspection_attempts == 3
-        assert not report.fire_location_valid and not report.smoke_location_valid
+        assert not report.fire_location_valid and report.smoke_location_valid
         with fcu.lock:
             statuses = [text for _, text in fcu.statuses]
             requests = [request for request in fcu.geometry_requests
@@ -2299,7 +2510,7 @@ def test_single_far_wall_candidate_cannot_latch_arrival_after_later_missing_retu
             probes.append(time.monotonic())
             response.smoke_wall_valid = len(probes) == 1
             response.smoke_wall_range = response.smoke_wall_nearest_range = maximum + 3.0
-        return response
+        return _with_wall_hit(response)
 
     fcu.geometry_service.callback = isolated_wall
     goal = _start_airborne_exploration(mission)
@@ -2342,7 +2553,7 @@ def test_one_close_wall_then_missing_holds_until_a_fresh_far_range(
             response.smoke_wall_valid = state['release'] or state['probes'] == 1
             distance = maximum + 3.0 if state['release'] else 8.0
             response.smoke_wall_range = response.smoke_wall_nearest_range = distance
-        return response
+        return _with_wall_hit(response)
 
     fcu.geometry_service.callback = transient_close_wall
     goal = _start_airborne_exploration(mission)
@@ -2372,10 +2583,10 @@ def test_one_close_wall_then_missing_holds_until_a_fresh_far_range(
 
 @pytest.mark.parametrize('evidence', ['flicker', 'persistent'])
 @pytest.mark.parametrize('fire_visible', [False, True], ids=['search_smoke', 'center_fire'])
-def test_two_qualified_maps_across_wall_gap_route_without_stale_success(
+def test_two_qualified_maps_across_wall_gap_report_retained_coordinate(
     mission, monitoring_sensors, evidence, fire_visible,
 ):
-    """Both evidence routes retain one vote through gaps, never its live range."""
+    """Both evidence routes confirm across gaps, then report the retained map hit."""
     sensors, fcu = monitoring_sensors, mission.fcu
     original_geometry = fcu.geometry_service.callback
     controller = mission.executive._verify
@@ -2398,7 +2609,7 @@ def test_two_qualified_maps_across_wall_gap_route_without_stale_success(
             response.smoke_wall_evidence = (response.WALL_EVIDENCE_FLICKER
                                             if evidence == 'flicker'
                                             else response.WALL_EVIDENCE_PERSISTENT)
-        return response
+        return _with_wall_hit(response)
 
     def recorded_wall(blackboard, wall):
         previous = blackboard['verify_wall_last_stamp_ns']
@@ -2473,18 +2684,25 @@ def test_two_qualified_maps_across_wall_gap_route_without_stale_success(
         assert len(accepted) >= 2
         assert len(set(accepted)) == len(accepted)
         # The first new supported map after the gap completes the retained
-        # vote. Further fresh ranges may be needed if physical proof lapses
-        # before the state transition; those ranges must not hide lost memory.
+        # vote. The final visual check requires fresh smoke, not a third map.
         assert near_counts[:2] == [1, 2]
         assert all(request.smoke_wall_extended_evidence and request.smoke_wall_width == 4.5
                    for request in probes)
         if evidence == 'persistent':
             assert all(request.smoke_wall_camera_roi for request in probes)
-        # Every later probe is missing. Historical votes permit routing only;
-        # they cannot publish success without a current qualified wall range.
-        wait_for(lambda: len(probes) > accepted_probe_counts[-1], 5.0,
-                 'a missing post-arrival wall revalidation')
-        assert not sensors.inspection_snapshot()
+        frozen_probe_count = len(probes)
+        retained = deepcopy(mission.executive._verify_retained_report_wall)
+        wait_for(lambda: bool(sensors.inspection_snapshot()),
+                 config['verify_inspection_timeout'],
+                 'fresh visual inspection using the twice-confirmed historical wall hit')
+        with sensors.lock:
+            sensors.source = None
+        report = sensors.inspection_snapshot()[0]
+        assert report.fire_found == fire_visible
+        assert report.smoke_location_valid and report.smoke_wall_confirmed
+        assert report.smoke_planning_position == retained['nearest_point']
+        assert len(probes) == frozen_probe_count
+        assert len(accepted) == 2
         assert not result.done()
     finally:
         if not result.done():
@@ -2531,7 +2749,7 @@ def test_loiter_braking_finishes_before_stationary_wall_evidence(
             response.smoke_wall_evidence = (response.WALL_EVIDENCE_FLICKER
                                             if evidence == 'flicker'
                                             else response.WALL_EVIDENCE_PERSISTENT)
-        return response
+        return _with_wall_hit(response)
 
     executive._verify_parent_entry = enter_then_brake
     fcu.telemetry_timer.callback = coast_then_publish
@@ -2602,7 +2820,7 @@ def test_motion_during_wall_query_holds_until_a_new_settled_viewpoint(
             response.smoke_wall_evidence = (response.WALL_EVIDENCE_FLICKER
                                             if evidence == 'flicker'
                                             else response.WALL_EVIDENCE_PERSISTENT)
-        return response
+        return _with_wall_hit(response)
 
     def report_hold(message, error=False):
         if query_started.is_set() and 'stationary observation withheld;' in message:
@@ -2677,7 +2895,7 @@ def test_replayed_near_wall_map_cannot_confirm_arrival(mission, monitoring_senso
             probes.append(time.monotonic())
             response.smoke_wall_valid = True
             response.smoke_wall_range = response.smoke_wall_nearest_range = standoff + 0.12
-        return response
+        return _with_wall_hit(response)
 
     fcu.geometry_service.callback = repeated_observation
     goal = _start_airborne_exploration(mission)
@@ -2703,7 +2921,7 @@ def test_replayed_near_wall_map_cannot_confirm_arrival(mission, monitoring_senso
 def test_near_wall_then_farther_observation_resumes_checked_approach(
     mission, monitoring_sensors, near_observations,
 ):
-    """Wind-driven farther returns reset near confirmation without trapping inspection."""
+    """Far returns reset a single vote; two accepted votes complete arrival."""
     sensors, fcu = monitoring_sensors, mission.fcu
     for config in (mission.executive.config, mission.executive._verify.config):
         config['mode_timeout'] = 8.0
@@ -2718,27 +2936,34 @@ def test_near_wall_then_farther_observation_resumes_checked_approach(
             distance = standoff + (0.12 if len(probes) <= near_observations else 8.0)
             response.smoke_wall_valid = True
             response.smoke_wall_range = response.smoke_wall_nearest_range = distance
-        return response
+        return _with_wall_hit(response)
 
     fcu.geometry_service.callback = moving_wall
     goal = _start_airborne_exploration(mission)
     with sensors.lock:
         sensors.source = 'smoke'
     try:
-        wait_for(lambda: len(fcu.target_requests) >= 2, 45.0,
-                 'a farther fresh wall observation to resume normal approach')
-        with fcu.lock:
-            statuses = [text for _, text in fcu.statuses]
-        assert len(probes) >= 3
         if near_observations == 1:
+            wait_for(lambda: len(fcu.target_requests) >= 2, 45.0,
+                     'a farther fresh wall observation to resume normal approach')
+            with fcu.lock:
+                statuses = [text for _, text in fcu.statuses]
+            assert len(probes) >= 3
             assert 'Verify/SEARCH_FIRE: started' not in statuses
             assert 'Verify/CENTER_FIRE: started' not in statuses
+            assert not sensors.inspection_snapshot()
+            _assert_terrain_planning(mission)
         else:
+            wait_for(lambda: bool(sensors.inspection_snapshot()),
+                     mission.executive.config['verify_inspection_timeout'],
+                     'fresh visual inspection after two accepted near observations')
+            with sensors.lock:
+                sensors.source = None
+            with fcu.lock:
+                statuses = [text for _, text in fcu.statuses]
             assert 'Verify/SEARCH_FIRE: started' in statuses
-            first_search = statuses.index('Verify/SEARCH_FIRE: started')
-            assert 'Verify/APPROACH_SMOKE: started' in statuses[first_search + 1:]
-        assert not sensors.inspection_snapshot()
-        _assert_terrain_planning(mission)
+            assert len(probes) == 2
+            assert sensors.inspection_snapshot()[0].smoke_location_valid
     finally:
         cancel_goal(goal)
     _assert_airborne_safety(mission)
@@ -2763,7 +2988,7 @@ def test_missing_smoke_at_confirmed_wall_uses_bounded_reacquisition_without_stat
             probes.append(time.monotonic())
             response.smoke_wall_valid = True
             response.smoke_wall_range = response.smoke_wall_nearest_range = standoff + 0.12
-        return response
+        return _with_wall_hit(response)
 
     fcu.geometry_service.callback = wall_then_smoke_gap
     original_report = mission.executive._report
@@ -2840,7 +3065,7 @@ def test_observed_smoke_boundary_stops_advance_and_bounds_negative_inspection(
     report = sensors.inspection_snapshot()[0]
     assert not report.fire_found and report.status == 'fire_not_found'
     assert report.inspection_attempts == 3
-    assert not report.fire_location_valid and not report.smoke_location_valid
+    assert not report.fire_location_valid and report.smoke_location_valid
     viewpoints = _assert_terrain_planning(mission)[-2:]
     assert len(viewpoints) == 2
     first, second = (request.target.pose.position for request in viewpoints)
@@ -3089,7 +3314,7 @@ def test_smoke_leg_uses_only_qualified_boundary_for_final_clipping(
             aperture_queries.append(deepcopy(request))
             response.smoke_wall_valid = len(aperture_queries) == 1
             response.smoke_wall_range = response.smoke_wall_nearest_range = standoff + 0.8
-        return response
+        return _with_wall_hit(response)
 
     if wall_source == 'aperture_once':
         fcu.geometry_service.callback = one_aperture_measurement

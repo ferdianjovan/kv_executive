@@ -92,6 +92,16 @@ def generate_launch_description():
                 description='Planner frame for targeted Verify paths',
             ),
             DeclareLaunchArgument(
+                'inspection_evidence_rgb_topic',
+                default_value=['/', drone_name, '/rgb_camera/image'],
+                description='Original RGB images retained for inspection evidence',
+            ),
+            DeclareLaunchArgument(
+                'inspection_evidence_thermal_topic',
+                default_value=['/', drone_name, '/thermal_camera/image'],
+                description='Original thermal images retained for inspection evidence',
+            ),
+            DeclareLaunchArgument(
                 'global_position_topic',
                 default_value='/mavros/global_position/global',
                 description='GPS fixes for verified fire observation reports',
@@ -196,6 +206,10 @@ def generate_launch_description():
                             'robot_base_frame': LaunchConfiguration('robot_base_frame'),
                             'smoke_detection_topic': LaunchConfiguration('smoke_detection_topic'),
                             'fire_detection_topic': LaunchConfiguration('fire_detection_topic'),
+                            'inspection_evidence_rgb_topic': LaunchConfiguration(
+                                'inspection_evidence_rgb_topic'),
+                            'inspection_evidence_thermal_topic': LaunchConfiguration(
+                                'inspection_evidence_thermal_topic'),
                             'verify_planning_frame': LaunchConfiguration('verify_planning_frame'),
                             'global_position_topic': LaunchConfiguration('global_position_topic'),
                             'auto_start_mission': ParameterValue(

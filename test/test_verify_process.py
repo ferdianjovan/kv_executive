@@ -24,7 +24,7 @@ from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 
 from test_mission_action import cancel_goal, send_goal, SimulatedFcu, wait_for
-from test_verify_ros import _install_camera_transforms, MonitoringSensors
+from test_verify_ros import _install_camera_transforms, _with_wall_hit, MonitoringSensors
 
 
 def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch, tmp_path):
@@ -115,7 +115,7 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
                     request.origin.header.frame_id == 'test_thermal_camera' or near_fire)
                 response.smoke_wall_range = response.smoke_wall_nearest_range = (
                     VERIFY_DEFAULTS['verify_smoke_standoff'] + 0.4)
-            return response
+            return _with_wall_hit(response)
 
         fcu.geometry_service.callback = near_smoke_wall
         sensors.smoke_regions = [1, 2]
@@ -226,6 +226,12 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
                 targets = deepcopy(recovery_targets[first_target:])
                 statuses = list(fcu.statuses[first_status:])
             assert report.fire_found and report.source_count == 2
+            assert report.smoke_location_valid and report.smoke_wall_confirmed
+            assert report.smoke_location_method == 'confirmed_smoke_wall_nearest_hit'
+            assert report.smoke_planning_position.header.frame_id == 'px4_odom'
+            assert not report.evidence_complete
+            assert not report.rgb_evidence.valid and not report.thermal_evidence.valid
+            assert not report.rgb_evidence.image.data and not report.thermal_evidence.image.data
             assert abs(report.observer_local_pose.pose.position.z - source['z']) < 0.03
             observed_yaw = yaw_from_quaternion(report.observer_local_pose.pose.orientation)
             assert abs(angular_distance(source['yaw'], observed_yaw)) <= (
@@ -245,7 +251,12 @@ def test_smoke_terrain_leg_then_fire_centering_in_executive_process(monkeypatch,
             last_loiter = max(stamp for stamp, text in before_report
                               if text.startswith('FCU: OFFBOARD -> AUTO.LOITER'))
             assert stationary and last_loiter <= max(stationary) <= report_time
-            assert post_stop_maps and max(stationary) <= max(post_stop_maps) <= report_time
+            # Two fresh maps established arrival before the final checked
+            # height correction. Reporting settles again without re-ranging.
+            assert post_stop_maps and max(post_stop_maps) <= report_time
+            assert (report.smoke_planning_position.header.stamp.sec * 10**9
+                    + report.smoke_planning_position.header.stamp.nanosec) <= (
+                        report.header.stamp.sec * 10**9 + report.header.stamp.nanosec)
             with fcu.lock:
                 strict = deepcopy(fcu.inspection_planning_requests)
             assert strict and all(request.terrain_envelope and request.minimum_radius == 0.0

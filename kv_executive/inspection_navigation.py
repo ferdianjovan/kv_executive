@@ -10,7 +10,9 @@ import math
 import time
 
 from geometry_msgs.msg import Point, PointStamped, Pose, PoseStamped, Vector3Stamped
+from kv_executive.inspection_evidence import InspectionEvidenceMixin
 from kv_executive.inspection_heading import InspectionHeadingMixin
+from kv_executive.inspection_report_view import InspectionReportViewMixin, retained_wall_valid
 from kv_executive.inspection_settling import InspectionSettlingMixin
 from kv_executive.mission_geometry import quaternion_from_yaw, transform_pose, yaw_from_quaternion
 from nav_msgs.msg import Path
@@ -96,7 +98,9 @@ def enu_offset_to_fix(reference, east, north, up, uncertainty=0.0):
     return result
 
 
-class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin):
+class InspectionNavigationMixin(
+        InspectionHeadingMixin, InspectionSettlingMixin,
+        InspectionEvidenceMixin, InspectionReportViewMixin):
     """Support the smoke standoff and three-viewpoint thermal inspection."""
 
     def _verify_reset_source_localization(self):
@@ -927,6 +931,13 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
                 or response.ray_direction.header.frame_id != self.config['verify_planning_frame']
                 or not _finite_point(origin) or not _finite_point(direction)):
             return unavailable('invalid map-frame ray origin or direction')
+        nearest_point_valid = bool(getattr(response, 'smoke_wall_nearest_point_valid', False))
+        nearest_point = getattr(response, 'smoke_wall_nearest_point', None)
+        if nearest_point_valid and (
+                nearest_point is None or not _finite_point(nearest_point.point)
+                or nearest_point.header.frame_id != self.config['verify_planning_frame']
+                or nearest_point.header.stamp != response.map_header.stamp):
+            return unavailable('invalid nearest smoke-wall point or measurement timestamp')
         local = transform_pose(Pose(position=deepcopy(origin),
                                     orientation=quaternion_from_yaw(0.0)), conversion).position
         end = transform_pose(Pose(position=Point(**{
@@ -977,7 +988,9 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
                 'evidence': evidence_name, 'evidence_code': evidence, 'samples': samples,
                 'mixed_samples': mixed, 'rows': rows, 'columns': columns,
                 'camera_associated': roi_source is not None,
-                'smoke_camera_stamp_ns': _stamp_ns(roi_source.header) if roi_source else 0}
+                'smoke_camera_stamp_ns': _stamp_ns(roi_source.header) if roi_source else 0,
+                'nearest_point_valid': nearest_point_valid,
+                'nearest_point': deepcopy(nearest_point) if nearest_point_valid else None}
 
     @staticmethod
     def _verify_valid_wall(wall):
@@ -1511,7 +1524,8 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
             return None
         return fix
 
-    def _inspection_target_fields(self, report, prefix, geometry, fix, observer, stamp):
+    def _inspection_target_fields(
+            self, report, prefix, geometry, fix, observer, stamp, *, retained=False):
         local_frame = self.config['local_frame']
         planning_frame = self.config['verify_planning_frame']
         setattr(report, prefix + '_local_position', _unknown_point(local_frame, stamp))
@@ -1533,8 +1547,8 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
             and planning.header.frame_id == planning_frame and _finite_point(planning.point)
             and math.isfinite(uncertainty) and uncertainty >= 0.0 and source_ns > 0
             and geometry.get('source', prefix) == prefix
-            and -self.config['verify_future_tolerance'] <= age
-            <= self.config['verify_observation_timeout']
+            and (retained or -self.config['verify_future_tolerance'] <= age
+                 <= self.config['verify_observation_timeout'])
         )
         setattr(report, prefix + '_location_valid', valid)
         if not valid:
@@ -1555,8 +1569,26 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
                 setattr(report, prefix + '_global_valid', True)
                 setattr(report, prefix + '_global_position', target_fix)
 
+    def _inspection_retained_smoke_geometry(self, wall, conversion=None):
+        """Transform the confirmed historical hit, never reproject an old range."""
+        from kv_executive.verification import VerificationObservationLost
+        frame = self.config['verify_planning_frame']
+        if not retained_wall_valid(wall, frame, self.config['verify_inspection_max_uncertainty']):
+            raise VerificationObservationLost('Retained smoke-wall confirmation is invalid')
+        point = wall['nearest_point']
+        uncertainty = wall['uncertainty']
+        if conversion is None:
+            conversion = self._path_frame_transform(frame)
+        local = transform_pose(Pose(
+            position=deepcopy(point.point), orientation=quaternion_from_yaw(0.0)),
+            conversion).position
+        return {'point': local, 'planning_point': deepcopy(point),
+                'uncertainty': uncertainty, 'source_stamp': deepcopy(point.header.stamp),
+                'source': 'smoke', 'target_valid': True,
+                'method': 'confirmed_smoke_wall_nearest_hit'}
+
     def _verify_report_inspection(
-        self, smoke_geometry, fire_message=None, attempts=1, *, wall=None,
+        self, smoke_geometry, fire_message=None, attempts=1, *, wall=None, guard=None,
     ):
         """Publish target estimates and a found/not-found result separately from the UAV."""
         from kv_executive.mission_executive import MissionError
@@ -1564,10 +1596,19 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
         from kv_executive.verification import VerificationObservationLost
         if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 3:
             raise MissionError('Inspection attempts must be between one and three')
+
+        def check():
+            self._check_running()
+            if guard:
+                guard()
+
+        check()
+        retained_wall = getattr(self, '_verify_retained_report_wall', None)
+        smoke_geometry = self._inspection_retained_smoke_geometry(retained_wall)
         self._verify_control_pose()
-        current_smoke = self._verify.fresh_smoke()
-        if current_smoke is not None:
-            smoke_geometry = self._verify_target_geometry(current_smoke, 'smoke')
+        current_smoke = self._verify_prepare_report_view(
+            retained_wall, fire_message=fire_message, guard=check)
+        view_after_ns = getattr(self, '_verify_report_view_after_ns', 0)
         if fire_message is None:
             # A track may become persistent during the final smoke query.
             # Its appearance cannot be reported as a negative inspection.
@@ -1576,24 +1617,12 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
                 and attempts < self.config.get('verify_inspection_max_attempts', 3)):
             raise VerificationObservationLost('No-fire inspection attempts are incomplete')
 
-        def no_fire_boundary_valid():
+        def visual_smoke_valid():
             smoke = self._verify.fresh_smoke()
-            if not self._inspection_detection_valid(smoke, 'smoke'):
-                return False
-            if wall is None:
-                _, current = self._verify_control_pose()
-                frame = smoke.header.frame_id
-                bearing = yaw_from_quaternion(current.orientation) + smoke.yaw_correction_rad
-            else:
-                frame, bearing = wall.get('camera_frame'), wall.get('bearing')
-                if frame != smoke.header.frame_id:
-                    return False
-            if not frame or bearing is None or not math.isfinite(bearing):
-                return False
-            # A legacy single ray or cached plane only chooses where to look.
-            # Every negative publication needs a newly qualified aperture.
-            measured = self._verify_opportunistic_wall(frame, bearing)
-            return self._verify_smoke_wall_at_standoff(measured)
+            return (self._inspection_detection_valid(smoke, 'smoke')
+                    and _stamp_ns(smoke) > view_after_ns
+                    and self._verify_wall_observation_ready()
+                    and getattr(self, '_verify_retained_report_wall', None) is retained_wall)
 
         fire_geometry = None
         if fire_message is not None:
@@ -1640,6 +1669,9 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
             raise MissionError('Invalid fire source identity in inspection report')
         report.source_count = source_count
         report.track_id = track_id
+        report.smoke_wall_confirmed = True
+        report.smoke_wall_nearest_depth_m = retained_wall['nearest']
+        report.smoke_wall_evidence = str(retained_wall.get('evidence', 'unknown'))
         report.observer_local_pose.header = deepcopy(odometry.header)
         report.observer_local_pose.pose = deepcopy(odometry.pose.pose)
         report.observer_planning_pose.header = deepcopy(report.header)
@@ -1653,28 +1685,22 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
         if not report.fire_found and self._verify.had_fire_confirmation():
             raise VerificationObservationLost(
                 'Confirmed fire was observed during this inspection; no-fire result withheld')
-        if not report.fire_found and not no_fire_boundary_valid():
+        if not visual_smoke_valid():
             raise VerificationObservationLost(
-                'A fresh observed smoke boundary is required for a no-fire inspection result')
+                'Fresh forward-camera smoke is required for the inspection result')
         self._inspection_target_fields(
-            report, 'smoke', smoke_geometry, fix, odometry.pose.pose, report.header.stamp)
+            report, 'smoke', smoke_geometry, fix, odometry.pose.pose,
+            report.header.stamp, retained=True)
         self._inspection_target_fields(
             report, 'fire', fire_geometry, fix, odometry.pose.pose, report.header.stamp)
         legacy = None
         if report.fire_found:
-            wall = self._verify_center_fire_wall(fire_message.header.frame_id)
-            if not smoke_wall_standoff_reached(
-                    wall, self.config['verify_smoke_standoff'],
-                    self.config.get('position_tolerance', 0.3),
-                    max_distance=self.config.get('verify_smoke_inspection_max_distance')):
-                raise VerificationObservationLost(
-                    'A fresh smoke wall at the standoff is required for a fire-found result')
             latest = self._verify.stable_fire()
             if (not self._inspection_detection_valid(latest, 'fire')
                     or latest.header.frame_id != fire_message.header.frame_id
                     or getattr(latest, 'track_id', 0) != getattr(fire_message, 'track_id', 0)):
                 raise VerificationObservationLost(
-                    'Fire changed while measuring smoke-wall standoff')
+                    'Fire changed while preparing the inspection result')
             fix = self._inspection_fresh_fix()
         if report.fire_found and fix is not None:
             # Preserve the existing observation-viewpoint topic for consumers
@@ -1688,24 +1714,31 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
         report.observer_global_position = deepcopy(fix) if fix is not None else _unknown_fix(
             report.header.stamp)
         self._inspection_target_fields(
-            report, 'smoke', smoke_geometry, fix, odometry.pose.pose, report.header.stamp)
+            report, 'smoke', smoke_geometry, fix, odometry.pose.pose,
+            report.header.stamp, retained=True)
         self._inspection_target_fields(
             report, 'fire', fire_geometry, fix, odometry.pose.pose, report.header.stamp)
-        # Re-measure after optional localization, transforms and legacy preparation;
-        # a previous approach measurement cannot authorize a distant/stale result.
-        if report.fire_found:
-            wall = self._verify_center_fire_wall(fire_message.header.frame_id)
-            if not smoke_wall_standoff_reached(
-                    wall, self.config['verify_smoke_standoff'],
-                    self.config.get('position_tolerance', 0.3),
-                    max_distance=self.config.get('verify_smoke_inspection_max_distance')):
-                raise VerificationObservationLost(
-                    'Smoke-wall standoff evidence became unavailable before publishing')
+        self._inspection_capture_evidence(
+            report, fire_message=fire_message if report.fire_found else None,
+            guard=check, after_ns=view_after_ns)
         # Decide classification after the last potentially blocking query too.
-        self._check_running()
-        if not report.fire_found and not no_fire_boundary_valid():
+        check()
+        # Map/local alignment may have changed during viewing or image capture.
+        # Keep the saved map hit fixed and use one current conversion for both
+        # targets and the observer before deriving current GPS offsets.
+        conversion = self._path_frame_transform(self.config['verify_planning_frame'])
+        smoke_geometry = self._inspection_retained_smoke_geometry(retained_wall, conversion)
+        planning_fire = fire_geometry.get('planning_point') if fire_geometry else None
+        if (planning_fire is not None
+                and planning_fire.header.frame_id == self.config['verify_planning_frame']
+                and _finite_point(planning_fire.point)):
+            fire_geometry = {**fire_geometry, 'point': transform_pose(Pose(
+                position=deepcopy(planning_fire.point), orientation=quaternion_from_yaw(0.0)),
+                conversion).position}
+        check()
+        if not visual_smoke_valid():
             raise VerificationObservationLost(
-                'Smoke boundary evidence became unavailable before publishing')
+                'Forward smoke or the settled report viewpoint changed before publishing')
         latest = self._verify.stable_fire()
         if report.fire_found:
             if (not self._inspection_detection_valid(latest, 'fire')
@@ -1721,8 +1754,7 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
             if latest is not None or current_smoke is None:
                 raise VerificationObservationLost(
                     'Smoke or no-fire evidence changed before publishing')
-        # Geometry queries can wait. Refresh observer telemetry at the commit
-        # point, using the map conversion already resolved before those queries.
+        # Refresh observer telemetry after resolving the final common transform.
         self._verify_control_pose()
         _, odometry = self._snapshot(require_armed=True)
         now_ns = self.get_clock().now().nanoseconds
@@ -1742,7 +1774,8 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
         report.observer_global_position = deepcopy(fix) if fix is not None else _unknown_fix(
             report.header.stamp)
         self._inspection_target_fields(
-            report, 'smoke', smoke_geometry, fix, odometry.pose.pose, report.header.stamp)
+            report, 'smoke', smoke_geometry, fix, odometry.pose.pose,
+            report.header.stamp, retained=True)
         self._inspection_target_fields(
             report, 'fire', fire_geometry, fix, odometry.pose.pose, report.header.stamp)
         if report.fire_found:
@@ -1751,6 +1784,7 @@ class InspectionNavigationMixin(InspectionHeadingMixin, InspectionSettlingMixin)
                 raise MissionError(
                     'Invalid current fire source count before publishing inspection')
             report.source_count = source_count
+        check()
         if legacy is not None and fix is not None:
             legacy.header = deepcopy(report.header)
             legacy.local_pose = deepcopy(report.observer_local_pose)

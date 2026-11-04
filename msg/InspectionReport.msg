@@ -22,6 +22,12 @@ sensor_msgs/NavSatFix smoke_global_position
 float64 smoke_uncertainty_m
 string smoke_location_method
 
+# Historical qualified smoke-wall measurement retained when arrival was confirmed.
+# The point headers retain measurement time; these are not newly ranged coordinates.
+bool smoke_wall_confirmed
+float64 smoke_wall_nearest_depth_m
+string smoke_wall_evidence
+
 bool fire_location_valid
 bool fire_global_valid
 geometry_msgs/PointStamped fire_local_position
@@ -30,3 +36,9 @@ sensor_msgs/NavSatFix fire_global_position
 # Geometric source-localization uncertainty; classification comes from camera detections.
 float64 fire_uncertainty_m
 string fire_location_method
+
+# Fresh compressed camera evidence. Missing streams do not erase a valid finding.
+InspectionImageEvidence rgb_evidence
+InspectionImageEvidence thermal_evidence
+bool evidence_complete
+string evidence_status

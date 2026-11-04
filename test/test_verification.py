@@ -195,7 +195,10 @@ class Harness:
             target, geometry=geometry, guard=guard,
             preserve_requested_altitude=vertical_offset != 0.0)
 
-    def _verify_report_inspection(self, geometry, fire_message=None, attempts=1, wall=None):
+    def _verify_report_inspection(
+            self, geometry, fire_message=None, attempts=1, wall=None, guard=None):
+        if guard:
+            guard()
         self.events.append((
             'inspection_report', deepcopy(geometry), deepcopy(fire_message), attempts,
         ))

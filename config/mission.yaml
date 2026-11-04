@@ -41,6 +41,25 @@ mission_executive:
     verify_planning_frame: map
     global_position_topic: /mavros/global_position/global
     global_position_timeout: 2.0
+    # Bounded compressed snapshots. Images may be missing without changing the finding.
+    inspection_report_history: 2
+    inspection_evidence_rgb_topic: /kv_drone/rgb_camera/image
+    inspection_evidence_thermal_topic: /kv_drone/thermal_camera/image
+    inspection_evidence_timeout: 3.0
+    inspection_evidence_max_age: 2.0
+    inspection_evidence_pair_slop: 0.5
+    inspection_evidence_cache_bytes: 16777216
+    inspection_evidence_cache_frames: 3
+    inspection_evidence_frame_bytes: 8388608
+    inspection_evidence_rgb_max_bytes: 262144
+    inspection_evidence_thermal_max_bytes: 1048576
+    inspection_evidence_rgb_max_side: 1280
+    inspection_evidence_rgb_quality: 80
+    inspection_evidence_pose_history: 128
+    inspection_evidence_pose_slop: 0.25
+    # Final yaw/visual check uses retained wall coordinates, with no wall re-ranging.
+    verify_report_view_timeout: 15.0
+    verify_report_view_yaw_tolerance: 0.5235987755982988
     verify_path_step: 0.25  # Metres between guarded path targets.
     fire_exclusion_radius: 15.0  # Exploration endpoint exclusion, in metres.
     verify_observation_timeout: 2.0

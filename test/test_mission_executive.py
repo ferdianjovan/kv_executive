@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from builtin_interfaces.msg import Time as TimeMessage
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion, TransformStamped
 from kv_executive.action import ExecuteMission
+from kv_executive.inspection_evidence import InspectionEvidenceMixin
 import kv_executive.mission_executive as executive_module
 from kv_executive.mission_executive import (
     build_state_machine, ExplorationStateMachine, MissionAbortRequested,
@@ -74,7 +75,7 @@ class ClockStop:
         return self.stopped
 
 
-class Harness:
+class Harness(InspectionEvidenceMixin):
     """Bind production operations to deterministic telemetry and record commands."""
 
     _wait_until = MissionExecutive._wait_until
@@ -1759,6 +1760,8 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     blackboard['verify_fire_loss_failures'] = 2
     blackboard['verify_fire_loss_after_ns'] = 123_000_000_000
     blackboard['verify_wall_recheck_after_settle'] = True
+    blackboard['verify_report_wall'] = {'confirmed': True}
+    harness._verify_retained_report_wall = {'confirmed': True}
     harness._verify_heading_state = {'sources': {'old fire': 123}}
     harness._verify_wall_observation_context = {'settled_ns': 123}
 
@@ -1772,6 +1775,8 @@ def test_exploration_reentry_resets_verify_progress_without_taking_off(harness):
     assert blackboard['verify_fire_loss_failures'] == 0
     assert blackboard['verify_fire_loss_after_ns'] == 0
     assert not blackboard['verify_wall_recheck_after_settle']
+    assert blackboard['verify_report_wall'] is None
+    assert harness._verify_retained_report_wall is None
     assert not blackboard['verify_entered']
     assert blackboard['verify_approaches'] == 0
     assert not blackboard['verify_smoke_approach_completed']

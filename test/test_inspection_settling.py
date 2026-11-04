@@ -201,6 +201,50 @@ def test_context_reuse_keeps_its_epoch_and_does_not_repeat_map_wait(vehicle):
     assert vehicle.alignment_calls == 2
 
 
+def test_report_settling_keeps_physical_dwell_without_waiting_for_a_map(vehicle):
+    def never_query(context, guard):
+        raise AssertionError('Retained-coordinate reporting must not require a new map')
+
+    vehicle.map_wait = never_query
+    assert vehicle._verify_prepare_wall_observation(align_fire=False, wait_for_map=False)
+    assert vehicle.wall - vehicle.epoch >= 1.0
+    assert vehicle.map_calls == 0
+    assert vehicle.alignment_calls == 0
+    assert not vehicle._verify_wall_observation_context['map_wait_complete']
+    assert vehicle._verify_wall_observation_ready()
+
+
+def test_normal_ranging_after_report_settling_waits_once_for_its_map(vehicle):
+    assert vehicle._verify_prepare_wall_observation(wait_for_map=False)
+    context = vehicle._verify_wall_observation_context
+    assert vehicle.map_calls == 0
+    assert vehicle._verify_prepare_wall_observation()
+    assert vehicle._verify_wall_observation_context is context
+    assert vehicle.map_calls == 1
+    assert context['map_wait_complete']
+    assert vehicle._verify_prepare_wall_observation()
+    assert vehicle.map_calls == 1
+
+
+def test_skipping_wall_map_wait_does_not_accept_motion_or_a_frozen_clock(vehicle):
+    vehicle.clock_rate = 0.0
+    assert not vehicle._verify_prepare_wall_observation(wait_for_map=False)
+    assert vehicle.map_calls == 0
+    assert vehicle._verify_wall_observation_context is None
+
+
+def test_report_settling_still_obeys_the_original_inspection_deadline(vehicle):
+    def original_deadline():
+        if vehicle.wall - vehicle.epoch >= 0.3:
+            raise RuntimeError('Original inspection deadline expired')
+
+    with pytest.raises(RuntimeError, match='Original inspection deadline'):
+        vehicle._verify_prepare_wall_observation(
+            wait_for_map=False, guard=original_deadline)
+    assert vehicle.map_calls == 0
+    assert vehicle._verify_wall_observation_context is None
+
+
 def test_pending_wall_recheck_reuses_settled_pose_without_turning_again(vehicle):
     assert vehicle._verify_prepare_wall_observation()
     context = vehicle._verify_wall_observation_context

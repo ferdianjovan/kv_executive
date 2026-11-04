@@ -42,6 +42,8 @@
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>yasmin</exec_depend>
   <exec_depend>kv_perception</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
   <exec_depend>tf2_ros_py</exec_depend>
   <exec_depend>tf2_msgs</exec_depend>
   <exec_depend>rosgraph_msgs</exec_depend>

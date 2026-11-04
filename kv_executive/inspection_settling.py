@@ -139,7 +139,7 @@ class InspectionSettlingMixin:
             return False
         return True
 
-    def _verify_prepare_wall_observation(self, guard=None, *, align_fire=True):
+    def _verify_prepare_wall_observation(self, guard=None, *, align_fire=True, wait_for_map=True):
         """Align fire heading, then require fresh low-rate odometry in LOITER."""
         limits = self._verify_settling_limits()
 
@@ -153,8 +153,12 @@ class InspectionSettlingMixin:
             self._verify_wall_observation_context = None
             self._verify_wall_settle_reason = 'fire heading alignment is unavailable'
             return False
+        map_waiter = getattr(self, '_verify_wait_for_wall_map', None)
         if self._verify_wall_observation_ready():
-            return True
+            context = self._verify_wall_observation_context
+            if wait_for_map and not context['map_wait_complete'] and map_waiter is not None:
+                map_waiter(context, guard=check)
+            return self._verify_wall_observation_ready()
         self._verify_wall_observation_context = None
         started = time.monotonic()
         clock_ns = self.get_clock().now().nanoseconds
@@ -217,10 +221,9 @@ class InspectionSettlingMixin:
                             f'speed={linear:.3f} m/s, angular rate={math.degrees(angular):.2f} '
                             f'deg/s, dwell={sample["wall"] - low_since:.2f} wall s, '
                             f'distinct odometry samples={low_samples}')
-                        wait_for_map = getattr(self, '_verify_wait_for_wall_map', None)
-                        if wait_for_map is not None:
-                            wait_for_map(context, guard=check)
-                        else:
+                        if wait_for_map and map_waiter is not None:
+                            map_waiter(context, guard=check)
+                        elif map_waiter is None:
                             context['map_wait_complete'] = True
                         return self._verify_wall_observation_ready()
                 else:
